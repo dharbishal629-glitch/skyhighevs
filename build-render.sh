@@ -1,8 +1,10 @@
 #!/bin/bash
 set -e
 
-npm install -g pnpm@10.26.1 --prefix=$HOME
-export PATH=$HOME/bin:$PATH
+export COREPACK_ENABLE_STRICT=0
+export npm_config_prefix=$HOME/.npm-global
+npm install -g pnpm@10.26.1
+export PATH=$HOME/.npm-global/bin:$PATH
 
 pnpm install --frozen-lockfile
 pnpm --filter @workspace/dashboard run build
