@@ -1,0 +1,12 @@
+discord.py==2.7.1
+requests==2.33.0
+pyotp==2.9.0
+colorama
+httpx
+nodriver
+Pillow
+pystyle
+rich
+tls-client
+urllib3
+curl_cffi

@@ -1,0 +1,22 @@
+packages:
+  "framer-motion": "For cyberpunk glitch and reveal animations"
+  "recharts": "For dashboard token generation statistics charts"
+  "date-fns": "For formatting timestamps in tokens and logs"
+  "react-hook-form": "For worker creation and login forms"
+  "@hookform/resolvers": "For zod validation in forms"
+  "zod": "For form schema validation"
+  "lucide-react": "For UI icons"
+  "clsx": "For class merging"
+  "tailwind-merge": "For class merging"
+
+images:
+  - path: "artifacts/dashboard/public/images/cyber-bg.png"
+    description: "Dark cyberpunk hacker terminal background, glowing green circuit lines, very dark near black, subtle grid pattern"
+    aspect_ratio: "16:9"
+  - path: "artifacts/dashboard/public/images/logo-mark.png"
+    description: "Abstract geometric neon green hacker logo mark, sharp angles, on transparent background"
+    aspect_ratio: "1:1"
+
+notes:
+  - "App uses @workspace/api-client-react for TanStack hooks."
+  - "Authentication is purely header-based (x-api-key, x-totp-code, x-admin-key)."

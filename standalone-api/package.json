@@ -1,0 +1,9 @@
+{
+  "name": "skyhighev-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node dist/index.mjs",
+    "setup-db": "node setup-db.js"
+  }
+}

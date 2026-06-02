@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: skyhighev-api
+    runtime: node
+    buildCommand: echo "No build needed - pre-built"
+    startCommand: node dist/index.mjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: WORKER_API_KEY
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: TOTP_SECRET
+        sync: false
