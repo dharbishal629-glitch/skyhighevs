@@ -9,11 +9,7 @@ services:
         value: 10000
       - key: DATABASE_URL
         sync: false
-      - key: ADMIN_KEY
-        sync: false
       - key: TOTP_SECRET
-        sync: false
-      - key: CTRL_API_URL
         sync: false
       - key: WORKER_API_KEY
         sync: false
