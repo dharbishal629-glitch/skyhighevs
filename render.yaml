@@ -2,7 +2,7 @@ services:
   - type: web
     name: skyhighevs
     runtime: node
-    buildCommand: corepack enable && corepack prepare pnpm@latest --activate && pnpm install --frozen-lockfile && pnpm --filter @workspace/dashboard run build && pnpm --filter @workspace/api-server run build
+    buildCommand: bash build-render.sh
     startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
     envVars:
       - key: NODE_ENV
