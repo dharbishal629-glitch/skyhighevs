@@ -184,14 +184,6 @@ router.get("/tool/download", requireWorkerKey, async (req: Request, res: Respons
 });
 
 router.post("/tool/build-exe", requireApiKey, requireAdmin, upload.single("file"), async (req: Request, res: Response) => {
-  if (process.env.VERCEL) {
-    res.status(501).json({
-      error: "PyInstaller builds are not supported on Vercel.",
-      hint: "Build the .exe locally (pyinstaller --onefile your_tool.py) then upload it via 'Upload Tool File' above.",
-    });
-    return;
-  }
-
   let workDir: string | null = null;
   try {
     if (!req.file) {

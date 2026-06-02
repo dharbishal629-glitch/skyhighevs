@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: skyhighevs
+    runtime: node
+    buildCommand: npm install -g pnpm && pnpm install && pnpm --filter @workspace/dashboard run build && pnpm --filter @workspace/api-server run build
+    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: TOTP_SECRET
+        sync: false
+      - key: CTRL_API_URL
+        sync: false
