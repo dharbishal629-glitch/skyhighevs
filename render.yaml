@@ -17,3 +17,5 @@ services:
         sync: false
       - key: CTRL_API_URL
         sync: false
+      - key: WORKER_API_KEY
+        sync: false
