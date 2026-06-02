@@ -2,10 +2,8 @@
 set -e
 
 export COREPACK_ENABLE_STRICT=0
-export npm_config_prefix=$HOME/.npm-global
-npm install -g pnpm@10.26.1
-export PATH=$HOME/.npm-global/bin:$PATH
+export COREPACK_ENABLE=0
 
-pnpm install --frozen-lockfile
-pnpm --filter @workspace/dashboard run build
-pnpm --filter @workspace/api-server run build
+npx --yes pnpm@10.26.1 install --frozen-lockfile
+npx pnpm@10.26.1 --filter @workspace/dashboard run build
+npx pnpm@10.26.1 --filter @workspace/api-server run build
