@@ -75958,13 +75958,6 @@ router9.get("/tool/download", requireWorkerKey, async (req, res) => {
   }
 });
 router9.post("/tool/build-exe", requireApiKey, requireAdmin, upload.single("file"), async (req, res) => {
-  if (process.env.VERCEL) {
-    res.status(501).json({
-      error: "PyInstaller builds are not supported on Vercel.",
-      hint: "Build the .exe locally (pyinstaller --onefile your_tool.py) then upload it via 'Upload Tool File' above."
-    });
-    return;
-  }
   let workDir = null;
   try {
     if (!req.file) {
@@ -76600,16 +76593,10 @@ app.use(
     logger,
     serializers: {
       req(req) {
-        return {
-          id: req.id,
-          method: req.method,
-          url: req.url?.split("?")[0]
-        };
+        return { id: req.id, method: req.method, url: req.url?.split("?")[0] };
       },
       res(res) {
-        return {
-          statusCode: res.statusCode
-        };
+        return { statusCode: res.statusCode };
       }
     }
   })
@@ -76622,13 +76609,12 @@ var __filename = fileURLToPath(import.meta.url);
 var __dirnameLocal = path2.dirname(__filename);
 var candidatePublicDirs = [
   path2.resolve(__dirnameLocal, "public"),
-  // bundled
   path2.resolve(__dirnameLocal, "..", "dist", "public"),
-  // bundled (from src/)
   path2.resolve(__dirnameLocal, "..", "..", "dashboard", "dist", "public")
-  // source (tsx mode)
 ];
-var publicDir = candidatePublicDirs.find((p) => fs2.existsSync(path2.join(p, "index.html")));
+var publicDir = candidatePublicDirs.find(
+  (p) => fs2.existsSync(path2.join(p, "index.html"))
+);
 if (publicDir) {
   logger.info({ publicDir }, "Serving dashboard static files");
   app.use(
