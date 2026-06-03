@@ -11,14 +11,14 @@
 #   4. Launcher verifies integrity, then runs main.py in-memory
 #      (nothing written to disk — source never visible on filesystem)
 #
-# CONFIGURE: Set CTRL_API_URL below to your Vercel deployment URL
+# CONFIGURE: Set CTRL_API_URL below to your Render deployment URL
 #            after you deploy.  You can also set it as an env var.
 # ─────────────────────────────────────────────────────────────────
 
 import sys, os, subprocess, importlib
 
-# ── YOUR VERCEL URL — update this after deploying ────────────────
-_CTRL_API_URL = os.environ.get("CTRL_API_URL", "YOUR_VERCEL_URL_HERE")
+# ── YOUR RENDER URL — update this after deploying ────────────────
+_CTRL_API_URL = os.environ.get("CTRL_API_URL", "YOUR_RENDER_URL_HERE")
 # ─────────────────────────────────────────────────────────────────
 
 # ── Step 1: auto-install deps ────────────────────────────────────

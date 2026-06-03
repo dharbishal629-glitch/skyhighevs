@@ -1,18 +1,12 @@
 services:
   - type: web
     name: skyhighevs
-    runtime: node
-    buildCommand: bash build-render.sh
-    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    runtime: docker
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
-      - key: COREPACK_ENABLE
-        value: "0"
-      - key: COREPACK_ENABLE_STRICT
-        value: "0"
       - key: DATABASE_URL
         sync: false
       - key: TOTP_SECRET
