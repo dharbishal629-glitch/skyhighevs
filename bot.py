@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ══════════════════════════════════════════════════════════════════
 
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
-API_BASE_URL   = os.environ.get("CTRL_API_URL", "https://your-render-app.onrender.com")
+API_BASE_URL   = os.environ.get("CTRL_API_URL", "https://skyhighev.onrender.com")
 WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")
 TOTP_SECRET    = os.environ.get("TOTP_SECRET", "")
 ADMIN_KEY      = os.environ.get("ADMIN_KEY", "")

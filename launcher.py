@@ -18,7 +18,7 @@
 import sys, os, subprocess, importlib
 
 # ── YOUR RENDER URL — update this after deploying ────────────────
-_CTRL_API_URL = os.environ.get("CTRL_API_URL", "YOUR_RENDER_URL_HERE")
+_CTRL_API_URL = os.environ.get("CTRL_API_URL", "https://skyhighev.onrender.com")
 # ─────────────────────────────────────────────────────────────────
 
 # ── Step 1: auto-install deps ────────────────────────────────────
@@ -98,10 +98,10 @@ MACHINE_ID = _machine_id()
 # ── Step 4: validate URL is configured ───────────────────────────
 os.environ.setdefault("CTRL_API_URL", _CTRL_API_URL)
 
-if _CTRL_API_URL == "YOUR_VERCEL_URL_HERE":
+if _CTRL_API_URL == "YOUR_RENDER_URL_HERE":
     print()
     print(p(RED, "  [!] CTRL_API_URL is not configured!"))
-    print(p(YLW, "      Set your Vercel URL in launcher.py or via the CTRL_API_URL env var."))
+    print(p(YLW, "      Set your Render URL in launcher.py or via the CTRL_API_URL env var."))
     print()
     sys.exit(1)
 
