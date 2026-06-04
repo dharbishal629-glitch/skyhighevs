@@ -42,6 +42,7 @@ WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")
 TOTP_SECRET    = os.environ.get("TOTP_SECRET", "")
 ADMIN_KEY      = os.environ.get("ADMIN_KEY", "")
 ADMIN_IDS      = { 1499372249503895552, 1482575133779427488 }
+WORKER_ROLE_ID = 0  # ← set to your worker role ID (e.g. 1234567890123456789)
 # Channel where payout request notifications are sent (set to your admin/payout channel ID)
 PAYOUT_NOTIFY_CHANNEL_ID = 1491674976787365978   # ← replace 0 with your channel ID
 TICKET_CATEGORY_ID       = 1491820563025363045                     # ← set to your ticket category channel ID (0 = no category)
@@ -338,6 +339,14 @@ async def create_key(interaction: discord.Interaction, user: discord.Member, dur
         await user.send(embed=dm)
     except discord.Forbidden:
         dm_note = "Could not DM user (DMs closed)"
+
+    if WORKER_ROLE_ID and interaction.guild:
+        try:
+            role = interaction.guild.get_role(WORKER_ROLE_ID)
+            if role:
+                await user.add_roles(role, reason="Worker key issued via /create-key")
+        except Exception:
+            pass
 
     await interaction.followup.send(view=_cv2(C_SUCCESS,
         _td("## Worker Key Issued"),
@@ -3051,8 +3060,7 @@ def build_coin_lb_image(entries: list) -> discord.File:
 
 # ── /leaderboard ──────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="leaderboard", description="[Admin] View the top workers ranked by total generation")
-@admin_only()
+@bot.tree.command(name="leaderboard", description="View the top workers ranked by total generation")
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -3066,24 +3074,6 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(view=cv2_info("Leaderboard", "No workers have generated tokens yet. Be the first."))
         return
 
-    col_w = max((len(e2["discordUsername"]) for e2 in board[:10]), default=8)
-    col_w = max(col_w, 8)
-    hdr  = f"{'RNK':<4}  {'WORKER':<{col_w}}  {'GEN':>7}  {'VALID':>6}  {'RATE':>5}"
-    sep  = f"{'─'*4}  {'─'*col_w}  {'─'*7}  {'─'*6}  {'─'*5}"
-    rows = [hdr, sep]
-    for e2 in board[:10]:
-        rows.append(f"{e2['rank']:02d}.  {e2['discordUsername'][:col_w]:<{col_w}}  {e2['totalGenerated']:>7,}  {e2['totalValid']:>6,}  {e2['unlockRate']:>4}%")
-    rows += [sep, f"{'TOT':<4}  {'(top 10)':<{col_w}}  {sum(e2['totalGenerated'] for e2 in board[:10]):>7,}  {sum(e2['totalValid'] for e2 in board[:10]):>6,}"]
-    table = f"```\n{chr(10).join(rows)}\n```"
-
-    lb_view = _cv2(C_GOLD,
-        _td(f"##   Worker Leaderboard"),
-        _sep(),
-        _td(f"Top **{min(len(board), 10)}** workers ranked by all-time tokens generated"),
-        _td(table),
-        _td(f"-# {_FOOTER_TEXT}"),
-    )
-
     try:
         img_file = build_leaderboard_image(
             board,
@@ -3092,15 +3082,46 @@ async def leaderboard(interaction: discord.Interaction):
             gen_key="totalGenerated",
             valid_key="totalValid",
         )
-        await interaction.followup.send(view=lb_view, file=img_file)
+
+        class _LBLayout(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=None)
+                self.add_item(_cv2_cont(
+                    _td("##   Worker Leaderboard"),
+                    _sep(),
+                    _td(f"Top **{min(len(board), 10)}** workers ranked by all-time tokens generated"),
+                    discord.ui.MediaGallery(
+                        discord.ui.MediaGalleryItem(
+                            media=discord.ui.UnfurledMediaItem(url="attachment://leaderboard.png")
+                        )
+                    ),
+                    _td(f"-# {_FOOTER_TEXT}"),
+                    color=C_GOLD,
+                ))
+
+        await interaction.followup.send(view=_LBLayout(), files=[img_file])
     except Exception:
-        await interaction.followup.send(view=lb_view)
+        col_w = max((len(e2["discordUsername"]) for e2 in board[:10]), default=8)
+        col_w = max(col_w, 8)
+        hdr  = f"{'RNK':<4}  {'WORKER':<{col_w}}  {'GEN':>7}  {'VALID':>6}  {'RATE':>5}"
+        sep  = f"{'─'*4}  {'─'*col_w}  {'─'*7}  {'─'*6}  {'─'*5}"
+        rows = [hdr, sep]
+        for e2 in board[:10]:
+            rows.append(f"{e2['rank']:02d}.  {e2['discordUsername'][:col_w]:<{col_w}}  {e2['totalGenerated']:>7,}  {e2['totalValid']:>6,}  {e2['unlockRate']:>4}%")
+        rows += [sep, f"{'TOT':<4}  {'(top 10)':<{col_w}}  {sum(e2['totalGenerated'] for e2 in board[:10]):>7,}  {sum(e2['totalValid'] for e2 in board[:10]):>6,}"]
+        table = f"```\n{chr(10).join(rows)}\n```"
+        await interaction.followup.send(view=_cv2(C_GOLD,
+            _td("##   Worker Leaderboard"),
+            _sep(),
+            _td(f"Top **{min(len(board), 10)}** workers ranked by all-time tokens generated"),
+            _td(table),
+            _td(f"-# {_FOOTER_TEXT}"),
+        ))
 
 
 # ── /top-today ────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="top-today", description="[Admin] See who generated the most tokens today")
-@admin_only()
+@bot.tree.command(name="top-today", description="See who generated the most tokens today")
 async def top_today(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -3114,26 +3135,6 @@ async def top_today(interaction: discord.Interaction):
         await interaction.followup.send(view=cv2_info("Today's Leaders", "No activity recorded today yet."))
         return
 
-    col_w = max((len(e2["discordUsername"]) for e2 in board[:10]), default=8)
-    col_w = max(col_w, 8)
-    hdr  = f"{'RNK':<4}  {'WORKER':<{col_w}}  {'GEN':>7}  {'VALID':>6}  {'RATE':>5}"
-    sep2  = f"{'─'*4}  {'─'*col_w}  {'─'*7}  {'─'*6}  {'─'*5}"
-    rows = [hdr, sep2]
-    for e2 in board[:10]:
-        gen2  = e2.get("todayGenerated", e2.get("totalGenerated", 0))
-        valid2 = e2.get("todayValid",     e2.get("totalValid", 0))
-        rows.append(f"{e2['rank']:02d}.  {e2['discordUsername'][:col_w]:<{col_w}}  {gen2:>7,}  {valid2:>6,}  {e2.get('unlockRate',0):>4}%")
-    rows.append("Resets daily at midnight UTC")
-    table = f"```\n{chr(10).join(rows)}\n```"
-
-    td_view = _cv2(C_INFO,
-        _td("##   Today's Top Workers"),
-        _sep(),
-        _td(f"Top **{min(len(board), 10)}** workers by tokens generated today — resets at midnight UTC"),
-        _td(table),
-        _td(f"-# {_FOOTER_TEXT}"),
-    )
-
     try:
         img_file = build_leaderboard_image(
             board,
@@ -3142,9 +3143,43 @@ async def top_today(interaction: discord.Interaction):
             gen_key="todayGenerated",
             valid_key="todayValid",
         )
-        await interaction.followup.send(view=td_view, file=img_file)
+
+        class _TDLayout(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=None)
+                self.add_item(_cv2_cont(
+                    _td("##   Today's Top Workers"),
+                    _sep(),
+                    _td(f"Top **{min(len(board), 10)}** workers by tokens generated today — resets at midnight UTC"),
+                    discord.ui.MediaGallery(
+                        discord.ui.MediaGalleryItem(
+                            media=discord.ui.UnfurledMediaItem(url="attachment://leaderboard.png")
+                        )
+                    ),
+                    _td(f"-# {_FOOTER_TEXT}"),
+                    color=C_INFO,
+                ))
+
+        await interaction.followup.send(view=_TDLayout(), files=[img_file])
     except Exception:
-        await interaction.followup.send(view=td_view)
+        col_w = max((len(e2["discordUsername"]) for e2 in board[:10]), default=8)
+        col_w = max(col_w, 8)
+        hdr  = f"{'RNK':<4}  {'WORKER':<{col_w}}  {'GEN':>7}  {'VALID':>6}  {'RATE':>5}"
+        sep2  = f"{'─'*4}  {'─'*col_w}  {'─'*7}  {'─'*6}  {'─'*5}"
+        rows = [hdr, sep2]
+        for e2 in board[:10]:
+            gen2  = e2.get("todayGenerated", e2.get("totalGenerated", 0))
+            valid2 = e2.get("todayValid",     e2.get("totalValid", 0))
+            rows.append(f"{e2['rank']:02d}.  {e2['discordUsername'][:col_w]:<{col_w}}  {gen2:>7,}  {valid2:>6,}  {e2.get('unlockRate',0):>4}%")
+        rows.append("Resets daily at midnight UTC")
+        table = f"```\n{chr(10).join(rows)}\n```"
+        await interaction.followup.send(view=_cv2(C_INFO,
+            _td("##   Today's Top Workers"),
+            _sep(),
+            _td(f"Top **{min(len(board), 10)}** workers by tokens generated today — resets at midnight UTC"),
+            _td(table),
+            _td(f"-# {_FOOTER_TEXT}"),
+        ))
 
 
 # ── /my-rank ──────────────────────────────────────────────────────────────────
@@ -3736,15 +3771,6 @@ class PayoutPanelView(discord.ui.View):
     async def request_payout_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _do_payout_request(interaction)
 
-    @discord.ui.button(
-        label="Coins Payout",
-        style=discord.ButtonStyle.primary,
-        emoji="\U0001fa99",  # 🪙
-        custom_id="payout_panel:coins",
-    )
-    async def coins_payout_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(CoinPayoutModal())
-
 PAYOUT_FILE = "payout_data.json"
 
 def _load_payout_db() -> dict:
@@ -3863,16 +3889,14 @@ async def setup_payout_panel(interaction: discord.Interaction):
                 _td("##   Request Your Payout"),
                 _sep(),
                 _td(
-                    "Choose how you want to cash out:\n\n"
-                    "**\U0001f4b8 Request Payout** — token-based payout (live-validated against Discord)\n"
-                    "**\U0001fa99 Coins Payout** — direct withdrawal of your coin balance"
+                    "**\U0001f4b8 Request Payout** — token-based payout (live-validated against Discord)"
                 ),
                 _sep(),
                 _td(
                     "**Before you click:**\n"
                     "\u203a You must be a registered worker\n"
                     "\u203a Set your payout method with `/set-payout` first\n"
-                    "\u203a You can only have one pending request at a time per type"
+                    "\u203a You can only have one pending request at a time"
                 ),
                 _sep(),
                 _td("-# SkyHighEV Worker Payout System"),
@@ -3885,15 +3909,7 @@ async def setup_payout_panel(interaction: discord.Interaction):
                 custom_id="payout_panel:request",
             )
             req_btn.callback = _do_payout_request
-
-            coins_btn = discord.ui.Button(
-                label="Coins Payout",
-                style=discord.ButtonStyle.primary,
-                emoji="\U0001fa99",
-                custom_id="payout_panel:coins",
-            )
-            coins_btn.callback = _do_coin_payout_button
-            self.add_item(discord.ui.ActionRow(req_btn, coins_btn))
+            self.add_item(discord.ui.ActionRow(req_btn))
 
     await interaction.channel.send(view=_PayoutPanelLayout())
     await interaction.followup.send(
