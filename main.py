@@ -1,4 +1,55 @@
 
+import sys as _sys
+import subprocess as _subprocess
+import importlib as _importlib
+
+# ── Auto-install missing dependencies ────────────────────────────────────────
+_REQUIRED_PKGS = {
+    "requests":   "requests",
+    "httpx":      "httpx",
+    "tls_client": "tls-client",
+    "colorama":   "colorama",
+    "pystyle":    "pystyle",
+    "rich":       "rich",
+    "nodriver":   "nodriver",
+    "urllib3":    "urllib3",
+    "pyotp":      "pyotp",
+    "psutil":     "psutil",
+}
+
+def _pkg_installed(mod_name: str) -> bool:
+    try:
+        _importlib.import_module(mod_name)
+        return True
+    except ImportError:
+        return False
+
+_missing = [pip_name for mod_name, pip_name in _REQUIRED_PKGS.items() if not _pkg_installed(mod_name)]
+if _missing:
+    print(f"[*] Auto-installing missing modules: {', '.join(_missing)} ...")
+    for _flags in ([], ["--user"]):
+        try:
+            _subprocess.check_call(
+                [_sys.executable, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", *_flags, *_missing],
+                stdout=_subprocess.DEVNULL, stderr=_subprocess.PIPE,
+            )
+            print(f"[+] Successfully installed: {', '.join(_missing)}")
+            break
+        except _subprocess.CalledProcessError:
+            continue
+    else:
+        print(f"[!] Auto-install failed. Manually run: pip install {' '.join(_missing)}")
+        _sys.exit(1)
+    # Re-import newly installed packages into sys.modules
+    import importlib as _il
+    for _mod in _REQUIRED_PKGS:
+        try: _il.import_module(_mod)
+        except ImportError: pass
+
+del _REQUIRED_PKGS, _missing, _pkg_installed
+# ─────────────────────────────────────────────────────────────────────────────
+
 import asyncio
 from datetime import datetime
 import hashlib
