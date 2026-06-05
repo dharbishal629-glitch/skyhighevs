@@ -145,18 +145,6 @@ router.get("/tool/download", requireWorkerKey, async (req: Request, res: Respons
         [worker?.id ?? null, worker?.workerKey ?? null, clientIp, filename]
       );
 
-      // Rate-limit: max 5 downloads per worker per 10 minutes
-      const recent = await pool.query(
-        `SELECT COUNT(*) AS cnt FROM tool_download_log
-         WHERE worker_key = $1
-           AND downloaded_at > NOW() - INTERVAL '10 minutes'`,
-        [worker?.workerKey ?? ""]
-      );
-      const cnt = Number((recent.rows[0] as any)?.cnt ?? 0);
-      if (cnt > 5) {
-        res.status(429).json({ error: "Too many downloads. Please wait before trying again." });
-        return;
-      }
     } catch (_logErr) {
       // Never block a valid download because of a log failure
     }
