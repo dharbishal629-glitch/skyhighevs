@@ -1,0 +1,10 @@
+requests
+httpx
+tls-client
+colorama
+pystyle
+rich
+nodriver
+urllib3
+pyotp
+psutil
