@@ -1,92 +1,39 @@
 
 import sys as _sys
 import subprocess as _subprocess
-import importlib as _importlib
 import shutil as _shutil
 
-# ── Auto-install missing dependencies ────────────────────────────────────────
-# NOTE: When run via a PyInstaller-frozen launcher.exe, sys.executable points
-# to the .exe itself — NOT a real Python. We must find the system Python to
-# run pip, then add its site-packages to sys.path so imports succeed.
-
-def _find_real_python() -> str:
-    """Return path to a real Python interpreter (not a frozen binary)."""
+# ── Fix imports inside PyInstaller frozen launcher.exe ───────────────────────
+# When run via launcher.exe the frozen runtime only sees bundled packages.
+# We find the real system Python and always inject its site-packages into
+# sys.path — so any packages the worker installed with pip are found normally.
+def _inject_site_packages():
     if not getattr(_sys, 'frozen', False):
-        return _sys.executable
-    for _cmd in ("python", "python3", "py"):
-        _p = _shutil.which(_cmd)
-        if _p:
-            return _p
-    return _sys.executable  # last resort
-
-_PYTHON_EXE = _find_real_python()
-
-_REQUIRED_PKGS = {
-    "requests":   "requests",
-    "httpx":      "httpx",
-    "tls_client": "tls-client",
-    "colorama":   "colorama",
-    "pystyle":    "pystyle",
-    "rich":       "rich",
-    "nodriver":   "nodriver",
-    "urllib3":    "urllib3",
-    "pyotp":      "pyotp",
-    "psutil":     "psutil",
-}
-
-def _pkg_installed(mod_name: str) -> bool:
+        return  # Running real Python already — sys.path is correct
+    _real_py = next(
+        (_shutil.which(c) for c in ("python", "python3", "py") if _shutil.which(c)),
+        None,
+    )
+    if not _real_py:
+        return
     try:
-        _importlib.import_module(mod_name)
-        return True
-    except ImportError:
-        return False
-
-_missing = [pip_name for mod_name, pip_name in _REQUIRED_PKGS.items() if not _pkg_installed(mod_name)]
-if _missing:
-    print(f"[*] Auto-installing missing modules: {', '.join(_missing)} ...")
-    _installed_ok = False
-    for _flags in ([], ["--user"]):
-        try:
-            _r = _subprocess.run(
-                [_PYTHON_EXE, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", *_flags, *_missing],
-                capture_output=True,
-            )
-            if _r.returncode == 0:
-                print(f"[+] Successfully installed: {', '.join(_missing)}")
-                _installed_ok = True
-                break
-        except Exception:
-            continue
-    if not _installed_ok:
-        print(f"[!] Auto-install failed. Manually run: pip install {' '.join(_missing)}")
-        _sys.exit(1)
-
-    # Inject system Python's site-packages into sys.path so the frozen runtime
-    # can find the packages we just installed.
-    try:
-        _sp = _subprocess.run(
-            [_PYTHON_EXE, "-c",
-             "import site, json; dirs = []; "
-             "(dirs.extend(site.getsitepackages()) if hasattr(site,'getsitepackages') else None); "
-             "dirs.append(site.getusersitepackages()); print(json.dumps(dirs))"],
+        import json as _json
+        _r = _subprocess.run(
+            [_real_py, "-c",
+             "import site, json; d=[];"
+             "(d.extend(site.getsitepackages()) if hasattr(site,'getsitepackages') else None);"
+             "d.append(site.getusersitepackages()); print(json.dumps(d))"],
             capture_output=True, text=True, timeout=10,
         )
-        if _sp.returncode == 0:
-            import json as _json
-            for _d in _json.loads(_sp.stdout.strip()):
+        if _r.returncode == 0:
+            for _d in _json.loads(_r.stdout.strip()):
                 if _d and _d not in _sys.path:
                     _sys.path.insert(0, _d)
     except Exception:
         pass
 
-    # Re-import newly installed packages so the rest of this file can use them
-    import importlib as _il
-    for _mod in _REQUIRED_PKGS:
-        try: _il.import_module(_mod)
-        except ImportError: pass
-
-del _REQUIRED_PKGS, _missing, _pkg_installed, _find_real_python, _PYTHON_EXE, _shutil
+_inject_site_packages()
+del _inject_site_packages, _shutil
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
