@@ -75004,32 +75004,11 @@ router2.delete("/workers/delete-key", requireApiKey, requireAdmin, async (req, r
   }
   res.json({ success: true, message: "Worker key locked" });
 });
-router2.post("/workers/validate-key", requireApiKey, async (req, res) => {
-  const { workerKey } = req.body;
-  if (!workerKey) {
-    res.status(400).json({ error: "workerKey is required" });
-    return;
-  }
-  const [worker] = await db.select().from(workersTable).where(eq(workersTable.workerKey, workerKey)).limit(1);
-  if (!worker) {
-    logBus.warn(`Failed key validation attempt \u2014 key not found`);
-    res.json({ valid: false, status: "INVALID", message: "Worker key not found" });
-    return;
-  }
-  if (worker.status === "LOCKED") {
-    logBus.warn(`Blocked login attempt \u2014 key LOCKED for ${worker.discordUsername}`);
-    res.json({ valid: false, status: "LOCKED", message: "Worker key is locked" });
-    return;
-  }
-  if (worker.expiresAt && new Date(worker.expiresAt) < /* @__PURE__ */ new Date()) {
-    await db.update(workersTable).set({ status: "LOCKED" }).where(eq(workersTable.id, worker.id));
-    logBus.warn(`Key expired and locked for ${worker.discordUsername}`);
-    res.json({ valid: false, status: "EXPIRED", message: "Worker key has expired" });
-    return;
-  }
-  logBus.info(`Worker authenticated: ${worker.discordUsername} (${worker.discordId})`);
-  res.json({ valid: true, status: "VALID", worker: { id: worker.id, discordId: worker.discordId, discordUsername: worker.discordUsername } });
-});
+router2.post("/workers/validate-key", requireWorkerKey, async (req, res) => {
+    const worker = req.worker;
+    logBus.info(`Worker authenticated: ${worker.discordUsername} (${worker.discordId})`);
+    res.json({ valid: true, status: "VALID", worker: { id: worker.id, discordId: worker.discordId, discordUsername: worker.discordUsername } });
+  });
 router2.get("/workers/leaderboard", requireApiKey, async (req, res) => {
   const period = req.query.period || "alltime";
   const today = getTodayDate();
