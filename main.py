@@ -1,40 +1,5 @@
 
-import sys as _sys
-import subprocess as _subprocess
-import shutil as _shutil
-
-# ── Fix imports inside PyInstaller frozen launcher.exe ───────────────────────
-# When run via launcher.exe the frozen runtime only sees bundled packages.
-# We find the real system Python and always inject its site-packages into
-# sys.path — so any packages the worker installed with pip are found normally.
-def _inject_site_packages():
-    if not getattr(_sys, 'frozen', False):
-        return  # Running real Python already — sys.path is correct
-    _real_py = next(
-        (_shutil.which(c) for c in ("python", "python3", "py") if _shutil.which(c)),
-        None,
-    )
-    if not _real_py:
-        return
-    try:
-        import json as _json
-        _r = _subprocess.run(
-            [_real_py, "-c",
-             "import site, json; d=[];"
-             "(d.extend(site.getsitepackages()) if hasattr(site,'getsitepackages') else None);"
-             "d.append(site.getusersitepackages()); print(json.dumps(d))"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if _r.returncode == 0:
-            for _d in _json.loads(_r.stdout.strip()):
-                if _d and _d not in _sys.path:
-                    _sys.path.insert(0, _d)
-    except Exception:
-        pass
-
-_inject_site_packages()
-del _inject_site_packages, _shutil
-# ─────────────────────────────────────────────────────────────────────────────
+# (no auto-install — all packages are bundled inside launcher.exe by PyInstaller)
 
 import asyncio
 from datetime import datetime
