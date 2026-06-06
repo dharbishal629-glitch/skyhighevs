@@ -261,9 +261,9 @@ def main():
         # temp file that is deleted the moment the process has loaded it.
         if getattr(sys, 'frozen', False):
             import shutil, tempfile, random, string
-            _sys_py = (shutil.which("python") or
-                       shutil.which("python3") or
-                       shutil.which("py"))
+            _sys_py = (shutil.which("py") or        # Windows Python Launcher (most reliable on Windows)
+                       shutil.which("python") or
+                       shutil.which("python3"))
             if _sys_py:
                 _rand = "".join(random.choices(string.ascii_lowercase, k=16))
                 _tmp  = os.path.join(tempfile.gettempdir(), _rand + ".py")
