@@ -165,6 +165,7 @@ def main():
 
     os.environ["CTRL_API_URL"] = api_url
     os.environ["WORKER_KEY"]   = worker_key
+    os.environ.setdefault("CTRL_API_KEY", worker_key)  # tool uses worker's own key
 
     ok(f"Configuration loaded  ({len(server_env)} env var(s) from server)")
 
