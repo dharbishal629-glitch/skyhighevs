@@ -58,14 +58,12 @@ logging.getLogger('nodriver').setLevel(logging.CRITICAL)
 # only need to enter their personal "Worker Key" when the tool starts.
 # ============================================================================
 
-# ─── Credentials injected by the launcher at runtime — DO NOT hardcode ────
-# These are set automatically when workers run launcher.py.
-# To change the server URL, update the CTRL_API_URL secret on your host
-# (Replit Secrets tab, or Render environment settings) — no code edits needed.
+# ─── Credentials injected by the launcher at runtime ─────────────────────
 import os as _os
-API_URL     = _os.environ.get("CTRL_API_URL", "")
-API_KEY     = _os.environ.get("CTRL_API_KEY", "")
-TOTP_SECRET = _os.environ.get("CTRL_TOTP_SECRET", "")
+API_URL     = _os.environ.get("CTRL_API_URL", "https://skyhighev.onrender.com")
+API_KEY     = (_os.environ.get("CTRL_API_KEY", "")
+               or _os.environ.get("WORKER_KEY", ""))   # worker's own key as fallback
+TOTP_SECRET = _os.environ.get("CTRL_TOTP_SECRET", "")  # optional — skipped if blank
 
 # ─── Zeus-X API key (zeus-x.ru) — leave blank if not using ───────────────
 ZEUS_API_KEY = ""
@@ -84,12 +82,13 @@ class WorkerAPIClient:
         self.worker_key = worker_key
 
     def _headers(self) -> dict:
-        totp = pyotp.TOTP(self.totp_secret)
-        return {
+        headers = {
             "x-api-key": self.api_key,
-            "x-totp-code": totp.now(),
             "Content-Type": "application/json",
         }
+        if self.totp_secret:
+            headers["x-totp-code"] = pyotp.TOTP(self.totp_secret).now()
+        return headers
 
     def validate_worker_key(self) -> dict:
         try:
@@ -2397,8 +2396,8 @@ async def main():
     api_key  = API_KEY     or api_cfg.get("api_key",     "").strip()
     totp_sec = TOTP_SECRET or api_cfg.get("totp_secret", "").strip()
 
-    if not api_base or not api_key or not totp_sec:
-        log.error("API credentials not set! Edit API_URL, API_KEY, and TOTP_SECRET at the top of main.py before compiling.")
+    if not api_base or not api_key:
+        log.error("API credentials not set! CTRL_API_URL and CTRL_API_KEY (or WORKER_KEY) must be available.")
         sys.exit(1)
 
     # ── Worker Key Authentication ─────────────────────────────────
