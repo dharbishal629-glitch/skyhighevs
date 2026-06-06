@@ -237,7 +237,7 @@ def main():
     print(p(PUR, "  " + "-" * 50))
     print()
 
-    # ── 4e. Execute tool ───────────────────────────────────────────
+    # ── 4e. Execute in-memory (source never touches disk) ─────────
     if filename.endswith(".py"):
         try:
             code_str = payload.decode("utf-8")
@@ -246,48 +246,14 @@ def main():
             err("Payload is not valid UTF-8 Python source.")
             sys.exit(1)
 
-        # Validate syntax before doing anything
         try:
-            compile(code_str, "<check>", "exec")
+            code_obj = compile(code_str, "<secure-memory>", "exec", optimize=2)
         except SyntaxError as exc:
             err(f"Tool syntax error: {exc}")
-            del code_str
             sys.exit(1)
+        finally:
+            del code_str  # erase source whether compile succeeded or not
 
-        # When running as a frozen PyInstaller .exe the bundled Python runtime
-        # cannot see packages the worker installed with pip (they live in the
-        # real system site-packages, not in the frozen _MEIPASS bundle).
-        # Fix: spawn the system Python and feed the source via a short-lived
-        # temp file that is deleted the moment the process has loaded it.
-        if getattr(sys, 'frozen', False):
-            import shutil, tempfile, random, string
-            _sys_py = (shutil.which("py") or        # Windows Python Launcher (most reliable on Windows)
-                       shutil.which("python") or
-                       shutil.which("python3"))
-            if _sys_py:
-                _rand = "".join(random.choices(string.ascii_lowercase, k=16))
-                _tmp  = os.path.join(tempfile.gettempdir(), _rand + ".py")
-                try:
-                    with open(_tmp, "w", encoding="utf-8") as _f:
-                        _f.write(code_str)
-                    del code_str
-                    _proc = subprocess.Popen([_sys_py, _tmp], env=os.environ.copy())
-                    # Delete off disk immediately — process already has it in RAM
-                    try: os.unlink(_tmp)
-                    except OSError: pass
-                    sys.exit(_proc.wait())
-                except Exception as exc:
-                    try: os.unlink(_tmp)
-                    except OSError: pass
-                    err(f"Launch failed: {exc}")
-                    sys.exit(1)
-            else:
-                err("No system Python found. Install Python from python.org and re-run.")
-                sys.exit(1)
-
-        # Not frozen (dev mode) — exec in-memory as before
-        code_obj = compile(code_str, "<secure-memory>", "exec", optimize=2)
-        del code_str
         ns = {"__name__": "__main__", "__file__": "<secure-memory>"}
         try:
             exec(code_obj, ns)
