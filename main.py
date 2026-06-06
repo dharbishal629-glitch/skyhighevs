@@ -2439,7 +2439,7 @@ async def main():
     log.info("Fetching tool config from server...")
     try:
         import pyotp as _pyotp
-        _totp_now = _pyotp.TOTP(totp_sec).now()
+        _totp_now = _pyotp.TOTP(totp_sec).now() if totp_sec else ""
         _cfg_resp = requests.get(
             f"{api_base.rstrip('/')}/api/config",
             headers={"x-api-key": api_key, "x-totp-code": _totp_now},
