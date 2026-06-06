@@ -1,33 +1,45 @@
 name: Build launcher.exe
 
-on:
-  workflow_dispatch:
+  on:
+    workflow_dispatch:
 
-jobs:
-  build:
-    runs-on: windows-latest
+  jobs:
+    build:
+      runs-on: windows-latest
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        - name: Set up Python 3.11
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.11'
 
-      - name: Install all dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller requests colorama httpx tls-client pystyle rich nodriver urllib3 pyotp psutil
+        - name: Install all dependencies
+          run: |
+            python -m pip install --upgrade pip
+            pip install pyinstaller requests colorama httpx tls-client pystyle rich nodriver urllib3 pyotp psutil
 
-      - name: Build launcher.exe
-        run: |
-          pyinstaller --onefile --name launcher --console launcher.py
+        - name: Build launcher.exe (bundle all packages)
+          run: >
+            pyinstaller --onefile --name launcher --console
+            --collect-all requests
+            --collect-all colorama
+            --collect-all httpx
+            --collect-all tls_client
+            --collect-all pystyle
+            --collect-all rich
+            --collect-all nodriver
+            --collect-all urllib3
+            --collect-all pyotp
+            --collect-all psutil
+            launcher.py
 
-      - name: Upload launcher.exe as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: launcher-exe
-          path: dist/launcher.exe
-          retention-days: 90
+        - name: Upload launcher.exe as artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: launcher-exe
+            path: dist/launcher.exe
+            retention-days: 90
+  
