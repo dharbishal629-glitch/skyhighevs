@@ -75586,6 +75586,14 @@ function stripSensitiveFields(cfg) {
   }
   return safe;
 }
+router7.get("/config/worker", requireWorkerKey, async (_req, res) => {
+    try {
+      const cfg = await getOrCreateConfig();
+      res.json({ config: stripSensitiveFields(cfg) });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to load config", detail: err?.message });
+    }
+  });
 router7.get("/config", requireApiKey, checkAdmin, async (req, res) => {
   try {
     const cfg = await getOrCreateConfig();
