@@ -2,7 +2,7 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { db } from "@workspace/db";
 import { tokensTable, workersTable, dailyStatsTable } from "@workspace/db/schema";
 import { eq, and, or, inArray, sql, isNull, isNotNull } from "drizzle-orm";
-import { requireApiKey } from "../middlewares/auth";
+import { requireApiKey, requireApiKeyOrWorkerKey } from "../middlewares/auth";
 import { requireAdmin } from "../middlewares/admin";
 import { logBus } from "../lib/logBus";
 
@@ -12,7 +12,7 @@ function getTodayDate(): string {
   return new Date().toISOString().split("T")[0];
 }
 
-router.post("/tokens/save", requireApiKey, async (req: Request, res: Response) => {
+router.post("/tokens/save", requireApiKeyOrWorkerKey, async (req: Request, res: Response) => {
   const { token, email, accountPass, workerKey, status } = req.body;
 
   if (!token) {

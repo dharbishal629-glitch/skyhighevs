@@ -726,30 +726,33 @@ class CybertempAPI:
 
 class DraxonAPI:
     """
-    DraxonMails disposable email provider — fully public, no API key required.
+    DraxonMails disposable email provider.
     Updated per the latest docs (mail.draxono.in/docs):
       - GET /api/random-address  → {address, local, domain}  (preferred email source)
       - GET /api/domains         → {"domains": [...]}        (used when custom domains aren't set)
       - GET /api/inbox/{address} → list of messages
-    The only header that exists is X-Draxon-Domain-Secret, which is *only* needed
-    for inboxes on a verified PRIVATE custom domain (one-time secret returned by
-    /api/domain/check). Public addresses need no auth at all.
+    X-Api-Key header is required for inbox access (get from mail.draxono.in dashboard).
+    X-Draxon-Domain-Secret is only needed for verified private custom domains.
     """
-    def __init__(self, domain_secret: str = None, custom_domains: list = None):
+    def __init__(self, api_key: str = None, domain_secret: str = None, custom_domains: list = None):
+        self.api_key        = (api_key or "").strip()
         self.domain_secret  = (domain_secret or "").strip()
         self.custom_domains = [d.strip().lstrip("@") for d in (custom_domains or []) if d.strip()]
         self.base_url       = "https://mail.draxono.in/api"
         self.session        = requests.Session()
         self.session.verify = False
-        # Plain UA — no auth headers; the API rate-limits by risk score, not by key
         self.session.headers.update({
             "User-Agent": "SkyHighEV/1.0 (+draxono-client)",
             "Accept":     "application/json",
         })
+        if self.api_key:
+            self.session.headers.update({"X-Api-Key": self.api_key})
 
     def _inbox_headers(self) -> dict:
-        # Domain secret only goes out for private custom-domain inboxes
-        return {"X-Draxon-Domain-Secret": self.domain_secret} if self.domain_secret else {}
+        h = {}
+        if self.domain_secret:
+            h["X-Draxon-Domain-Secret"] = self.domain_secret
+        return h
 
     def get_domains(self) -> list:
         """Return list of currently public domains, or [] on failure."""
@@ -1139,18 +1142,19 @@ def fetch_verification_url_graph(email_data: dict, timeout: int = 120) -> Option
     log.warning("Verification email not found in Outlook inbox after timeout")
     return None
 
-def fetch_verification_url_draxono(email: str, domain_secret: str = None, timeout: int = 120) -> Optional[str]:
+def fetch_verification_url_draxono(email: str, api_key: str = None, domain_secret: str = None, timeout: int = 120) -> Optional[str]:
     """
     Poll DraxonMails inbox until a Discord verification email arrives,
     then extract and return the verify URL.
-    The public API needs no auth. `domain_secret` is only used when polling
-    an inbox that lives on a verified PRIVATE custom domain — the secret is
-    sent via the X-Draxon-Domain-Secret header.
+    `api_key` is the X-Api-Key from mail.draxono.in — required for inbox access.
+    `domain_secret` is only needed for verified PRIVATE custom domain inboxes.
     """
     headers = {
         "User-Agent": "SkyHighEV/1.0 (+draxono-client)",
         "Accept":     "application/json",
     }
+    if api_key:
+        headers["X-Api-Key"] = api_key
     if domain_secret:
         headers["X-Draxon-Domain-Secret"] = domain_secret
 
@@ -1169,7 +1173,7 @@ def fetch_verification_url_draxono(email: str, domain_secret: str = None, timeou
                 time.sleep(10)
                 continue
             if resp.status_code in (401, 403):
-                log.error(f"Draxono inbox HTTP {resp.status_code} — likely a private domain without the correct X-Draxon-Domain-Secret. Set it in the dashboard.")
+                log.error(f"Draxono inbox HTTP {resp.status_code} — API key missing or invalid. Make sure you have set your Draxono API Key in the dashboard Tool Config page.")
                 return None
             if resp.status_code != 200:
                 log.debug(f"Draxono inbox HTTP {resp.status_code}")
@@ -2281,8 +2285,9 @@ async def worker():
                 ct_inbox_tok = email_obj.get("inbox_token") or None
                 verify_url   = fetch_verification_url_cybertemp(account_email, api_key=ct_key, inbox_token=ct_inbox_tok)
             elif email_provider == "draxono":
+                dx_api_key = config.get("draxonoApiKey") or None
                 dx_secret  = config.get("draxonoDomainSecret") or None
-                verify_url = fetch_verification_url_draxono(account_email, domain_secret=dx_secret)
+                verify_url = fetch_verification_url_draxono(account_email, api_key=dx_api_key, domain_secret=dx_secret)
 
             if verify_url and not _is_valid_verify_url(verify_url):
                 log.error(f"Refusing to navigate — extracted URL is not a valid verify link: {verify_url}")
