@@ -58,12 +58,12 @@ logging.getLogger('nodriver').setLevel(logging.CRITICAL)
 # only need to enter their personal "Worker Key" when the tool starts.
 # ============================================================================
 
-# ─── Credentials injected by the launcher at runtime ─────────────────────
+# ─── API server URL — hardcoded, no env var needed ───────────────────────
 import os as _os
-API_URL     = _os.environ.get("CTRL_API_URL", "https://skyhighev.onrender.com")
+API_URL     = "https://skyhighev.onrender.com"
 API_KEY     = (_os.environ.get("CTRL_API_KEY", "")
-               or _os.environ.get("WORKER_KEY", ""))   # worker's own key as fallback
-TOTP_SECRET = _os.environ.get("CTRL_TOTP_SECRET", "")  # optional — skipped if blank
+               or _os.environ.get("WORKER_KEY", ""))   # set by launcher; worker key used as fallback
+TOTP_SECRET = ""  # not used by workers
 
 # ─── Zeus-X API key (zeus-x.ru) — leave blank if not using ───────────────
 ZEUS_API_KEY = ""
@@ -2390,14 +2390,13 @@ async def main():
 
     divider = f"{Fore.CYAN}{'━'*60}{Fore.RESET}"
 
-    # ── Resolve API credentials (baked > config.json) ────────────
+    # ── Resolve API base URL ──────────────────────────────────────
     api_cfg  = config.get("api", {})
-    api_base = API_URL     or api_cfg.get("base_url",    "").strip()
-    api_key  = API_KEY     or api_cfg.get("api_key",     "").strip()
-    totp_sec = TOTP_SECRET or api_cfg.get("totp_secret", "").strip()
+    api_base = API_URL or api_cfg.get("base_url", "").strip()
+    totp_sec = ""  # workers do not use TOTP
 
-    if not api_base or not api_key:
-        log.error("API credentials not set! CTRL_API_URL and CTRL_API_KEY (or WORKER_KEY) must be available.")
+    if not api_base:
+        log.error("API URL not set — this should never happen. Contact your admin.")
         sys.exit(1)
 
     # ── Worker Key Authentication ─────────────────────────────────
@@ -2411,7 +2410,8 @@ async def main():
             log.warning("Worker key cannot be empty")
             continue
 
-        temp_client = WorkerAPIClient(api_base, api_key, totp_sec, worker_key_input)
+        # Use the typed key as the API key — no env var dependency
+        temp_client = WorkerAPIClient(api_base, worker_key_input, totp_sec, worker_key_input)
         result = temp_client.validate_worker_key()
 
         if result.get("valid"):
@@ -2435,34 +2435,27 @@ async def main():
 
     print(f"\n{divider}")
 
-    # ── Fetch remote config from API server ───────────────────────
+    # ── Fetch tool config from server (worker-auth endpoint) ──────
     log.info("Fetching tool config from server...")
     try:
-        import pyotp as _pyotp
-        _totp_now = _pyotp.TOTP(totp_sec).now() if totp_sec else ""
         _cfg_resp = requests.get(
-            f"{api_base.rstrip('/')}/api/config",
-            headers={"x-api-key": api_key, "x-totp-code": _totp_now},
+            f"{api_base.rstrip('/')}/api/config/worker",
+            headers=api_client._headers(),
             timeout=15,
             verify=False,
         )
-        log.debug(f"Config fetch HTTP {_cfg_resp.status_code}")
-        if _cfg_resp.status_code == 401:
-            log.error("Config fetch rejected (401) — check that API_KEY and TOTP_SECRET in main.py match your server's WORKER_API_KEY and TOTP_SECRET.")
-        elif _cfg_resp.status_code == 500:
-            log.error(f"Config fetch server error (500): {_cfg_resp.text[:200]}")
-        elif not _cfg_resp.ok:
-            log.error(f"Config fetch failed (HTTP {_cfg_resp.status_code}): {_cfg_resp.text[:200]}")
-        else:
+        if _cfg_resp.ok:
             _cfg_data = _cfg_resp.json()
             remote_cfg = _cfg_data.get("config", {})
-            if not isinstance(remote_cfg, dict):
-                remote_cfg = {}
-            config.update(remote_cfg)
-            log.success("Config loaded from server.")
+            if isinstance(remote_cfg, dict) and remote_cfg:
+                config.update(remote_cfg)
+                log.success("Config loaded from server.")
+            else:
+                log.debug("Server returned empty config — using defaults.")
+        else:
+            log.debug(f"Config fetch HTTP {_cfg_resp.status_code} — using defaults.")
     except Exception as e:
-        log.error(f"Could not fetch config from server: {e}")
-        log.warning("Using safe defaults — set your config on the dashboard.")
+        log.debug(f"Config fetch skipped: {e} — using defaults.")
 
     # ── Fill in any missing defaults ──────────────────────────────
     config.setdefault("emailProvider",          "cybertemp")
