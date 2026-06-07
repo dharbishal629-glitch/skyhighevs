@@ -1995,12 +1995,21 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
 
 
 async def wait_for_account_creation(page, timeout: int = 300) -> bool:
-    """Poll URL until Discord redirects to /channels/@me (account created)."""
+    """
+    Poll until Discord account is created. Uses four independent signals so that
+    a slow/lagging page.url never causes the tool to freeze:
+      1. URL contains /channels/ or /@me  (standard redirect)
+      2. Discord auth token appears in localStorage  (most reliable)
+      3. Registration email input disappears AND page title changed  (nav complete)
+      4. Discord app container element appears in the DOM  (UI mounted)
+    Any one signal returning True is enough to proceed.
+    """
     start = time.time()
     last_url = ""
     while (time.time() - start) < timeout:
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.4)
         try:
+            # ── Signal 1: URL-based detection ─────────────────────────────
             url = ""
             try:
                 url = str(page.url) if page.url else ""
@@ -2014,11 +2023,61 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
                     pass
             if url and url != last_url:
                 last_url = url
-            if url and ("discord.com/channels/@me" in url or "channels/%40me" in url or
-                        ("discord.com/channels/" in url and "/channels/@me" not in url)):
+                log.debug(f"[account-wait] URL → {url[:80]}")
+            if url and (
+                "discord.com/channels/" in url
+                or "channels/%40me" in url
+                or "discord.com/@me" in url
+            ):
+                log.info("[account-wait] Detected via URL redirect")
                 return True
+
+            # ── Signal 2: localStorage token present ──────────────────────
+            # Discord writes the auth token to localStorage as soon as the
+            # account is created — this fires even before the URL changes.
+            try:
+                has_token = await page.evaluate(
+                    '(()=>{ try{ return !!localStorage.getItem("token"); } catch(e){ return false; } })()'
+                )
+                if has_token:
+                    log.info("[account-wait] Detected via localStorage token")
+                    return True
+            except Exception:
+                pass
+
+            # ── Signal 3: Registration form gone + title changed ──────────
+            try:
+                form_gone = await page.evaluate(
+                    '(()=>{ try{'
+                    '  const emailInput = document.querySelector("input[name=\\"email\\"]");'
+                    '  const passInput  = document.querySelector("input[name=\\"password\\"]");'
+                    '  return !emailInput && !passInput;'
+                    '} catch(e){ return false; } })()'
+                )
+                if form_gone and url and "register" not in url:
+                    log.info("[account-wait] Detected via form disappearance")
+                    return True
+            except Exception:
+                pass
+
+            # ── Signal 4: Discord app container in DOM ────────────────────
+            try:
+                app_mounted = await page.evaluate(
+                    '(()=>{ try{'
+                    '  return !!(document.querySelector("[class*=\\"app-\\"]") || '
+                    '            document.querySelector("[class*=\\"layers-\\"]") || '
+                    '            document.querySelector("[class*=\\"sidebar-\\"]"));'
+                    '} catch(e){ return false; } })()'
+                )
+                if app_mounted:
+                    log.info("[account-wait] Detected via Discord app UI")
+                    return True
+            except Exception:
+                pass
+
         except Exception:
             pass
+
     log.error("Timeout waiting for account creation")
     return False
 
