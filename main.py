@@ -1600,6 +1600,33 @@ async def fill_date_of_birth(page) -> bool:
 
 # Older signature used elsewhere; keep a no-op JS leftover removed
 
+async def _send_keys_robust(page, selector: str, value: str, timeout: int = 10000, retries: int = 4) -> bool:
+    """
+    Find an input by selector and send keys to it. Retries if the node reference
+    goes stale (-32000 / 'Node with given id does not belong to the document'),
+    which happens when React re-renders between element lookup and send_keys.
+    Each retry re-queries the DOM fresh.
+    """
+    for attempt in range(retries):
+        try:
+            # Always re-query the element on every attempt — never reuse a stale ref
+            el = await page.wait_for(selector, timeout=timeout)
+            await asyncio.sleep(0.15)   # let React settle after finding the node
+            await el.clear_input()      # clear any prior partial content
+            await el.send_keys(value)
+            return True
+        except Exception as e:
+            msg = str(e)
+            # -32000 = stale node ref; retry with a fresh lookup
+            if "-32000" in msg or "given id" in msg or "does not belong" in msg:
+                log.debug(f"Stale node ref on {selector} (attempt {attempt+1}/{retries}) — retrying...")
+                await asyncio.sleep(0.3 * (attempt + 1))
+                continue
+            # Any other error — bubble up immediately
+            raise
+    return False
+
+
 async def fill_registration_form(page, email: str, display_name: str, username: str, password: str) -> bool:
     """Fill Discord registration form using native send_keys so React tracks the input."""
     try:
@@ -1607,33 +1634,36 @@ async def fill_registration_form(page, email: str, display_name: str, username: 
 
         # Email
         try:
-            el = await page.wait_for('input[name="email"]', timeout=10000)
-            await el.send_keys(email)
+            ok = await _send_keys_robust(page, 'input[name="email"]', email, timeout=12000)
+            if not ok:
+                log.error("Email field: all retry attempts failed"); return False
         except Exception as e:
             log.error(f"Email field error: {e}"); return False
 
         # Display Name (global_name)
         try:
-            el = await page.wait_for('input[name="global_name"]', timeout=3000)
-            await el.send_keys(display_name)
+            await _send_keys_robust(page, 'input[name="global_name"]', display_name, timeout=3000)
         except Exception as e:
             log.debug(f"Display name field not found (may not exist): {e}")
 
         # Username
         try:
-            el = await page.wait_for('input[name="username"]', timeout=3000)
-            await el.send_keys(username)
+            ok = await _send_keys_robust(page, 'input[name="username"]', username, timeout=4000)
+            if not ok:
+                log.error("Username field: all retry attempts failed"); return False
         except Exception as e:
             log.error(f"Username field error: {e}"); return False
 
         # Password
         try:
-            el = await page.wait_for('input[aria-label="Password"]', timeout=3000)
-            await el.send_keys(password)
+            ok = await _send_keys_robust(page, 'input[aria-label="Password"]', password, timeout=4000)
+            if not ok:
+                raise Exception("all retries failed")
         except Exception:
             try:
-                el = await page.wait_for('input[name="password"]', timeout=2000)
-                await el.send_keys(password)
+                ok = await _send_keys_robust(page, 'input[name="password"]', password, timeout=3000)
+                if not ok:
+                    log.error("Password field: all retry attempts failed"); return False
             except Exception as e:
                 log.error(f"Password field error: {e}"); return False
 
@@ -2060,20 +2090,29 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
             except Exception:
                 pass
 
-            # ── Signal 4: Discord app container in DOM ────────────────────
-            try:
-                app_mounted = await page.evaluate(
-                    '(()=>{ try{'
-                    '  return !!(document.querySelector("[class*=\\"app-\\"]") || '
-                    '            document.querySelector("[class*=\\"layers-\\"]") || '
-                    '            document.querySelector("[class*=\\"sidebar-\\"]"));'
-                    '} catch(e){ return false; } })()'
-                )
-                if app_mounted:
-                    log.info("[account-wait] Detected via Discord app UI")
-                    return True
-            except Exception:
-                pass
+            # ── Signal 4: Discord logged-in-only UI elements ─────────────
+            # Guard: ONLY check if we're no longer on the register page.
+            # The register page itself is a React SPA and has generic app-level
+            # containers — checking them without the URL guard causes a false positive.
+            # We look for elements that ONLY exist when the user is logged in:
+            #   - [aria-label="Servers"] = the guilds/server list nav
+            #   - [data-list-id="guildsnav"] = the server sidebar
+            #   - [class*="guilds-"] = server icon list
+            if url and "register" not in url and "login" not in url:
+                try:
+                    logged_in_ui = await page.evaluate(
+                        '(()=>{ try{'
+                        '  return !!(document.querySelector("[aria-label=\\"Servers\\"]") || '
+                        '            document.querySelector("[data-list-id=\\"guildsnav\\"]") || '
+                        '            document.querySelector("[class*=\\"guilds-\\"]") || '
+                        '            document.querySelector("[class*=\\"privateChannels-\\"]"));'
+                        '} catch(e){ return false; } })()'
+                    )
+                    if logged_in_ui:
+                        log.info("[account-wait] Detected via logged-in Discord UI")
+                        return True
+                except Exception:
+                    pass
 
         except Exception:
             pass
