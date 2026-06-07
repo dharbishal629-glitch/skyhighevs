@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { db, pool } from "@workspace/db";
 import { toolConfigTable } from "@workspace/db/schema";
-import { requireApiKey } from "../middlewares/auth";
+import { requireApiKey, requireWorkerKey } from "../middlewares/auth";
 import { requireAdmin, checkAdmin } from "../middlewares/admin";
 
 const router: IRouter = Router();
@@ -105,6 +105,16 @@ function stripSensitiveFields(cfg: Record<string, unknown>): Record<string, unkn
   }
   return safe;
 }
+
+// Workers fetch their safe config using their own key — no admin auth needed
+router.get("/config/worker", requireWorkerKey, async (_req: Request, res: Response) => {
+  try {
+    const cfg = await getOrCreateConfig();
+    res.json({ config: stripSensitiveFields(cfg) });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to load config", detail: err?.message });
+  }
+});
 
 // Workers can only read safe fields — API keys are never exposed
 router.get("/config", requireApiKey, checkAdmin, async (req: Request, res: Response) => {
