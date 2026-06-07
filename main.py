@@ -720,25 +720,24 @@ class CybertempAPI:
             return {"success": False, "error": str(e)}
 
 # ============================================================================
-# DRAXONO MAIL API  (mail.draxono.in — public disposable inboxes, no API key)
-# Docs: https://mail.draxono.in/docs
+# DRAXONO MAIL API  (draxonmails.xyz — new domain as of 2026)
+# Docs: https://draxonmails.xyz/docs
 # ============================================================================
 
 class DraxonAPI:
     """
     DraxonMails disposable email provider.
-    Updated per the latest docs (mail.draxono.in/docs):
-      - GET /api/random-address  → {address, local, domain}  (preferred email source)
-      - GET /api/domains         → {"domains": [...]}        (used when custom domains aren't set)
-      - GET /api/inbox/{address} → list of messages
-    X-Api-Key header is required for inbox access (get from mail.draxono.in dashboard).
-    X-Draxon-Domain-Secret is only needed for verified private custom domains.
+    Updated per the latest docs (draxonmails.xyz/docs):
+      - GET /api/v1/random-address  → {address, local, domain}  (preferred email source)
+      - GET /api/v1/domains         → list of public domains
+      - GET /api/v1/inbox/{address} → list of messages
+    X-Api-Key header is REQUIRED for automation/scripts (get from draxonmails.xyz account).
     """
     def __init__(self, api_key: str = None, domain_secret: str = None, custom_domains: list = None):
         self.api_key        = (api_key or "").strip()
         self.domain_secret  = (domain_secret or "").strip()
         self.custom_domains = [d.strip().lstrip("@") for d in (custom_domains or []) if d.strip()]
-        self.base_url       = "https://mail.draxono.in/api"
+        self.base_url       = "https://draxonmails.xyz/api/v1"
         self.session        = requests.Session()
         self.session.verify = False
         self.session.headers.update({
@@ -746,7 +745,7 @@ class DraxonAPI:
             "Accept":     "application/json",
         })
         if self.api_key:
-            self.session.headers.update({"X-Api-Key": self.api_key})
+            self.session.headers.update({"x-api-key": self.api_key})
 
     def _inbox_headers(self) -> dict:
         h = {}
@@ -1146,19 +1145,20 @@ def fetch_verification_url_draxono(email: str, api_key: str = None, domain_secre
     """
     Poll DraxonMails inbox until a Discord verification email arrives,
     then extract and return the verify URL.
-    `api_key` is the X-Api-Key from mail.draxono.in — required for inbox access.
-    `domain_secret` is only needed for verified PRIVATE custom domain inboxes.
+    New domain: draxonmails.xyz (API v1). API key required for automation.
+    `api_key` is the x-api-key from draxonmails.xyz account — required for inbox access.
+    `domain_secret` is only needed for private subscriber alias inboxes.
     """
     headers = {
         "User-Agent": "SkyHighEV/1.0 (+draxono-client)",
         "Accept":     "application/json",
     }
     if api_key:
-        headers["X-Api-Key"] = api_key
+        headers["x-api-key"] = api_key
     if domain_secret:
         headers["X-Draxon-Domain-Secret"] = domain_secret
 
-    url = f"https://mail.draxono.in/api/inbox/{email}"
+    url = f"https://draxonmails.xyz/api/v1/inbox/{email}"
     start_time = time.time()
     attempt    = 0
     seen       = set()
@@ -2094,9 +2094,10 @@ async def worker():
                 log.warning("Hotmail007 selected but no client key — falling back to CyberTemp.")
 
         elif email_provider == "draxono":
+            dx_api_key = config.get("draxonoApiKey", "") or None
             dx_secret  = config.get("draxonoDomainSecret", "") or None
             dx_domains = _parse_domains(config.get("draxonoCustomDomains", ""))
-            result = DraxonAPI(dx_secret, custom_domains=dx_domains).get_email()
+            result = DraxonAPI(api_key=dx_api_key, domain_secret=dx_secret, custom_domains=dx_domains).get_email()
             if result.get("success"):
                 email_obj = result
                 log.success(f"Draxono email: {result['email']}")
@@ -2468,11 +2469,9 @@ async def main():
     config.setdefault("hotmail007ClientKey",    "")
     config.setdefault("cybertempApiKey",        "")
     config.setdefault("cybertempCustomDomains", "")
+    config.setdefault("draxonoApiKey",          "")
     config.setdefault("draxonoDomainSecret",    "")
     config.setdefault("draxonoCustomDomains",   "")
-    # Backward compat: an older field name was used briefly — promote it if present
-    if config.get("draxonoApiKey") and not config.get("draxonoDomainSecret"):
-        config["draxonoDomainSecret"] = config["draxonoApiKey"]
     config.setdefault("browser",             "chrome")
     config.setdefault("threads",             1)
     config.setdefault("target",              0)
