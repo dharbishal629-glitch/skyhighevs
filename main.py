@@ -2422,78 +2422,90 @@ def ensure_nopecha_extension() -> Optional[str]:
 
 async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
     """
-    Inject the NoPeCHA API key into the extension via its popup page.
-    Called once right after the browser is launched with --load-extension.
-    Takes roughly 3–6 seconds.
+    Inject the NoPeCHA API key into the extension popup using sequential
+    synchronous JS evaluate() calls.
+
+    nodriver's evaluate() does NOT await Promise results — it returns None
+    for any async/Promise-returning JS.  Every call here is a plain sync
+    IIFE that returns a string immediately so we always get a real result.
     """
+    safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
+
     try:
         ext_page = await browser.get(f"chrome-extension://{ext_id}/popup.html")
-        await asyncio.sleep(3)
+        await asyncio.sleep(3)   # let the popup fully render
 
-        # Escape the key for safe JS string interpolation
-        safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
+        # ── Step 1: find a visible input, or click "Enter your key" trigger ──
+        found_input = False
+        for attempt in range(14):
+            # Check for a visible text input
+            has_input = await ext_page.evaluate(
+                "(() => { "
+                "  let inp = Array.from(document.querySelectorAll('input'))"
+                "    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
+                "  return inp ? 'yes' : 'no';"
+                "})()"
+            )
+            if has_input == "yes":
+                found_input = True
+                break
 
-        result = await ext_page.evaluate(f"""
-            (async () => {{
-                let targetInput = null;
-                for (let step = 0; step < 14; step++) {{
-                    let inputs = Array.from(document.querySelectorAll('input'));
-                    let visible = inputs.find(i =>
-                        i.getBoundingClientRect().width > 0 && i.type !== 'checkbox'
-                    );
-                    if (visible) {{ targetInput = visible; break; }}
+            # Click any "Enter your key" trigger to reveal the input
+            await ext_page.evaluate(
+                "(() => {"
+                "  let all = Array.from(document.querySelectorAll('*'));"
+                "  let t = all.find(e => e.textContent && e.textContent.includes('Enter your key') && e.children.length === 0);"
+                "  if (t) { t.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); t.click(); if(t.parentElement) t.parentElement.click(); }"
+                "  return t ? 'clicked' : 'none';"
+                "})()"
+            )
+            await asyncio.sleep(0.5)
 
-                    // Click "Enter your key" text to reveal the input field
-                    let all = Array.from(document.querySelectorAll('*'));
-                    let trigger = all.find(e =>
-                        e.textContent && e.textContent.includes('Enter your key') &&
-                        e.children.length === 0
-                    );
-                    if (trigger) {{
-                        trigger.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
-                        trigger.click();
-                        if (trigger.parentElement) trigger.parentElement.click();
-                    }}
-                    await new Promise(r => setTimeout(r, 500));
-                }}
+        if not found_input:
+            log.warning("[NoPeCHA] Could not find key input field in popup — key not injected")
+            return False
 
-                if (!targetInput) return 'error:no-input-found';
+        # ── Step 2: set the value via native HTMLInputElement setter ──────────
+        set_result = await ext_page.evaluate(
+            f"(() => {{"
+            f"  let inp = Array.from(document.querySelectorAll('input'))"
+            f"    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
+            f"  if (!inp) return 'no-input';"
+            f"  let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+            f"  if (setter) setter.call(inp, '{safe_key}'); else inp.value = '{safe_key}';"
+            f"  inp.dispatchEvent(new Event('input',  {{bubbles:true}}));"
+            f"  inp.dispatchEvent(new Event('change', {{bubbles:true}}));"
+            f"  return 'set';"
+            f"}})()"
+        )
+        log.debug(f"[NoPeCHA] Value set: {set_result}")
+        await asyncio.sleep(0.4)
 
-                // Set value via native setter to bypass React/Vue controlled inputs
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                if (setter) setter.call(targetInput, '{safe_key}');
-                else targetInput.value = '{safe_key}';
+        # ── Step 3: click Save button (or press Enter as fallback) ────────────
+        save_result = await ext_page.evaluate(
+            "(() => {"
+            "  let all = Array.from(document.querySelectorAll('*'));"
+            "  let btn = all.find(e => (e.textContent||'').trim().toLowerCase() === 'save'"
+            "    && e.getBoundingClientRect().width > 0 && !['SCRIPT','STYLE','INPUT'].includes(e.tagName));"
+            "  if (btn) { btn.click(); return 'saved-via-button'; }"
+            "  let inp = Array.from(document.querySelectorAll('input'))"
+            "    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
+            "  if (inp) {"
+            "    inp.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,which:13,bubbles:true}));"
+            "    inp.dispatchEvent(new KeyboardEvent('keyup',  {key:'Enter',keyCode:13,which:13,bubbles:true}));"
+            "    return 'saved-via-enter';"
+            "  }"
+            "  return 'no-save-target';"
+            "})()"
+        )
+        await asyncio.sleep(1)
+        log.debug(f"[NoPeCHA] Save result: {save_result}")
 
-                targetInput.dispatchEvent(new Event('input',  {{bubbles:true}}));
-                targetInput.dispatchEvent(new Event('change', {{bubbles:true}}));
-                await new Promise(r => setTimeout(r, 400));
-
-                // Try clicking Save button
-                let all2 = Array.from(document.querySelectorAll('*'));
-                let saveBtn = all2.find(e =>
-                    (e.textContent || '').trim().toLowerCase() === 'save' &&
-                    e.getBoundingClientRect().width > 0 &&
-                    !['SCRIPT','STYLE','INPUT'].includes(e.tagName)
-                );
-                if (saveBtn) {{ saveBtn.click(); return 'saved-via-button'; }}
-
-                // Fallback: press Enter
-                targetInput.dispatchEvent(new KeyboardEvent('keydown',
-                    {{key:'Enter', keyCode:13, which:13, bubbles:true}}));
-                targetInput.dispatchEvent(new KeyboardEvent('keyup',
-                    {{key:'Enter', keyCode:13, which:13, bubbles:true}}));
-                return 'saved-via-enter';
-            }})()
-        """)
-
-        await asyncio.sleep(2)
-        log.debug(f"[NoPeCHA] Key inject result: {result}")
-        if result and "error" not in str(result):
-            log.success("[NoPeCHA] API key injected into extension ✓")
+        if save_result and "no-" not in str(save_result):
+            log.success(f"[NoPeCHA] API key injected into extension ✓ ({save_result})")
             return True
-        log.warning(f"[NoPeCHA] Key inject uncertain: {result}")
+
+        log.warning(f"[NoPeCHA] Key injection uncertain: set={set_result} save={save_result}")
         return False
 
     except Exception as e:
@@ -2510,11 +2522,11 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     waits up to `timeout` seconds for the extension to solve and clear it.
     """
     _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
-    _APPEAR_MAX = 20    # seconds to wait for captcha to show up
-    _POLL_STEP  = 0.5   # polling interval
+    _APPEAR_MAX = 120   # seconds to wait for captcha to show up
+    _POLL_STEP  = 5.0   # polling interval (check every 5 seconds)
 
     # ── Phase 1: wait for hCaptcha iframe to appear ───────────────────────
-    log.debug("[NoPeCHA] Waiting for hCaptcha to load...")
+    log.debug("[NoPeCHA] Waiting for hCaptcha to load (up to 120s)...")
     appeared = False
     for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
         await asyncio.sleep(_POLL_STEP)
