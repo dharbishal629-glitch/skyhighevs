@@ -67,6 +67,13 @@ async function initDb() {
         config     JSON NOT NULL DEFAULT '{}',
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS fingerprints (
+        id         SERIAL PRIMARY KEY,
+        data       TEXT NOT NULL,
+        enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
     `);
     logger.info("Database tables verified/created");
   } catch (err) {
