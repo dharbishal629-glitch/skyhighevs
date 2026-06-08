@@ -2024,6 +2024,197 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
     return False
 
 
+async def solve_captcha_nopecha(page, nopecha_key: str) -> bool:
+    """
+    Solve hCaptcha using the NoPeCHA REST API (no extension, no profile needed).
+
+    Flow:
+      1. Extract hCaptcha sitekey from the page DOM / iframe src
+      2. POST task to api.nopecha.com → get task ID
+      3. Poll until token is ready (up to 120 s)
+      4. Inject token into the page and trigger hCaptcha callback
+      5. Return True if captcha iframe disappears within 10 s
+    """
+    NOPECHA_BASE = "https://api.nopecha.com"
+
+    # ── 1. Check captcha is actually present ─────────────────────────────────
+    try:
+        has_cap = await page.evaluate(
+            "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
+        )
+    except Exception:
+        has_cap = False
+    if not has_cap:
+        log.debug("[NoPeCHA] No hCaptcha detected on page — skipping")
+        return True   # nothing to solve
+
+    # ── 2. Extract sitekey ───────────────────────────────────────────────────
+    try:
+        sitekey = await page.evaluate(r"""() => {
+            // data-sitekey on a container element
+            const el = document.querySelector('[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            // sitekey in hCaptcha iframe src
+            const iframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+            for (const f of iframes) {
+                const m = f.src.match(/[?&]sitekey=([^&]+)/);
+                if (m) return decodeURIComponent(m[1]);
+            }
+            return null;
+        }""")
+    except Exception:
+        sitekey = None
+
+    if not sitekey:
+        log.warning("[NoPeCHA] Could not extract hCaptcha sitekey — falling back")
+        return False
+
+    try:
+        page_url = await page.evaluate('window.location.href')
+    except Exception:
+        page_url = "https://discord.com/register"
+
+    log.info(f"[NoPeCHA] Submitting task (sitekey={sitekey[:12]}...)")
+
+    # ── 3. Submit task to NoPeCHA ────────────────────────────────────────────
+    try:
+        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: requests.post(
+            f"{NOPECHA_BASE}/",
+            json={
+                "type":    "hcaptcha",
+                "key":     nopecha_key,
+                "sitekey": sitekey,
+                "url":     page_url,
+            },
+            timeout=20,
+        ))
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"[NoPeCHA] API submit error: {e}")
+        return False
+
+    if data.get("error"):
+        err_map = {
+            1:  "invalid/empty request",
+            2:  "invalid API key",
+            3:  "rate limited",
+            9:  "account banned",
+            10: "out of credits",
+        }
+        code = data.get("error", "?")
+        log.warning(f"[NoPeCHA] Submit failed: {err_map.get(code, str(code))} — {data.get('message','')}")
+        return False
+
+    task_id = data.get("id")
+    if not task_id:
+        log.warning(f"[NoPeCHA] No task ID in response: {data}")
+        return False
+
+    log.info(f"[NoPeCHA] Task submitted (id={task_id}) — polling for token...")
+
+    # ── 4. Poll for result ───────────────────────────────────────────────────
+    token = None
+    for tick in range(60):   # max 120 s (2 s per tick)
+        await asyncio.sleep(2)
+        try:
+            poll = await asyncio.get_event_loop().run_in_executor(None, lambda: requests.get(
+                f"{NOPECHA_BASE}/",
+                params={"id": task_id, "key": nopecha_key},
+                timeout=15,
+            ))
+            pdata = poll.json()
+        except Exception as e:
+            log.debug(f"[NoPeCHA] Poll error (tick {tick}): {e}")
+            continue
+
+        if pdata.get("error") == 1:
+            # "not ready" — still solving
+            continue
+        if pdata.get("error"):
+            code = pdata.get("error")
+            log.warning(f"[NoPeCHA] Poll error code {code}: {pdata.get('message','')}")
+            return False
+
+        results = pdata.get("data")
+        if results and len(results) > 0:
+            token = results[0]
+            break
+
+    if not token:
+        log.warning("[NoPeCHA] Timed out waiting for token (120 s)")
+        return False
+
+    log.success(f"[NoPeCHA] Token received ({len(token)} chars) — injecting...")
+
+    # ── 5. Inject token and trigger hCaptcha callback ────────────────────────
+    # We need to:
+    #   a) Set the hidden textarea Discord reads for the response
+    #   b) Call the widget's onVerify callback so Discord's React state updates
+    inject_js = r"""
+    (token) => {
+        try {
+            // Set every h-captcha-response textarea (there may be hidden ones)
+            document.querySelectorAll('[name="h-captcha-response"]').forEach(el => {
+                el.value = token;
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            });
+
+            // Try calling the hcaptcha JS API callback
+            // data-callback attr tells us which global function to call
+            const widget = document.querySelector('[data-hcaptcha-widget-id]');
+            const cbName = document.querySelector('[data-callback]')?.getAttribute('data-callback');
+            if (cbName && window[cbName]) {
+                window[cbName](token);
+                return 'called data-callback: ' + cbName;
+            }
+
+            // Fallback: walk window.hcaptcha internal state
+            if (window.hcaptcha) {
+                // Execute on all mounted widgets
+                const wid = widget?.getAttribute('data-hcaptcha-widget-id') || '0';
+                // hcaptcha.execute does not accept a token; use internal handler
+                // Try internal __H.__h map (varies by version)
+                const H = window.hcaptcha;
+                if (H.submit) { H.submit(wid, token); return 'hcaptcha.submit'; }
+                if (H.setResponse) { H.setResponse(wid, token); return 'hcaptcha.setResponse'; }
+            }
+
+            // Last resort: fire a submit on the form — Discord may re-validate
+            const form = document.querySelector('form');
+            if (form) {
+                const submitEvent = new Event('submit', {bubbles: true, cancelable: true});
+                form.dispatchEvent(submitEvent);
+                return 'form.submit dispatched';
+            }
+            return 'token set (no callback found)';
+        } catch(e) {
+            return 'inject error: ' + e.message;
+        }
+    }
+    """
+    try:
+        result = await page.evaluate(inject_js, token)
+        log.debug(f"[NoPeCHA] Inject result: {result}")
+    except Exception as e:
+        log.warning(f"[NoPeCHA] Inject error: {e}")
+        return False
+
+    # ── 6. Confirm captcha is gone ───────────────────────────────────────────
+    for _ in range(20):   # 10 s
+        await asyncio.sleep(0.5)
+        try:
+            still_there = await page.evaluate(
+                "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
+            )
+            if not still_there:
+                log.success("[NoPeCHA] Captcha cleared!")
+                return True
+        except Exception:
+            return True   # page navigated → solved
+    log.warning("[NoPeCHA] Captcha iframe still present after inject")
+    return False
+
+
 async def wait_for_account_creation(page, timeout: int = 300) -> bool:
     """
     Poll until Discord account is created. Uses four independent signals so that
@@ -2247,26 +2438,6 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # NoPeCHA: if enabled, launch with a copy of the NoPeCHA profile so
-        # the extension is active. We copy rather than use the folder directly
-        # because Chrome refuses to open a profile that's already in use by
-        # another instance (important for multi-thread runs).
-        _nopecha_tmp_profile = None
-        if config.get("nopechaEnabled"):
-            base_profile = config.get("nopechaProfileDir", "nopecha_profile")
-            if not os.path.isabs(base_profile):
-                base_profile = os.path.join(BASE_DIR, base_profile)
-            if os.path.isdir(base_profile):
-                import tempfile
-                _nopecha_tmp_profile = tempfile.mkdtemp(prefix="skyhigh_nopecha_")
-                shutil.rmtree(_nopecha_tmp_profile)
-                shutil.copytree(base_profile, _nopecha_tmp_profile)
-                start_kw["user_data_dir"] = _nopecha_tmp_profile
-                log.info(f"[NoPeCHA] Profile loaded — extension active")
-            else:
-                log.warning(f"[NoPeCHA] Profile not found at '{base_profile}' — run setup_nopecha_profile.py first. Continuing without NoPeCHA.")
-                config["nopechaEnabled"] = False
-
         browser = await uc.start(**start_kw)
 
         page = await safe_browser_get(browser, "https://discord.com/register")
@@ -2314,37 +2485,17 @@ async def worker():
             captcha_gave_up.set()
 
         async def _captcha_loop():
-            nopecha_on     = bool(config.get("nopechaEnabled"))
+            nopecha_key    = config.get("nopechaKey", "").strip()
             solver_enabled = bool(config.get("captchaSolverEnabled"))
 
-            if nopecha_on:
-                # ── NoPeCHA extension mode ─────────────────────────────────
-                # The extension auto-solves in the background; we just wait
-                # for the hCaptcha iframe to disappear as confirmation.
-                await asyncio.sleep(1.5)
-                try:
-                    has_captcha = await page.evaluate(
-                        "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
-                    )
-                except Exception:
-                    has_captcha = False
-
-                if has_captcha:
-                    log.info("[NoPeCHA] Captcha detected — auto-solving in progress...")
-                    for tick in range(240):   # up to 120 s
-                        await asyncio.sleep(0.5)
-                        try:
-                            still_there = await page.evaluate(
-                                "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
-                            )
-                            if not still_there:
-                                log.success("[NoPeCHA] Captcha solved automatically!")
-                                return
-                        except Exception:
-                            return
-                    log.warning("[NoPeCHA] Captcha still present after 120s — may need manual solve")
-                    captcha_gave_up.set()
-                # No captcha present — NoPeCHA already handled it or none appeared
+            if nopecha_key:
+                # ── NoPeCHA REST API mode ──────────────────────────────────
+                # Wait briefly for the captcha iframe to mount after form submit
+                await asyncio.sleep(2)
+                solved = await solve_captcha_nopecha(page, nopecha_key)
+                if not solved:
+                    log.warning("[NoPeCHA] API solve failed — falling back to manual wait")
+                    await _wait_manual_captcha()
                 return
 
             elif solver_enabled:
@@ -2522,12 +2673,6 @@ async def worker():
                 await browser.stop()
             except Exception:
                 pass
-        # Clean up temp NoPeCHA profile copy (created per-run to avoid lock conflicts)
-        if _nopecha_tmp_profile and os.path.isdir(_nopecha_tmp_profile):
-            try:
-                shutil.rmtree(_nopecha_tmp_profile, ignore_errors=True)
-            except Exception:
-                pass
 
         cooldown = int(config.get("cooldownSeconds", 0))
         if cooldown > 0:
@@ -2647,8 +2792,7 @@ async def main():
     config.setdefault("openRouterApiKey",      "")
     config.setdefault("openRouterModel",       "google/gemini-2.0-flash-001")
     config.setdefault("captchaMaxAttempts",    4)
-    config.setdefault("nopechaEnabled",        False)
-    config.setdefault("nopechaProfileDir",     "nopecha_profile")
+    config.setdefault("nopechaKey",            "")
 
     # If baked key exists and server didn't supply one, use baked key
     if not config["zeusxApiKey"] and ZEUS_API_KEY:
