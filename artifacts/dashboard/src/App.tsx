@@ -68,7 +68,7 @@ function AppContent() {
       <Route path="/settings" component={() => <ProtectedRoute component={Settings} />} />
       <Route path="/worker-login" component={WorkerLogin} />
       <Route path="/worker" component={WorkerPortal} />
-      <Route path="/config" component={() => <ProtectedRoute component={Settings} />} />
+      <Route path="/config" component={Settings} />
       <Route component={NotFound} />
     </Switch>
   );
