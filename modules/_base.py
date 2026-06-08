@@ -101,17 +101,21 @@ def make_session(proxy: Optional[str] = None) -> requests.Session:
     return sess
 
 
-def discord_headers(token: str) -> dict:
+def discord_headers(token: str, x_fingerprint: str = None) -> dict:
     """Web-browser headers — used for enroll / heartbeat / hypesquad."""
     h = WEB_HEADERS_TEMPLATE.copy()
     h["authorization"] = token
+    if x_fingerprint:
+        h["x-fingerprint"] = x_fingerprint
     return h
 
 
-def discord_desktop_headers(token: str) -> dict:
+def discord_desktop_headers(token: str, x_fingerprint: str = None) -> dict:
     """Desktop-client headers — used for quest discovery."""
     h = DESKTOP_HEADERS_TEMPLATE.copy()
     h["authorization"] = token
+    if x_fingerprint:
+        h["x-fingerprint"] = x_fingerprint
     return h
 
 
