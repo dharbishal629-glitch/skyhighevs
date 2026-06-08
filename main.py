@@ -2667,13 +2667,67 @@ async def worker():
         browser = await uc.start(**start_kw)
 
         # ── Fingerprint injection ──────────────────────────────────────────
-        # Inject via CDP addScriptToEvaluateOnNewDocument so the overrides
-        # run BEFORE any Discord scripts — makes them undetectable to the page.
+        # Priority: 1) fetch from API server (admin-managed pool)
+        #           2) fall back to local generation if API has none
+        # Inject via CDP addScriptToEvaluateOnNewDocument so overrides run
+        # BEFORE any Discord scripts — undetectable to the page.
         _fp_data = None
         if config.get("fingerprintEnabled"):
-            min_age = int(config.get("fingerprintMinAgeDays", 0))
-            pool_sz = int(config.get("fingerprintPoolSize", 200))
-            _fp_data = get_fingerprint(min_age_days=min_age, pool_size=pool_sz)
+            # 1. Try API server first
+            _ctrl_url  = config.get("ctrlApiUrl", "")
+            _ctrl_key  = config.get("ctrlApiKey", "")
+            if _ctrl_url and _ctrl_key:
+                try:
+                    import urllib.request as _urllib_req
+                    _req = _urllib_req.Request(
+                        f"{_ctrl_url.rstrip('/')}/api/fingerprints",
+                        headers={"x-api-key": _ctrl_key},
+                    )
+                    with _urllib_req.urlopen(_req, timeout=8) as _resp:
+                        _body = json.loads(_resp.read())
+                    _api_fp = _body.get("fingerprint")
+                    if _api_fp:
+                        # data field is a JSON string — try to parse it
+                        raw_data = _api_fp.get("data", "")
+                        try:
+                            _parsed = json.loads(raw_data)
+                        except Exception:
+                            _parsed = {}
+                        # Build a compatible dict (merge parsed fields + fallback defaults)
+                        _fp_data = {
+                            "id":              str(_api_fp.get("id", "api")),
+                            "created_at":      _api_fp.get("createdAt", datetime.now().isoformat()),
+                            "user_agent":      _parsed.get("userAgent",      _parsed.get("user_agent",      "")),
+                            "platform":        _parsed.get("platform",       "Win32"),
+                            "screen_width":    int(_parsed.get("screenWidth",   _parsed.get("screen_width",  1920))),
+                            "screen_height":   int(_parsed.get("screenHeight",  _parsed.get("screen_height", 1080))),
+                            "avail_width":     int(_parsed.get("availWidth",    _parsed.get("avail_width",   1920))),
+                            "avail_height":    int(_parsed.get("availHeight",   _parsed.get("avail_height",  1040))),
+                            "timezone":        _parsed.get("timezone",       "America/New_York"),
+                            "webgl_vendor":    _parsed.get("webglVendor",    _parsed.get("webgl_vendor",   "Google Inc. (NVIDIA)")),
+                            "webgl_renderer":  _parsed.get("webglRenderer",  _parsed.get("webgl_renderer", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)")),
+                            "cpu_cores":       int(_parsed.get("cpuCores",   _parsed.get("cpu_cores",       4))),
+                            "device_memory":   int(_parsed.get("deviceMemory", _parsed.get("device_memory",  8))),
+                            "canvas_noise_r":  int(_parsed.get("canvasNoiseR", _parsed.get("canvas_noise_r", 3))),
+                            "canvas_noise_g":  int(_parsed.get("canvasNoiseG", _parsed.get("canvas_noise_g", 5))),
+                            "canvas_noise_b":  int(_parsed.get("canvasNoiseB", _parsed.get("canvas_noise_b", 7))),
+                        }
+                        # Fill in blank user_agent with a default if not provided
+                        if not _fp_data["user_agent"]:
+                            _fp_data["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+                        age_d = (datetime.now() - datetime.fromisoformat(_fp_data["created_at"].replace("Z",""))).days
+                        log.info(f"[Fingerprint] API profile #{_fp_data['id']} (age={age_d}d, pool={_body.get('total',0)}) — {_fp_data['screen_width']}x{_fp_data['screen_height']} {_fp_data['timezone']}")
+                    else:
+                        log.info(f"[Fingerprint] API returned 0 enabled fingerprints — using local generation")
+                except Exception as _fe:
+                    log.debug(f"[Fingerprint] API fetch failed: {_fe} — falling back to local")
+
+            # 2. Local fallback if API gave nothing
+            if _fp_data is None:
+                min_age = int(config.get("fingerprintMinAgeDays", 0))
+                pool_sz = int(config.get("fingerprintPoolSize", 200))
+                _fp_data = get_fingerprint(min_age_days=min_age, pool_size=pool_sz)
+
             fp_js = make_fingerprint_js(_fp_data)
             injected = False
             try:
@@ -2686,7 +2740,6 @@ async def worker():
             except Exception as e:
                 log.debug(f"[Fingerprint] CDP inject failed: {e}")
             if not injected:
-                # Store JS for per-page evaluate fallback (applied after each navigation)
                 config["_fp_js_fallback"] = fp_js
                 log.info(f"[Fingerprint] Will inject per-page (id={_fp_data['id']})")
 

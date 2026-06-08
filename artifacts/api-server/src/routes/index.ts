@@ -13,6 +13,7 @@ import workerPortalRouter from "./workerPortal";
 import envSettingsRouter from "./envSettings";
 import adminAuthRouter from "./adminAuth";
 import workerEnvRouter from "./workerEnv";
+import fingerprintsRouter from "./fingerprints";
 
 const router: IRouter = Router();
 
@@ -30,5 +31,6 @@ router.use(launcherRouter);
 router.use(workerPortalRouter);
 router.use(envSettingsRouter);
 router.use(workerEnvRouter);
+router.use(fingerprintsRouter);
 
 export default router;

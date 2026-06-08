@@ -1,4 +1,4 @@
-import { pgTable, text, serial, timestamp, integer, json } from "drizzle-orm/pg-core";
+import { pgTable, text, serial, timestamp, integer, json, boolean } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
@@ -39,6 +39,13 @@ export const toolConfigTable = pgTable("tool_config", {
   id: serial("id").primaryKey(),
   config: json("config").notNull().$type<Record<string, unknown>>().default({}),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const fingerprintsTable = pgTable("fingerprints", {
+  id:        serial("id").primaryKey(),
+  data:      text("data").notNull(),
+  enabled:   boolean("enabled").notNull().default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 export const insertWorkerSchema = createInsertSchema(workersTable).omit({ id: true, createdAt: true, updatedAt: true });

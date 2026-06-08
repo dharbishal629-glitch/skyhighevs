@@ -17,6 +17,7 @@ import WorkerLogin from "@/pages/worker-login";
 import WorkerPortal from "@/pages/worker-portal";
 import Login from "@/pages/login";
 import NotFound from "@/pages/not-found";
+import FingerprintsPage from "@/pages/fingerprints";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -62,6 +63,7 @@ function AppContent() {
       <Route path="/analytics" component={() => <ProtectedRoute component={Analytics} />} />
       <Route path="/tool-config" component={() => <ProtectedRoute component={ToolConfig} />} />
       <Route path="/tool-file" component={() => <ProtectedRoute component={ToolFile} />} />
+      <Route path="/fingerprints" component={() => <ProtectedRoute component={FingerprintsPage} />} />
       <Route path="/environment" component={() => <ProtectedRoute component={Environment} />} />
       <Route path="/settings" component={() => <ProtectedRoute component={Settings} />} />
       <Route path="/worker-login" component={WorkerLogin} />

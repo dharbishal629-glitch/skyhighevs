@@ -3,22 +3,23 @@ import { Link, useLocation } from "wouter";
 import { useAuth, useTotpTimer } from "@/lib/auth-context";
 import {
   LayoutDashboard, Users, Key, Trophy, BarChart2, Settings, Settings2,
-  Menu, X, Shield, ChevronRight, Clock, Copy, Check, ShieldCheck, Terminal,
+  Menu, X, Shield, ChevronRight, Clock, Copy, Check, ShieldCheck, Terminal, Fingerprint,
 } from "lucide-react";
 import { cn } from "./ui/cyber-components";
 import { motion, AnimatePresence } from "framer-motion";
 import { format } from "date-fns";
 
 const navItems = [
-  { href: "/",            label: "Overview",    sub: "System stats",     icon: LayoutDashboard, color: "text-violet-400" },
-  { href: "/workers",     label: "Workers",     sub: "Manage nodes",     icon: Users,           color: "text-blue-400" },
-  { href: "/tokens",      label: "Tokens",      sub: "Data explorer",    icon: Key,             color: "text-cyan-400" },
-  { href: "/leaderboard", label: "Leaderboard", sub: "Top performers",   icon: Trophy,          color: "text-amber-400" },
-  { href: "/analytics",   label: "Analytics",   sub: "Charts & trends",  icon: BarChart2,       color: "text-emerald-400" },
-  { href: "/tool-config", label: "Tool Config", sub: "Worker settings",  icon: Settings2,       color: "text-amber-400" },
-  { href: "/tool-file",    label: "Tool File",    sub: "Secure launcher",   icon: ShieldCheck, color: "text-violet-400" },
-  { href: "/environment",  label: "Environment",  sub: "Env vars & URLs",   icon: Terminal,    color: "text-emerald-400" },
-  { href: "/settings",     label: "API Config",   sub: "Keys & server",     icon: Settings,    color: "text-slate-400" },
+  { href: "/",               label: "Overview",      sub: "System stats",     icon: LayoutDashboard, color: "text-violet-400" },
+  { href: "/workers",        label: "Workers",       sub: "Manage nodes",     icon: Users,           color: "text-blue-400" },
+  { href: "/tokens",         label: "Tokens",        sub: "Data explorer",    icon: Key,             color: "text-cyan-400" },
+  { href: "/leaderboard",    label: "Leaderboard",   sub: "Top performers",   icon: Trophy,          color: "text-amber-400" },
+  { href: "/analytics",      label: "Analytics",     sub: "Charts & trends",  icon: BarChart2,       color: "text-emerald-400" },
+  { href: "/tool-config",    label: "Tool Config",   sub: "Worker settings",  icon: Settings2,       color: "text-amber-400" },
+  { href: "/fingerprints",   label: "Fingerprints",  sub: "Browser profiles", icon: Fingerprint,     color: "text-violet-400" },
+  { href: "/tool-file",      label: "Tool File",     sub: "Secure launcher",  icon: ShieldCheck,     color: "text-violet-400" },
+  { href: "/environment",    label: "Environment",   sub: "Env vars & URLs",  icon: Terminal,        color: "text-emerald-400" },
+  { href: "/settings",       label: "API Config",    sub: "Keys & server",    icon: Settings,        color: "text-slate-400" },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────
