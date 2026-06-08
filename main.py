@@ -2327,17 +2327,56 @@ def ensure_nopecha_extension() -> Optional[str]:
     print(Colorate.Horizontal(Colors.cyan_to_blue,
         "  [NoPeCHA] Downloading extension (first-time auto-setup)..."))
 
-    crx_url = (
-        "https://clients2.google.com/service/update2/crx"
-        "?response=redirect&prodversion=120"
-        f"&x=id%3D{NOPECHA_EXT_ID}%26uc"
-    )
-    try:
-        resp = requests.get(crx_url, timeout=30, allow_redirects=True, verify=False)
-        resp.raise_for_status()
-        crx_data = resp.content
-    except Exception as e:
-        log.warning(f"[NoPeCHA] CRX download failed: {e}")
+    # Multiple URL formats to try — Google sometimes blocks one format but not another.
+    # A proper Chrome User-Agent is required, otherwise Google returns an HTML error page.
+    _crx_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.6099.109 Safari/537.36"
+        ),
+        "Accept": "application/octet-stream,*/*",
+    }
+    _crx_urls = [
+        (
+            "https://clients2.google.com/service/update2/crx"
+            f"?response=redirect&os=win&arch=x64&prodversion=120.0.6099.109"
+            f"&acceptformat=crx2,crx3&x=id%3D{NOPECHA_EXT_ID}%26uc"
+        ),
+        (
+            "https://clients2.google.com/service/update2/crx"
+            f"?response=redirect&prodversion=120.0.6099.109"
+            f"&x=id%3D{NOPECHA_EXT_ID}%26uc"
+        ),
+        (
+            "https://clients2.google.com/service/update2/crx"
+            f"?response=redirect&prodversion=91.0.4442.4"
+            f"&acceptformat=crx2,crx3&x=id%3D{NOPECHA_EXT_ID}%26uc"
+        ),
+    ]
+
+    crx_data = None
+    for _url in _crx_urls:
+        try:
+            resp = requests.get(_url, headers=_crx_headers, timeout=30,
+                                allow_redirects=True, verify=False)
+            resp.raise_for_status()
+            if resp.content[:4] == b"Cr24":
+                crx_data = resp.content
+                log.debug(f"[NoPeCHA] CRX downloaded from: {_url[:80]}...")
+                break
+            else:
+                log.debug(f"[NoPeCHA] URL returned non-CRX data ({len(resp.content)}B), trying next...")
+        except Exception as e:
+            log.debug(f"[NoPeCHA] CRX URL failed ({e}), trying next...")
+
+    if not crx_data:
+        log.warning(
+            "[NoPeCHA] Could not download extension CRX from any URL.\n"
+            "          → Download it manually: chrome.google.com/webstore/detail/"
+            f"{NOPECHA_EXT_ID}\n"
+            "          → Extract the .crx to a folder named 'nopecha_ext' next to main.py"
+        )
         return None
 
     # Parse CRX header (supports CRX2 and CRX3) to find the ZIP payload
@@ -2466,45 +2505,49 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
     Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
 
-    NoPeCHA is a browser extension (not a REST API service).  When the browser
-    is launched with the nopecha_profile directory and a valid API key is stored
-    in the extension, the extension detects the hCaptcha iframe and solves it
-    automatically — showing a blue arrow/spinner in the page while working.
-
-    This function just polls until the captcha iframe disappears (= solved) or
-    the timeout is reached.
+    hCaptcha takes a few seconds to load after form submission, so this
+    function first waits up to 20 seconds for the iframe to *appear*, then
+    waits up to `timeout` seconds for the extension to solve and clear it.
     """
-    # ── Check captcha is actually present ────────────────────────────────────
-    try:
-        has_cap = await page.evaluate(
-            "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
-        )
-    except Exception:
-        has_cap = False
-    if not has_cap:
-        log.debug("[NoPeCHA] No hCaptcha detected — skipping")
-        return True   # nothing to solve
+    _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
+    _APPEAR_MAX = 20    # seconds to wait for captcha to show up
+    _POLL_STEP  = 0.5   # polling interval
+
+    # ── Phase 1: wait for hCaptcha iframe to appear ───────────────────────
+    log.debug("[NoPeCHA] Waiting for hCaptcha to load...")
+    appeared = False
+    for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
+        await asyncio.sleep(_POLL_STEP)
+        try:
+            if await page.evaluate(_HCAP_JS):
+                appeared = True
+                break
+        except Exception:
+            # Page navigated mid-wait → no captcha needed
+            log.debug("[NoPeCHA] Page navigated before captcha appeared — no solve needed")
+            return True
+
+    if not appeared:
+        log.debug("[NoPeCHA] No hCaptcha appeared within 20s — skipping")
+        return True   # no captcha on this registration attempt
 
     log.info("[NoPeCHA] hCaptcha detected — waiting for extension to auto-solve...")
 
-    # Poll every 0.5 s until captcha is gone or timeout
-    ticks = int(timeout * 2)
+    # ── Phase 2: wait for extension to clear the iframe ──────────────────
+    ticks = int(timeout / _POLL_STEP)
     for tick in range(ticks):
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(_POLL_STEP)
         try:
-            still_there = await page.evaluate(
-                "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
-            )
-            if not still_there:
+            if not await page.evaluate(_HCAP_JS):
                 log.success("[NoPeCHA] Captcha cleared by extension!")
                 return True
         except Exception:
-            # Page navigated away — captcha is gone
+            # Page navigated away — captcha solved/bypassed
             return True
 
-        if tick % 20 == 19:   # log progress every 10 s
-            elapsed = (tick + 1) * 0.5
-            log.debug(f"[NoPeCHA] Still waiting... ({elapsed:.0f}s / {timeout}s)")
+        if tick % 20 == 19:
+            elapsed = (tick + 1) * _POLL_STEP
+            log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
 
     log.warning(f"[NoPeCHA] Timed out waiting for extension to solve ({timeout}s)")
     return False
