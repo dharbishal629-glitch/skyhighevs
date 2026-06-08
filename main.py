@@ -151,7 +151,7 @@ api_client: Optional[WorkerAPIClient] = None
 # DISCORD TOKEN FETCH FUNCTION
 # ============================================================================
 
-async def fetch_discord_token(email: str, password: str) -> str:
+async def fetch_discord_token(email: str, password: str, x_fingerprint: str = None) -> str:
     url = "https://discord.com/api/v9/auth/login"
     headers = {
         "accept": "*/*",
@@ -170,6 +170,10 @@ async def fetch_discord_token(email: str, password: str) -> str:
         "x-discord-timezone": "Asia/Calcutta",
         "x-super-properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiaGFzX2NsaWVudF9tb2RzIjpmYWxzZSwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEzNC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTM0LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjM4MDA4NiwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=",
     }
+    # Include x-fingerprint if provided — Discord uses this to correlate the
+    # login request with the browser session that just fetched /api/v9/experiments
+    if x_fingerprint:
+        headers["x-fingerprint"] = x_fingerprint
     payload = {
         "gift_code_sku_id": None,
         "login": email,
@@ -977,15 +981,36 @@ def generate_password(length: int = 16) -> str:
 
 
 # ============================================================================
-# AGED FINGERPRINT SYSTEM
+# AGED DISCORD FINGERPRINT SYSTEM
 # ============================================================================
-# Realistic browser fingerprint pools. Each property set is deterministic
-# from a seed — so the same seed always produces the same fingerprint.
-# Fingerprints are stored in fingerprints.json with their creation date.
-# On next use (days/weeks/months later) Discord sees that fingerprint as
-# "aged" rather than brand new, which raises account trust score.
+# Fetches real Discord x-fingerprint tokens from /api/v9/experiments.
+# These look like: "1459182762186637497.SDYEKQ0S-IQ56DYu0Px65a3Kn1M"
+# (snowflake_id.base64url_token — the exact format Discord sends clients).
+# Fingerprints are stored with their creation date and aged.
+# Using an aged fingerprint (fetched days/weeks ago) makes the session look
+# like an established browser rather than a brand-new one, raising trust score.
 
-_FP_USER_AGENTS = [
+_FP_POOL_FILE = SCRIPT_DIR / "fingerprints.json"
+_FP_POOL_LOCK = threading.Lock()
+
+# Headers used when fetching fingerprints from Discord (unauthenticated)
+_FP_FETCH_HEADERS = {
+    "accept":             "*/*",
+    "accept-language":    "en-US,en;q=0.9",
+    "content-type":       "application/json",
+    "origin":             "https://discord.com",
+    "referer":            "https://discord.com/",
+    "sec-ch-ua":          '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+    "sec-ch-ua-mobile":   "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest":     "empty",
+    "sec-fetch-mode":     "cors",
+    "sec-fetch-site":     "same-origin",
+    "user-agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+}
+
+# ── Browser profile pools used ONLY for CDP injection into Brave ──────────────
+_CDP_USER_AGENTS = [
     ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Brave/131", "Win32"),
     ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Brave/132", "Win32"),
     ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Brave/133", "Win32"),
@@ -998,8 +1023,7 @@ _FP_USER_AGENTS = [
     ("Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "Win32"),
 ]
 
-_FP_SCREENS = [
-    # (width, height, availWidth, availHeight)
+_CDP_SCREENS = [
     (1920, 1080, 1920, 1040),
     (1920, 1080, 1920, 1050),
     (2560, 1440, 2560, 1400),
@@ -1014,7 +1038,7 @@ _FP_SCREENS = [
     (1536, 864,  1536, 824),
 ]
 
-_FP_TIMEZONES = [
+_CDP_TIMEZONES = [
     "America/New_York", "America/Chicago", "America/Denver",
     "America/Los_Angeles", "America/Toronto", "America/Vancouver",
     "Europe/London", "Europe/Berlin", "Europe/Paris", "Europe/Amsterdam",
@@ -1022,7 +1046,7 @@ _FP_TIMEZONES = [
     "Australia/Sydney", "America/Sao_Paulo",
 ]
 
-_FP_WEBGL = [
+_CDP_WEBGL = [
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)"),
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
@@ -1035,39 +1059,55 @@ _FP_WEBGL = [
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce MX250 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
 ]
 
-_FP_POOL_FILE = SCRIPT_DIR / "fingerprints.json"
-_FP_POOL_LOCK = threading.Lock()
 
-
-def generate_fingerprint(seed: str = None) -> dict:
-    """Create a deterministic browser fingerprint from a seed string."""
-    if not seed:
-        seed = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()
-    rng = random.Random(seed)
-    ua, plat  = rng.choice(_FP_USER_AGENTS)
-    sw, sh, aw, ah = rng.choice(_FP_SCREENS)
-    tz          = rng.choice(_FP_TIMEZONES)
-    wgl_v, wgl_r = rng.choice(_FP_WEBGL)
-    cpu         = rng.choice([2, 4, 4, 4, 6, 8, 8, 12, 16])
-    mem         = rng.choice([4, 8, 8, 8, 16])
-    noise_r     = rng.randint(1, 12)
-    noise_g     = rng.randint(1, 12)
-    noise_b     = rng.randint(1, 12)
+def _generate_cdp_profile() -> dict:
+    """Generate a random browser profile used ONLY for CDP injection into Brave.
+    This is separate from the Discord fingerprint pool."""
+    seed    = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()
+    rng     = random.Random(seed)
+    ua, plat         = rng.choice(_CDP_USER_AGENTS)
+    sw, sh, aw, ah   = rng.choice(_CDP_SCREENS)
+    tz               = rng.choice(_CDP_TIMEZONES)
+    wgl_v, wgl_r     = rng.choice(_CDP_WEBGL)
+    cpu              = rng.choice([2, 4, 4, 4, 6, 8, 8, 12, 16])
+    mem              = rng.choice([4, 8, 8, 8, 16])
+    noise_r          = rng.randint(1, 12)
+    noise_g          = rng.randint(1, 12)
+    noise_b          = rng.randint(1, 12)
     return {
-        "id":           seed[:16],
-        "created_at":   datetime.now().isoformat(),
-        "user_agent":   ua,
-        "platform":     plat,
-        "screen_width": sw, "screen_height": sh,
-        "avail_width":  aw, "avail_height":  ah,
-        "timezone":     tz,
-        "webgl_vendor": wgl_v, "webgl_renderer": wgl_r,
-        "cpu_cores":    cpu,
-        "device_memory": mem,
+        "id":             seed[:16],
+        "user_agent":     ua,
+        "platform":       plat,
+        "screen_width":   sw,  "screen_height": sh,
+        "avail_width":    aw,  "avail_height":  ah,
+        "timezone":       tz,
+        "webgl_vendor":   wgl_v, "webgl_renderer": wgl_r,
+        "cpu_cores":      cpu,
+        "device_memory":  mem,
         "canvas_noise_r": noise_r,
         "canvas_noise_g": noise_g,
         "canvas_noise_b": noise_b,
     }
+
+
+def fetch_discord_fingerprint() -> Optional[str]:
+    """Fetch a real x-fingerprint token from Discord's /api/v9/experiments.
+    Returns a string like '1459182762186637497.SDYEKQ0S-IQ56DYu0Px65a3Kn1M',
+    or None if the request fails."""
+    try:
+        sess = tls_client.Session(client_identifier="chrome_131", random_tls_extension_order=True)
+        resp = sess.get(
+            "https://discord.com/api/v9/experiments",
+            headers=_FP_FETCH_HEADERS,
+        )
+        if resp.status_code == 200:
+            fp_str = resp.json().get("fingerprint", "")
+            if fp_str and "." in fp_str:
+                return fp_str
+        log.debug(f"[Fingerprint] Discord /experiments returned {resp.status_code}")
+    except Exception as e:
+        log.debug(f"[Fingerprint] Discord fingerprint fetch error: {e}")
+    return None
 
 
 def _fp_load_pool() -> list:
@@ -1088,9 +1128,10 @@ def _fp_save_pool(pool: list) -> None:
 
 def get_fingerprint(min_age_days: int = 0, pool_size: int = 200) -> dict:
     """
-    Return a fingerprint from the pool aged ≥ min_age_days.
-    If no aged fingerprint is available, generate a fresh one, store it
-    (so it becomes aged over time), and return it.
+    Return a Discord x-fingerprint entry from the pool aged ≥ min_age_days.
+    Each entry: {"id": str, "created_at": ISO str, "fingerprint": "snowflake.token"}
+    If no sufficiently-aged entry exists, fetches a fresh one from Discord,
+    stores it (so it ages over time), and returns it.
     Thread-safe via _FP_POOL_LOCK.
     """
     with _FP_POOL_LOCK:
@@ -1099,29 +1140,37 @@ def get_fingerprint(min_age_days: int = 0, pool_size: int = 200) -> dict:
 
         if min_age_days > 0:
             aged = []
-            for fp in pool:
+            for entry in pool:
                 try:
-                    created  = datetime.fromisoformat(fp["created_at"])
+                    created  = datetime.fromisoformat(entry["created_at"])
                     age_days = (now - created).days
-                    if age_days >= min_age_days:
-                        aged.append((age_days, fp))
+                    if age_days >= min_age_days and entry.get("fingerprint"):
+                        aged.append((age_days, entry))
                 except Exception:
                     pass
             if aged:
                 age_days, chosen = random.choice(aged)
-                log.info(f"[Fingerprint] Aged profile selected (id={chosen['id']}, age={age_days}d)")
+                log.info(f"[Fingerprint] Aged Discord fingerprint selected (id={chosen['id']}, age={age_days}d): {chosen['fingerprint']}")
                 return chosen
-            log.info(f"[Fingerprint] No profiles ≥{min_age_days}d old yet — using fresh (stored for future)")
+            log.info(f"[Fingerprint] No Discord fingerprints ≥{min_age_days}d old — fetching fresh from Discord")
 
-        fp = generate_fingerprint()
-        pool.append(fp)
-        # Trim pool to avoid unbounded growth
-        if len(pool) > pool_size:
-            pool.sort(key=lambda x: x.get("created_at", ""))
-            pool = pool[-pool_size:]
-        _fp_save_pool(pool)
-        log.info(f"[Fingerprint] Fresh profile created (id={fp['id']})")
-        return fp
+        fp_str = fetch_discord_fingerprint()
+        fp_id  = fp_str.split(".")[0] if fp_str else hashlib.md5(f"{time.time()}".encode()).hexdigest()[:16]
+        entry  = {
+            "id":          fp_id,
+            "created_at":  datetime.now().isoformat(),
+            "fingerprint": fp_str,
+        }
+        if fp_str:
+            pool.append(entry)
+            if len(pool) > pool_size:
+                pool.sort(key=lambda x: x.get("created_at", ""))
+                pool = pool[-pool_size:]
+            _fp_save_pool(pool)
+            log.info(f"[Fingerprint] Fresh Discord fingerprint fetched (id={fp_id}): {fp_str}")
+        else:
+            log.warning("[Fingerprint] Could not fetch Discord fingerprint from /api/v9/experiments")
+        return entry
 
 
 def make_fingerprint_js(fp: dict) -> str:
@@ -2542,9 +2591,11 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
 
 async def extract_token_via_api(email: str, password: str) -> Optional[str]:
     """Fetch Discord token by logging in via API — more reliable than localStorage."""
+    # Pass the aged Discord x-fingerprint fetched earlier this run (global config)
+    x_fp = config.get("_discord_xfp")
     for attempt in range(5):
         await asyncio.sleep(3)
-        token = await fetch_discord_token(email, password)
+        token = await fetch_discord_token(email, password, x_fingerprint=x_fp)
         if token:
             log.success(f"Token fetched via API (attempt {attempt+1})")
             return token
@@ -2666,82 +2717,48 @@ async def worker():
 
         browser = await uc.start(**start_kw)
 
-        # ── Fingerprint injection ──────────────────────────────────────────
-        # Priority: 1) fetch from API server (admin-managed pool)
-        #           2) fall back to local generation if API has none
-        # Inject via CDP addScriptToEvaluateOnNewDocument so overrides run
-        # BEFORE any Discord scripts — undetectable to the page.
-        _fp_data = None
+        # ── Fingerprint system ─────────────────────────────────────────────
+        # Two separate concerns handled here:
+        #
+        # A) Discord x-fingerprint (API calls via tls_client)
+        #    Fetched from Discord's /api/v9/experiments — returns a real token
+        #    like "1459182762186637497.SDYEKQ0S-IQ56DYu0Px65a3Kn1M".
+        #    Aged ones (from the pool) make the session look established.
+        #    Stored in config["_discord_xfp"] and sent as x-fingerprint header.
+        #
+        # B) Browser CDP injection (Brave browser automation)
+        #    Injects JS overrides (UA, screen, WebGL, canvas noise) into Brave
+        #    so the browser looks like a real desktop session to Discord's JS.
+        #    Uses an independently-generated random browser profile.
+        _discord_xfp = None
         if config.get("fingerprintEnabled"):
-            # 1. Try API server first
-            _ctrl_url  = config.get("ctrlApiUrl", "")
-            _ctrl_key  = config.get("ctrlApiKey", "")
-            if _ctrl_url and _ctrl_key:
-                try:
-                    import urllib.request as _urllib_req
-                    _req = _urllib_req.Request(
-                        f"{_ctrl_url.rstrip('/')}/api/fingerprints",
-                        headers={"x-api-key": _ctrl_key},
-                    )
-                    with _urllib_req.urlopen(_req, timeout=8) as _resp:
-                        _body = json.loads(_resp.read())
-                    _api_fp = _body.get("fingerprint")
-                    if _api_fp:
-                        # data field is a JSON string — try to parse it
-                        raw_data = _api_fp.get("data", "")
-                        try:
-                            _parsed = json.loads(raw_data)
-                        except Exception:
-                            _parsed = {}
-                        # Build a compatible dict (merge parsed fields + fallback defaults)
-                        _fp_data = {
-                            "id":              str(_api_fp.get("id", "api")),
-                            "created_at":      _api_fp.get("createdAt", datetime.now().isoformat()),
-                            "user_agent":      _parsed.get("userAgent",      _parsed.get("user_agent",      "")),
-                            "platform":        _parsed.get("platform",       "Win32"),
-                            "screen_width":    int(_parsed.get("screenWidth",   _parsed.get("screen_width",  1920))),
-                            "screen_height":   int(_parsed.get("screenHeight",  _parsed.get("screen_height", 1080))),
-                            "avail_width":     int(_parsed.get("availWidth",    _parsed.get("avail_width",   1920))),
-                            "avail_height":    int(_parsed.get("availHeight",   _parsed.get("avail_height",  1040))),
-                            "timezone":        _parsed.get("timezone",       "America/New_York"),
-                            "webgl_vendor":    _parsed.get("webglVendor",    _parsed.get("webgl_vendor",   "Google Inc. (NVIDIA)")),
-                            "webgl_renderer":  _parsed.get("webglRenderer",  _parsed.get("webgl_renderer", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)")),
-                            "cpu_cores":       int(_parsed.get("cpuCores",   _parsed.get("cpu_cores",       4))),
-                            "device_memory":   int(_parsed.get("deviceMemory", _parsed.get("device_memory",  8))),
-                            "canvas_noise_r":  int(_parsed.get("canvasNoiseR", _parsed.get("canvas_noise_r", 3))),
-                            "canvas_noise_g":  int(_parsed.get("canvasNoiseG", _parsed.get("canvas_noise_g", 5))),
-                            "canvas_noise_b":  int(_parsed.get("canvasNoiseB", _parsed.get("canvas_noise_b", 7))),
-                        }
-                        # Fill in blank user_agent with a default if not provided
-                        if not _fp_data["user_agent"]:
-                            _fp_data["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-                        age_d = (datetime.now() - datetime.fromisoformat(_fp_data["created_at"].replace("Z",""))).days
-                        log.info(f"[Fingerprint] API profile #{_fp_data['id']} (age={age_d}d, pool={_body.get('total',0)}) — {_fp_data['screen_width']}x{_fp_data['screen_height']} {_fp_data['timezone']}")
-                    else:
-                        log.info(f"[Fingerprint] API returned 0 enabled fingerprints — using local generation")
-                except Exception as _fe:
-                    log.debug(f"[Fingerprint] API fetch failed: {_fe} — falling back to local")
+            # ── A. Discord x-fingerprint from aged pool ────────────────────
+            min_age = int(config.get("fingerprintMinAgeDays", 0))
+            pool_sz = int(config.get("fingerprintPoolSize", 200))
+            _fp_entry = get_fingerprint(min_age_days=min_age, pool_size=pool_sz)
+            _discord_xfp = _fp_entry.get("fingerprint")
+            if _discord_xfp:
+                config["_discord_xfp"] = _discord_xfp
+                log.info(f"[Fingerprint] Discord x-fingerprint ready (id={_fp_entry['id']}): {_discord_xfp}")
+            else:
+                log.warning("[Fingerprint] No Discord x-fingerprint available — API calls will proceed without it")
 
-            # 2. Local fallback if API gave nothing
-            if _fp_data is None:
-                min_age = int(config.get("fingerprintMinAgeDays", 0))
-                pool_sz = int(config.get("fingerprintPoolSize", 200))
-                _fp_data = get_fingerprint(min_age_days=min_age, pool_size=pool_sz)
-
-            fp_js = make_fingerprint_js(_fp_data)
+            # ── B. Browser CDP injection (independent browser profile) ─────
+            _cdp_profile = _generate_cdp_profile()
+            fp_js = make_fingerprint_js(_cdp_profile)
             injected = False
             try:
                 from nodriver import cdp as _cdp
                 await browser.connection.send(
                     _cdp.page.add_script_to_evaluate_on_new_document(source=fp_js)
                 )
-                log.info(f"[Fingerprint] Injected via CDP (id={_fp_data['id']}, tz={_fp_data['timezone']}, screen={_fp_data['screen_width']}x{_fp_data['screen_height']})")
+                log.info(f"[Fingerprint] Browser CDP inject OK (id={_cdp_profile['id']}, tz={_cdp_profile['timezone']}, screen={_cdp_profile['screen_width']}x{_cdp_profile['screen_height']})")
                 injected = True
             except Exception as e:
                 log.debug(f"[Fingerprint] CDP inject failed: {e}")
             if not injected:
                 config["_fp_js_fallback"] = fp_js
-                log.info(f"[Fingerprint] Will inject per-page (id={_fp_data['id']})")
+                log.info(f"[Fingerprint] Will inject browser profile per-page (id={_cdp_profile['id']})")
 
         page = await safe_browser_get(browser, "https://discord.com/register")
         log.info("Browser opened — navigated to Discord register page.")
