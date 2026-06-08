@@ -10,6 +10,9 @@ import os
 import sys
 import json
 import time
+import platform
+import shutil
+from pathlib import Path
 
 if sys.platform == 'win32':
     try:
@@ -37,7 +40,72 @@ NOPECHA_WEBSTORE_URL = "https://chromewebstore.google.com/detail/nopecha-captcha
 NOPECHA_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
 
 
-async def run_setup(nopecha_key: str, brave_path: str = ""):
+def find_brave_executable() -> str:
+    """Auto-detect the Brave browser executable on Windows / macOS / Linux."""
+    system = platform.system()
+    candidates = []
+    if system == "Windows":
+        prog_files   = os.environ.get("PROGRAMFILES",      r"C:\Program Files")
+        prog_files86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+        local_app    = os.environ.get("LOCALAPPDATA",       "")
+        candidates = [
+            Path(prog_files)   / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+            Path(prog_files86) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+            Path(local_app)    / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+        ]
+    elif system == "Darwin":
+        candidates = [
+            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+            Path.home() / "Applications" / "Brave Browser.app" / "Contents" / "MacOS" / "Brave Browser",
+        ]
+    else:
+        found = shutil.which("brave-browser") or shutil.which("brave")
+        if found:
+            return found
+        candidates = [
+            Path("/usr/bin/brave-browser"),
+            Path("/usr/bin/brave"),
+            Path("/usr/local/bin/brave-browser"),
+            Path("/snap/bin/brave"),
+        ]
+    for p in candidates:
+        if p and Path(p).is_file():
+            return str(p)
+    return ""
+
+
+def resolve_browser_path(user_input: str) -> str:
+    """
+    Resolve whatever the user typed into an actual executable path.
+    If they typed a real path that exists — use it.
+    If they typed nothing, 'Brave', 'brave', 'chrome', or any non-path word — auto-detect.
+    """
+    inp = (user_input or "").strip()
+
+    # If it looks like a real file path and it exists, use it directly
+    if inp and os.path.isfile(inp):
+        return inp
+
+    # If they typed a known keyword or left it blank, auto-detect
+    keywords = {"brave", "chrome", "browser", ""}
+    if inp.lower() in keywords or not os.path.sep in inp:
+        detected = find_brave_executable()
+        if detected:
+            print(f"  Auto-detected: {detected}")
+            return detected
+        # Nothing found — let nodriver try its own detection
+        return ""
+
+    # They typed a path but it doesn't exist — warn them
+    print(f"  WARNING: '{inp}' not found. Trying auto-detect...")
+    detected = find_brave_executable()
+    if detected:
+        print(f"  Auto-detected: {detected}")
+        return detected
+    return ""
+
+
+async def run_setup(nopecha_key: str, brave_input: str = ""):
     if not nopecha_key:
         print("Error: API key cannot be empty.")
         return False
@@ -45,6 +113,8 @@ async def run_setup(nopecha_key: str, brave_path: str = ""):
     print("=" * 60)
     print("  NOPECHA SETUP v5 - Web Store Installer")
     print("=" * 60)
+
+    brave_path = resolve_browser_path(brave_input)
 
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
@@ -54,9 +124,11 @@ async def run_setup(nopecha_key: str, brave_path: str = ""):
     config.add_argument("--no-first-run")
     config.add_argument("--disable-default-apps")
     config.add_argument("--window-size=1200,800")
-    if brave_path and os.path.isfile(brave_path):
+    if brave_path:
         config.browser_executable_path = brave_path
         print(f"  Using browser: {brave_path}")
+    else:
+        print("  Using system default browser (Chrome/Chromium)")
 
     print("[1/5] Launching browser with persistent profile...")
     browser = await uc.start(config=config)
