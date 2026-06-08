@@ -2246,6 +2246,27 @@ async def worker():
         if brave_path:
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
+
+        # NoPeCHA: if enabled, launch with a copy of the NoPeCHA profile so
+        # the extension is active. We copy rather than use the folder directly
+        # because Chrome refuses to open a profile that's already in use by
+        # another instance (important for multi-thread runs).
+        _nopecha_tmp_profile = None
+        if config.get("nopechaEnabled"):
+            base_profile = config.get("nopechaProfileDir", "nopecha_profile")
+            if not os.path.isabs(base_profile):
+                base_profile = os.path.join(BASE_DIR, base_profile)
+            if os.path.isdir(base_profile):
+                import tempfile
+                _nopecha_tmp_profile = tempfile.mkdtemp(prefix="skyhigh_nopecha_")
+                shutil.rmtree(_nopecha_tmp_profile)
+                shutil.copytree(base_profile, _nopecha_tmp_profile)
+                start_kw["user_data_dir"] = _nopecha_tmp_profile
+                log.info(f"[NoPeCHA] Profile loaded — extension active")
+            else:
+                log.warning(f"[NoPeCHA] Profile not found at '{base_profile}' — run setup_nopecha_profile.py first. Continuing without NoPeCHA.")
+                config["nopechaEnabled"] = False
+
         browser = await uc.start(**start_kw)
 
         page = await safe_browser_get(browser, "https://discord.com/register")
@@ -2293,14 +2314,49 @@ async def worker():
             captcha_gave_up.set()
 
         async def _captcha_loop():
+            nopecha_on     = bool(config.get("nopechaEnabled"))
             solver_enabled = bool(config.get("captchaSolverEnabled"))
-            if solver_enabled:
+
+            if nopecha_on:
+                # ── NoPeCHA extension mode ─────────────────────────────────
+                # The extension auto-solves in the background; we just wait
+                # for the hCaptcha iframe to disappear as confirmation.
+                await asyncio.sleep(1.5)
+                try:
+                    has_captcha = await page.evaluate(
+                        "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+                    )
+                except Exception:
+                    has_captcha = False
+
+                if has_captcha:
+                    log.info("[NoPeCHA] Captcha detected — auto-solving in progress...")
+                    for tick in range(240):   # up to 120 s
+                        await asyncio.sleep(0.5)
+                        try:
+                            still_there = await page.evaluate(
+                                "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+                            )
+                            if not still_there:
+                                log.success("[NoPeCHA] Captcha solved automatically!")
+                                return
+                        except Exception:
+                            return
+                    log.warning("[NoPeCHA] Captcha still present after 120s — may need manual solve")
+                    captcha_gave_up.set()
+                # No captcha present — NoPeCHA already handled it or none appeared
+                return
+
+            elif solver_enabled:
+                # ── OpenRouter vision solver ───────────────────────────────
                 solved = await solve_captcha_accessibility(page, config)
                 if not solved:
                     # Solver failed — fall back to manual wait
                     await _wait_manual_captcha()
+
             else:
-                # No solver — check if captcha is actually present before waiting
+                # ── Manual mode ────────────────────────────────────────────
+                # Check if captcha is actually present before waiting
                 await asyncio.sleep(1.5)
                 try:
                     has_captcha = await page.evaluate(
@@ -2466,6 +2522,12 @@ async def worker():
                 await browser.stop()
             except Exception:
                 pass
+        # Clean up temp NoPeCHA profile copy (created per-run to avoid lock conflicts)
+        if _nopecha_tmp_profile and os.path.isdir(_nopecha_tmp_profile):
+            try:
+                shutil.rmtree(_nopecha_tmp_profile, ignore_errors=True)
+            except Exception:
+                pass
 
         cooldown = int(config.get("cooldownSeconds", 0))
         if cooldown > 0:
@@ -2585,6 +2647,8 @@ async def main():
     config.setdefault("openRouterApiKey",      "")
     config.setdefault("openRouterModel",       "google/gemini-2.0-flash-001")
     config.setdefault("captchaMaxAttempts",    4)
+    config.setdefault("nopechaEnabled",        False)
+    config.setdefault("nopechaProfileDir",     "nopecha_profile")
 
     # If baked key exists and server didn't supply one, use baked key
     if not config["zeusxApiKey"] and ZEUS_API_KEY:
