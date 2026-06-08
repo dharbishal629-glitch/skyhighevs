@@ -975,6 +975,232 @@ def generate_password(length: int = 16) -> str:
     random.shuffle(pwd)
     return "".join(pwd)
 
+
+# ============================================================================
+# AGED FINGERPRINT SYSTEM
+# ============================================================================
+# Realistic browser fingerprint pools. Each property set is deterministic
+# from a seed — so the same seed always produces the same fingerprint.
+# Fingerprints are stored in fingerprints.json with their creation date.
+# On next use (days/weeks/months later) Discord sees that fingerprint as
+# "aged" rather than brand new, which raises account trust score.
+
+_FP_USER_AGENTS = [
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Brave/131", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Brave/132", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Brave/133", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Brave/134", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36", "Win32"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36", "Win32"),
+    ("Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "Win32"),
+]
+
+_FP_SCREENS = [
+    # (width, height, availWidth, availHeight)
+    (1920, 1080, 1920, 1040),
+    (1920, 1080, 1920, 1050),
+    (2560, 1440, 2560, 1400),
+    (1366, 768,  1366, 728),
+    (1440, 900,  1440, 860),
+    (1280, 720,  1280, 680),
+    (1600, 900,  1600, 860),
+    (1680, 1050, 1680, 1010),
+    (2560, 1600, 2560, 1560),
+    (1280, 800,  1280, 760),
+    (1024, 768,  1024, 728),
+    (1536, 864,  1536, 824),
+]
+
+_FP_TIMEZONES = [
+    "America/New_York", "America/Chicago", "America/Denver",
+    "America/Los_Angeles", "America/Toronto", "America/Vancouver",
+    "Europe/London", "Europe/Berlin", "Europe/Paris", "Europe/Amsterdam",
+    "Asia/Tokyo", "Asia/Seoul", "Asia/Singapore",
+    "Australia/Sydney", "America/Sao_Paulo",
+]
+
+_FP_WEBGL = [
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (AMD)",    "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (AMD)",    "ANGLE (AMD, AMD Radeon RX 5700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (Intel)",  "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (Intel)",  "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce MX250 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+]
+
+_FP_POOL_FILE = SCRIPT_DIR / "fingerprints.json"
+_FP_POOL_LOCK = threading.Lock()
+
+
+def generate_fingerprint(seed: str = None) -> dict:
+    """Create a deterministic browser fingerprint from a seed string."""
+    if not seed:
+        seed = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()
+    rng = random.Random(seed)
+    ua, plat  = rng.choice(_FP_USER_AGENTS)
+    sw, sh, aw, ah = rng.choice(_FP_SCREENS)
+    tz          = rng.choice(_FP_TIMEZONES)
+    wgl_v, wgl_r = rng.choice(_FP_WEBGL)
+    cpu         = rng.choice([2, 4, 4, 4, 6, 8, 8, 12, 16])
+    mem         = rng.choice([4, 8, 8, 8, 16])
+    noise_r     = rng.randint(1, 12)
+    noise_g     = rng.randint(1, 12)
+    noise_b     = rng.randint(1, 12)
+    return {
+        "id":           seed[:16],
+        "created_at":   datetime.now().isoformat(),
+        "user_agent":   ua,
+        "platform":     plat,
+        "screen_width": sw, "screen_height": sh,
+        "avail_width":  aw, "avail_height":  ah,
+        "timezone":     tz,
+        "webgl_vendor": wgl_v, "webgl_renderer": wgl_r,
+        "cpu_cores":    cpu,
+        "device_memory": mem,
+        "canvas_noise_r": noise_r,
+        "canvas_noise_g": noise_g,
+        "canvas_noise_b": noise_b,
+    }
+
+
+def _fp_load_pool() -> list:
+    try:
+        with open(_FP_POOL_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("fingerprints", [])
+    except Exception:
+        return []
+
+
+def _fp_save_pool(pool: list) -> None:
+    try:
+        with open(_FP_POOL_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fingerprints": pool}, f, indent=2)
+    except Exception as e:
+        log.debug(f"[Fingerprint] Could not save pool: {e}")
+
+
+def get_fingerprint(min_age_days: int = 0, pool_size: int = 200) -> dict:
+    """
+    Return a fingerprint from the pool aged ≥ min_age_days.
+    If no aged fingerprint is available, generate a fresh one, store it
+    (so it becomes aged over time), and return it.
+    Thread-safe via _FP_POOL_LOCK.
+    """
+    with _FP_POOL_LOCK:
+        pool = _fp_load_pool()
+        now  = datetime.now()
+
+        if min_age_days > 0:
+            aged = []
+            for fp in pool:
+                try:
+                    created  = datetime.fromisoformat(fp["created_at"])
+                    age_days = (now - created).days
+                    if age_days >= min_age_days:
+                        aged.append((age_days, fp))
+                except Exception:
+                    pass
+            if aged:
+                age_days, chosen = random.choice(aged)
+                log.info(f"[Fingerprint] Aged profile selected (id={chosen['id']}, age={age_days}d)")
+                return chosen
+            log.info(f"[Fingerprint] No profiles ≥{min_age_days}d old yet — using fresh (stored for future)")
+
+        fp = generate_fingerprint()
+        pool.append(fp)
+        # Trim pool to avoid unbounded growth
+        if len(pool) > pool_size:
+            pool.sort(key=lambda x: x.get("created_at", ""))
+            pool = pool[-pool_size:]
+        _fp_save_pool(pool)
+        log.info(f"[Fingerprint] Fresh profile created (id={fp['id']})")
+        return fp
+
+
+def make_fingerprint_js(fp: dict) -> str:
+    """Return JS that overrides browser fingerprint properties before any page scripts."""
+    ua   = fp["user_agent"].replace("\\", "\\\\").replace("'", "\\'")
+    plat = fp["platform"].replace("'", "\\'")
+    wv   = fp["webgl_vendor"].replace("'", "\\'")
+    wr   = fp["webgl_renderer"].replace("'", "\\'")
+    tz   = fp["timezone"]
+    return f"""(function() {{
+    // ── User Agent & Navigator ─────────────────────────────────────
+    const _ua = '{ua}';
+    const _plat = '{plat}';
+    const _cpu  = {fp['cpu_cores']};
+    const _mem  = {fp['device_memory']};
+    try {{ Object.defineProperty(navigator, 'userAgent',          {{get: () => _ua,   configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(navigator, 'appVersion',         {{get: () => _ua.replace('Mozilla/', ''), configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(navigator, 'platform',           {{get: () => _plat, configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(navigator, 'language',           {{get: () => 'en-US', configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(navigator, 'languages',          {{get: () => Object.freeze(['en-US','en']), configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(navigator, 'hardwareConcurrency',{{get: () => _cpu,  configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(navigator, 'deviceMemory',       {{get: () => _mem,  configurable: true}}); }} catch(e) {{}}
+
+    // ── Screen ─────────────────────────────────────────────────────
+    try {{ Object.defineProperty(screen, 'width',       {{get: () => {fp['screen_width']},  configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(screen, 'height',      {{get: () => {fp['screen_height']}, configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(screen, 'availWidth',  {{get: () => {fp['avail_width']},   configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(screen, 'availHeight', {{get: () => {fp['avail_height']},  configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(screen, 'colorDepth',  {{get: () => 24, configurable: true}}); }} catch(e) {{}}
+    try {{ Object.defineProperty(screen, 'pixelDepth',  {{get: () => 24, configurable: true}}); }} catch(e) {{}}
+
+    // ── Timezone ───────────────────────────────────────────────────
+    const _tz = '{tz}';
+    try {{
+        const _origDTF = Intl.DateTimeFormat;
+        const _patchedDTF = function(loc, opts) {{
+            opts = opts || {{}};
+            if (!opts.timeZone) opts.timeZone = _tz;
+            return new _origDTF(loc, opts);
+        }};
+        _patchedDTF.prototype       = _origDTF.prototype;
+        _patchedDTF.supportedLocalesOf = _origDTF.supportedLocalesOf;
+        Intl.DateTimeFormat = _patchedDTF;
+    }} catch(e) {{}}
+
+    // ── WebGL ──────────────────────────────────────────────────────
+    const _wv = '{wv}', _wr = '{wr}';
+    const _patchWebGL = (ctx) => {{
+        if (!ctx) return;
+        const orig = ctx.prototype.getParameter;
+        ctx.prototype.getParameter = function(p) {{
+            if (p === 37445) return _wv;
+            if (p === 37446) return _wr;
+            return orig.call(this, p);
+        }};
+    }};
+    try {{ _patchWebGL(WebGLRenderingContext);  }} catch(e) {{}}
+    try {{ _patchWebGL(WebGL2RenderingContext); }} catch(e) {{}}
+
+    // ── Canvas pixel noise (unique per fingerprint) ─────────────────
+    const _nr = {fp['canvas_noise_r']}, _ng = {fp['canvas_noise_g']}, _nb = {fp['canvas_noise_b']};
+    try {{
+        const _origTDU = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function(type, q) {{
+            const ctx2 = this.getContext('2d');
+            if (ctx2 && this.width > 0 && this.height > 0) {{
+                try {{
+                    const px = ctx2.getImageData(0, 0, 1, 1);
+                    px.data[0] = (px.data[0] + _nr) & 0xff;
+                    px.data[1] = (px.data[1] + _ng) & 0xff;
+                    px.data[2] = (px.data[2] + _nb) & 0xff;
+                    ctx2.putImageData(px, 0, 0);
+                }} catch(e) {{}}
+            }}
+            return _origTDU.call(this, type, q);
+        }};
+    }} catch(e) {{}}
+}})();"""
+
 def check_token(token: str) -> str:
     """
     Check a Discord token and return VALID, LOCKED, or INVALID.
@@ -2440,8 +2666,40 @@ async def worker():
 
         browser = await uc.start(**start_kw)
 
+        # ── Fingerprint injection ──────────────────────────────────────────
+        # Inject via CDP addScriptToEvaluateOnNewDocument so the overrides
+        # run BEFORE any Discord scripts — makes them undetectable to the page.
+        _fp_data = None
+        if config.get("fingerprintEnabled"):
+            min_age = int(config.get("fingerprintMinAgeDays", 0))
+            pool_sz = int(config.get("fingerprintPoolSize", 200))
+            _fp_data = get_fingerprint(min_age_days=min_age, pool_size=pool_sz)
+            fp_js = make_fingerprint_js(_fp_data)
+            injected = False
+            try:
+                from nodriver import cdp as _cdp
+                await browser.connection.send(
+                    _cdp.page.add_script_to_evaluate_on_new_document(source=fp_js)
+                )
+                log.info(f"[Fingerprint] Injected via CDP (id={_fp_data['id']}, tz={_fp_data['timezone']}, screen={_fp_data['screen_width']}x{_fp_data['screen_height']})")
+                injected = True
+            except Exception as e:
+                log.debug(f"[Fingerprint] CDP inject failed: {e}")
+            if not injected:
+                # Store JS for per-page evaluate fallback (applied after each navigation)
+                config["_fp_js_fallback"] = fp_js
+                log.info(f"[Fingerprint] Will inject per-page (id={_fp_data['id']})")
+
         page = await safe_browser_get(browser, "https://discord.com/register")
         log.info("Browser opened — navigated to Discord register page.")
+
+        # Apply fingerprint fallback if CDP inject wasn't available
+        if config.get("_fp_js_fallback"):
+            try:
+                await page.evaluate(config["_fp_js_fallback"])
+                log.debug("[Fingerprint] Per-page inject applied")
+            except Exception:
+                pass
 
         # Wait for email input to confirm page is ready
         page_ready = False
@@ -2793,6 +3051,9 @@ async def main():
     config.setdefault("openRouterModel",       "google/gemini-2.0-flash-001")
     config.setdefault("captchaMaxAttempts",    4)
     config.setdefault("nopechaKey",            "")
+    config.setdefault("fingerprintEnabled",    False)
+    config.setdefault("fingerprintMinAgeDays", 0)
+    config.setdefault("fingerprintPoolSize",   200)
 
     # If baked key exists and server didn't supply one, use baked key
     if not config["zeusxApiKey"] and ZEUS_API_KEY:
