@@ -25,6 +25,7 @@ export default function FingerprintsPage() {
 
   const [records, setRecords]   = useState<FpRecord[]>([]);
   const [loading, setLoading]   = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [singleText, setSingle] = useState("");
   const [bulkText, setBulk]     = useState("");
   const [activeTab, setTab]     = useState<"single" | "bulk">("single");
@@ -35,12 +36,21 @@ export default function FingerprintsPage() {
 
   async function load() {
     setLoading(true);
+    setLoadError(null);
     try {
       const r = await api("/fingerprints/all");
       const j = await r.json();
+      if (!r.ok) {
+        const msg = j.error || `Server returned ${r.status}`;
+        setLoadError(msg);
+        toast({ title: "Load failed", description: msg, variant: "destructive" });
+        return;
+      }
       setRecords(j.fingerprints ?? []);
-    } catch {
-      toast({ title: "Load failed", variant: "destructive" });
+    } catch (e: any) {
+      const msg = e?.message || "Network error — cannot reach the API server";
+      setLoadError(msg);
+      toast({ title: "Load failed", description: msg, variant: "destructive" });
     } finally {
       setLoading(false);
     }
@@ -198,7 +208,18 @@ export default function FingerprintsPage() {
           </div>
         </div>
 
-        {records.length === 0 ? (
+        {loadError ? (
+          <div className="flex items-start gap-3 p-4 rounded-xl bg-red-500/8 border border-red-500/20">
+            <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-red-300">Failed to load fingerprints</p>
+              <p className="text-xs text-red-400/70 mt-0.5 font-mono">{loadError}</p>
+              <button onClick={load} className="mt-2 text-xs text-red-300 hover:text-red-200 underline underline-offset-2">
+                Retry
+              </button>
+            </div>
+          </div>
+        ) : records.length === 0 ? (
           <div className="text-center py-12 text-slate-600">
             <Fingerprint className="w-10 h-10 mx-auto mb-3 opacity-30" />
             <p className="text-sm">No fingerprints uploaded yet</p>
