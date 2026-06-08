@@ -2040,15 +2040,18 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
         await asyncio.sleep(0.4)
         try:
             # ── Signal 1: URL-based detection ─────────────────────────────
+            # ALWAYS read window.location.href via JS — page.url is a cached
+            # property that stays stale after navigation and must NOT be the
+            # primary source. Only fall back to page.url if the evaluate fails.
             url = ""
             try:
-                url = str(page.url) if page.url else ""
+                raw = await page.evaluate('window.location.href')
+                url = str(raw) if raw else ""
             except Exception:
                 pass
             if not url:
                 try:
-                    raw = await page.evaluate('window.location.href')
-                    url = str(raw) if raw else ""
+                    url = str(page.url) if page.url else ""
                 except Exception:
                     pass
             if url and url != last_url:
