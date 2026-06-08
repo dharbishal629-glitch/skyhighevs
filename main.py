@@ -2299,6 +2299,169 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
     return False
 
 
+NOPECHA_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+
+
+def _get_tool_base_dir() -> str:
+    """Return the directory containing the tool (exe or script)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def ensure_nopecha_extension() -> Optional[str]:
+    """
+    Download and extract the NoPeCHA browser extension CRX to nopecha_ext/.
+    Called automatically on first run — workers need no manual setup.
+    Returns the path to the extracted extension dir, or None on failure.
+    """
+    import struct, io, zipfile as _zipfile
+
+    base     = _get_tool_base_dir()
+    ext_dir  = os.path.join(base, "nopecha_ext")
+    manifest = os.path.join(ext_dir, "manifest.json")
+
+    if os.path.isfile(manifest):
+        return ext_dir   # already extracted on a previous run
+
+    print(Colorate.Horizontal(Colors.cyan_to_blue,
+        "  [NoPeCHA] Downloading extension (first-time auto-setup)..."))
+
+    crx_url = (
+        "https://clients2.google.com/service/update2/crx"
+        "?response=redirect&prodversion=120"
+        f"&x=id%3D{NOPECHA_EXT_ID}%26uc"
+    )
+    try:
+        resp = requests.get(crx_url, timeout=30, allow_redirects=True, verify=False)
+        resp.raise_for_status()
+        crx_data = resp.content
+    except Exception as e:
+        log.warning(f"[NoPeCHA] CRX download failed: {e}")
+        return None
+
+    # Parse CRX header (supports CRX2 and CRX3) to find the ZIP payload
+    if crx_data[:4] != b"Cr24":
+        log.warning("[NoPeCHA] Unexpected CRX magic bytes — download may be corrupt")
+        return None
+
+    version = struct.unpack_from("<I", crx_data, 4)[0]
+    try:
+        if version == 3:
+            header_size = struct.unpack_from("<I", crx_data, 8)[0]
+            zip_start   = 12 + header_size
+        elif version == 2:
+            pk_len  = struct.unpack_from("<I", crx_data, 8)[0]
+            sig_len = struct.unpack_from("<I", crx_data, 12)[0]
+            zip_start = 16 + pk_len + sig_len
+        else:
+            log.warning(f"[NoPeCHA] Unknown CRX version {version}")
+            return None
+    except struct.error as e:
+        log.warning(f"[NoPeCHA] CRX header parse error: {e}")
+        return None
+
+    zip_payload = crx_data[zip_start:]
+    os.makedirs(ext_dir, exist_ok=True)
+    try:
+        with _zipfile.ZipFile(io.BytesIO(zip_payload)) as zf:
+            zf.extractall(ext_dir)
+    except Exception as e:
+        log.warning(f"[NoPeCHA] CRX extract failed: {e}")
+        shutil.rmtree(ext_dir, ignore_errors=True)
+        return None
+
+    if not os.path.isfile(manifest):
+        log.warning("[NoPeCHA] Extracted CRX has no manifest.json — corrupt download")
+        shutil.rmtree(ext_dir, ignore_errors=True)
+        return None
+
+    print(Colorate.Horizontal(Colors.green_to_cyan,
+        f"  [NoPeCHA] Extension ready → {ext_dir}"))
+    return ext_dir
+
+
+async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
+    """
+    Inject the NoPeCHA API key into the extension via its popup page.
+    Called once right after the browser is launched with --load-extension.
+    Takes roughly 3–6 seconds.
+    """
+    try:
+        ext_page = await browser.get(f"chrome-extension://{ext_id}/popup.html")
+        await asyncio.sleep(3)
+
+        # Escape the key for safe JS string interpolation
+        safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
+
+        result = await ext_page.evaluate(f"""
+            (async () => {{
+                let targetInput = null;
+                for (let step = 0; step < 14; step++) {{
+                    let inputs = Array.from(document.querySelectorAll('input'));
+                    let visible = inputs.find(i =>
+                        i.getBoundingClientRect().width > 0 && i.type !== 'checkbox'
+                    );
+                    if (visible) {{ targetInput = visible; break; }}
+
+                    // Click "Enter your key" text to reveal the input field
+                    let all = Array.from(document.querySelectorAll('*'));
+                    let trigger = all.find(e =>
+                        e.textContent && e.textContent.includes('Enter your key') &&
+                        e.children.length === 0
+                    );
+                    if (trigger) {{
+                        trigger.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+                        trigger.click();
+                        if (trigger.parentElement) trigger.parentElement.click();
+                    }}
+                    await new Promise(r => setTimeout(r, 500));
+                }}
+
+                if (!targetInput) return 'error:no-input-found';
+
+                // Set value via native setter to bypass React/Vue controlled inputs
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                if (setter) setter.call(targetInput, '{safe_key}');
+                else targetInput.value = '{safe_key}';
+
+                targetInput.dispatchEvent(new Event('input',  {{bubbles:true}}));
+                targetInput.dispatchEvent(new Event('change', {{bubbles:true}}));
+                await new Promise(r => setTimeout(r, 400));
+
+                // Try clicking Save button
+                let all2 = Array.from(document.querySelectorAll('*'));
+                let saveBtn = all2.find(e =>
+                    (e.textContent || '').trim().toLowerCase() === 'save' &&
+                    e.getBoundingClientRect().width > 0 &&
+                    !['SCRIPT','STYLE','INPUT'].includes(e.tagName)
+                );
+                if (saveBtn) {{ saveBtn.click(); return 'saved-via-button'; }}
+
+                // Fallback: press Enter
+                targetInput.dispatchEvent(new KeyboardEvent('keydown',
+                    {{key:'Enter', keyCode:13, which:13, bubbles:true}}));
+                targetInput.dispatchEvent(new KeyboardEvent('keyup',
+                    {{key:'Enter', keyCode:13, which:13, bubbles:true}}));
+                return 'saved-via-enter';
+            }})()
+        """)
+
+        await asyncio.sleep(2)
+        log.debug(f"[NoPeCHA] Key inject result: {result}")
+        if result and "error" not in str(result):
+            log.success("[NoPeCHA] API key injected into extension ✓")
+            return True
+        log.warning(f"[NoPeCHA] Key inject uncertain: {result}")
+        return False
+
+    except Exception as e:
+        log.warning(f"[NoPeCHA] Key inject error: {e}")
+        return False
+
+
 async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
     Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
@@ -2490,7 +2653,6 @@ async def worker():
         adb_rot.rotate_ip()
 
     browser = None
-    _nopecha_temp_dir = None
     try:
         # ── 1. Get email from configured provider ──────────────────────────
         email_provider = config.get("emailProvider", "cybertemp")
@@ -2573,39 +2735,30 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # ── NoPeCHA extension profile ──────────────────────────────────────
+        # ── NoPeCHA extension auto-setup ──────────────────────────────────
         # NoPeCHA is a browser extension solver — NOT a REST API.
-        # When enabled, we load the pre-configured nopecha_profile directory
-        # (created by setup_nopecha_profile.py) so the extension is active
-        # and has the API key already saved.  Each worker thread gets its own
-        # temporary copy so multiple threads can run simultaneously.
-        _nopecha_temp_dir = None
-        _nopecha_enabled  = bool(config.get("nopechaEnabled"))
-        _nopecha_api_key  = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+        # The first time a worker runs with NoPeCHA enabled, the extension CRX
+        # is downloaded from Google automatically and extracted to nopecha_ext/.
+        # On every run the browser is launched with --load-extension pointing
+        # to that folder, and the API key is injected into the extension UI
+        # right after startup. Zero manual setup required.
+        _nopecha_enabled = bool(config.get("nopechaEnabled"))
+        _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+        _nopecha_ext_dir = None
+
         if _nopecha_enabled and _nopecha_api_key:
-            _base_dir_py = (
-                os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-                else os.path.dirname(os.path.abspath(__file__))
-            )
-            _profile_src = os.path.join(_base_dir_py, "nopecha_profile")
-            if os.path.isdir(_profile_src):
-                try:
-                    _nopecha_temp_dir = tempfile.mkdtemp(prefix="nopecha_worker_")
-                    shutil.copytree(_profile_src, _nopecha_temp_dir, dirs_exist_ok=True)
-                    start_kw["browser_args"].append(f"--user-data-dir={_nopecha_temp_dir}")
-                    log.info(f"[NoPeCHA] Extension profile loaded → {_nopecha_temp_dir}")
-                except Exception as _e:
-                    log.warning(f"[NoPeCHA] Could not copy profile: {_e} — continuing without extension")
-                    if _nopecha_temp_dir and os.path.isdir(_nopecha_temp_dir):
-                        shutil.rmtree(_nopecha_temp_dir, ignore_errors=True)
-                    _nopecha_temp_dir = None
+            _nopecha_ext_dir = ensure_nopecha_extension()
+            if _nopecha_ext_dir:
+                start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
+                log.info(f"[NoPeCHA] Extension loaded: {_nopecha_ext_dir}")
             else:
-                log.warning(
-                    "[NoPeCHA] nopecha_profile folder not found — "
-                    "run setup_nopecha_profile.py first to install the extension!"
-                )
+                log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
         browser = await uc.start(**start_kw)
+
+        # ── Inject NoPeCHA API key into extension (takes ~3-5s) ───────────
+        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
+            await inject_nopecha_key(browser, NOPECHA_EXT_ID, _nopecha_api_key)
 
         # ── Fingerprint system ─────────────────────────────────────────────
         # Two separate concerns handled here:
@@ -2894,13 +3047,6 @@ async def worker():
         if browser:
             try:
                 await browser.stop()
-            except Exception:
-                pass
-
-        # Clean up per-worker NoPeCHA temp profile copy
-        if _nopecha_temp_dir and os.path.isdir(_nopecha_temp_dir):
-            try:
-                shutil.rmtree(_nopecha_temp_dir, ignore_errors=True)
             except Exception:
                 pass
 
