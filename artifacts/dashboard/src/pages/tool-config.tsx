@@ -462,22 +462,28 @@ export default function ToolConfig() {
           value={form.nopechaEnabled}
           onChange={set("nopechaEnabled")}
           label="Enable NoPeCHA"
-          hint="Uses nopecha.com to auto-solve Discord's hCaptcha. Workers need no manual captcha solving when this is on."
+          hint="Browser extension that auto-solves Discord's hCaptcha. Workers only need an API key — no manual setup scripts required."
         />
 
         {form.nopechaEnabled && (
           <>
             <SecretField
               label="NoPeCHA API Key"
-              hint="Get one at nopecha.com — charged per solve. Recommended: plan with hCaptcha support."
+              hint="Get your key at nopecha.com. Recommended: join the NoPeCHA Discord server to get the free Discord Plan (200 solves / 24h)."
               value={form.nopechaApiKey}
               onChange={set("nopechaApiKey")}
               placeholder="nopecha-api-key-here"
             />
-            <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-3 py-2.5 text-[11px] text-cyan-300/90 space-y-1">
-              <p>✓ When enabled, the tool calls the NoPeCHA API after the registration form is submitted.</p>
-              <p>✓ hCaptcha is detected and solved automatically — no worker interaction required.</p>
-              <p>✓ Make sure your NoPeCHA plan includes hCaptcha solving.</p>
+            <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-3 py-2.5 text-[11px] text-cyan-300/90 space-y-1.5">
+              <p className="font-semibold text-cyan-200">How it works — zero setup for workers:</p>
+              <p>① On first run, the tool auto-downloads the NoPeCHA Chrome extension.</p>
+              <p>② The API key is injected into the extension automatically on every launch.</p>
+              <p>③ The extension detects hCaptcha and solves it silently in the background.</p>
+              <p className="pt-1 border-t border-cyan-500/15">
+                <span className="font-medium text-cyan-200">Free plan: </span>
+                Join the NoPeCHA Discord server → verify → get 200 free solves / 24 h.
+                Visit <span className="font-mono">nopecha.com</span> → Plans to find the Discord invite link.
+              </p>
             </div>
           </>
         )}
