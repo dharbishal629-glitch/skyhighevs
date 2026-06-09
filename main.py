@@ -2300,6 +2300,7 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
 
 
 NOPECHA_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+_nopecha_profile_lock = threading.Lock()
 
 
 def _get_tool_base_dir() -> str:
@@ -2422,12 +2423,15 @@ def ensure_nopecha_extension() -> Optional[str]:
 
 async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
     """
-    Inject the NoPeCHA API key into the extension popup using sequential
-    synchronous JS evaluate() calls.
+    Inject the NoPeCHA API key into the extension popup.
 
-    nodriver's evaluate() does NOT await Promise results — it returns None
-    for any async/Promise-returning JS.  Every call here is a plain sync
-    IIFE that returns a string immediately so we always get a real result.
+    Uses sequential synchronous JS evaluate() calls — nodriver does NOT await
+    Promises so every call here is a sync IIFE returning a string immediately.
+
+    NoPeCHA popup flow:
+      1. May show "Join our Discord..." banner — dismiss it first.
+      2. "Usage tier" row has an "Enter API key" link — click it to show input.
+      3. Set value via native setter, then click Save or press Enter.
     """
     safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
 
@@ -2435,13 +2439,26 @@ async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
         ext_page = await browser.get(f"chrome-extension://{ext_id}/popup.html")
         await asyncio.sleep(3)   # let the popup fully render
 
-        # ── Step 1: find a visible input, or click "Enter your key" trigger ──
+        # ── Step 0: dismiss "Join our Discord" banner if present ─────────────
+        await ext_page.evaluate(
+            "(() => {"
+            "  let all = Array.from(document.querySelectorAll('*'));"
+            "  let x = all.find(e => ['×','✕','✖'].includes(e.textContent.trim())"
+            "    && e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().width < 40);"
+            "  if (x) x.click();"
+            "  return x ? 'dismissed' : 'no-banner';"
+            "})()"
+        )
+        await asyncio.sleep(0.4)
+
+        # ── Step 1: find a visible key input, or click 'Enter API key' link ──
+        # The NoPeCHA popup shows "Enter API key 🔗" as a clickable link in the
+        # Usage tier row — clicking it reveals the actual <input> field.
         found_input = False
-        for attempt in range(14):
-            # Check for a visible text input
+        for attempt in range(20):
             has_input = await ext_page.evaluate(
-                "(() => { "
-                "  let inp = Array.from(document.querySelectorAll('input'))"
+                "(() => {"
+                "  let inp = Array.from(document.querySelectorAll('input,textarea'))"
                 "    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
                 "  return inp ? 'yes' : 'no';"
                 "})()"
@@ -2450,25 +2467,39 @@ async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
                 found_input = True
                 break
 
-            # Click any "Enter your key" trigger to reveal the input
-            await ext_page.evaluate(
+            # Click the 'Enter API key' / 'Enter your key' link to reveal input
+            clicked = await ext_page.evaluate(
                 "(() => {"
-                "  let all = Array.from(document.querySelectorAll('*'));"
-                "  let t = all.find(e => e.textContent && e.textContent.includes('Enter your key') && e.children.length === 0);"
-                "  if (t) { t.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); t.click(); if(t.parentElement) t.parentElement.click(); }"
-                "  return t ? 'clicked' : 'none';"
+                "  let candidates = Array.from(document.querySelectorAll('a,button,span,div,p,li'));"
+                "  let t = candidates.find(e => {"
+                "    let txt = (e.textContent||'').trim();"
+                "    return e.getBoundingClientRect().width > 0 && ("
+                "      txt.includes('Enter API key') || txt.includes('Enter your key') ||"
+                "      txt.toLowerCase().includes('enter') && txt.toLowerCase().includes('key'));"
+                "  });"
+                "  if (!t && document.querySelector('[href=\"#api-key\"],[data-action=\"enter-key\"]')) {"
+                "    t = document.querySelector('[href=\"#api-key\"],[data-action=\"enter-key\"]');"
+                "  }"
+                "  if (t) {"
+                "    t.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));"
+                "    t.click();"
+                "    if (t.parentElement) t.parentElement.click();"
+                "    return 'clicked';"
+                "  }"
+                "  return 'not-found';"
                 "})()"
             )
+            log.debug(f"[NoPeCHA] Popup trigger (attempt {attempt}): {clicked}")
             await asyncio.sleep(0.5)
 
         if not found_input:
-            log.warning("[NoPeCHA] Could not find key input field in popup — key not injected")
+            log.warning("[NoPeCHA] Could not find key input in popup — key not injected")
             return False
 
-        # ── Step 2: set the value via native HTMLInputElement setter ──────────
+        # ── Step 2: set the API key value via native HTMLInputElement setter ──
         set_result = await ext_page.evaluate(
             f"(() => {{"
-            f"  let inp = Array.from(document.querySelectorAll('input'))"
+            f"  let inp = Array.from(document.querySelectorAll('input,textarea'))"
             f"    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
             f"  if (!inp) return 'no-input';"
             f"  let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
@@ -2481,14 +2512,18 @@ async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
         log.debug(f"[NoPeCHA] Value set: {set_result}")
         await asyncio.sleep(0.4)
 
-        # ── Step 3: click Save button (or press Enter as fallback) ────────────
+        # ── Step 3: click Save / press Enter to persist the key ──────────────
         save_result = await ext_page.evaluate(
             "(() => {"
             "  let all = Array.from(document.querySelectorAll('*'));"
-            "  let btn = all.find(e => (e.textContent||'').trim().toLowerCase() === 'save'"
-            "    && e.getBoundingClientRect().width > 0 && !['SCRIPT','STYLE','INPUT'].includes(e.tagName));"
+            "  let btn = all.find(e => {"
+            "    let txt = (e.textContent||'').trim().toLowerCase();"
+            "    return (txt === 'save' || txt === 'confirm' || txt === 'apply')"
+            "      && e.getBoundingClientRect().width > 0"
+            "      && !['SCRIPT','STYLE','INPUT','TEXTAREA'].includes(e.tagName);"
+            "  });"
             "  if (btn) { btn.click(); return 'saved-via-button'; }"
-            "  let inp = Array.from(document.querySelectorAll('input'))"
+            "  let inp = Array.from(document.querySelectorAll('input,textarea'))"
             "    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
             "  if (inp) {"
             "    inp.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,which:13,bubbles:true}));"
@@ -2498,18 +2533,138 @@ async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
             "  return 'no-save-target';"
             "})()"
         )
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)   # give extension time to save to chrome.storage
         log.debug(f"[NoPeCHA] Save result: {save_result}")
 
         if save_result and "no-" not in str(save_result):
             log.success(f"[NoPeCHA] API key injected into extension ✓ ({save_result})")
             return True
 
-        log.warning(f"[NoPeCHA] Key injection uncertain: set={set_result} save={save_result}")
+        log.warning(f"[NoPeCHA] Key injection may have failed: set={set_result} save={save_result}")
         return False
 
     except Exception as e:
         log.warning(f"[NoPeCHA] Key inject error: {e}")
+        return False
+
+
+async def ensure_nopecha_profile(ext_dir: str, api_key: str,
+                                  brave_path: Optional[str] = None) -> Optional[str]:
+    """
+    Ensure nopecha_profile/ exists with the API key stored in extension storage.
+
+    On first call (or when the API key changes), launches a one-time setup
+    browser that injects the key and lets the extension persist it to
+    chrome.storage before quitting. Subsequent calls return immediately.
+
+    Thread-safe — only one setup browser runs at a time via _nopecha_profile_lock.
+    Returns the profile dir path, or None on failure.
+    """
+    import hashlib
+
+    base         = _get_tool_base_dir()
+    profile_dir  = os.path.join(base, "nopecha_profile")
+    marker_file  = os.path.join(profile_dir, ".key_hash")
+    key_hash     = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+
+    # Fast path: profile already configured for this key
+    try:
+        if os.path.isfile(marker_file) and open(marker_file).read().strip() == key_hash:
+            return profile_dir
+    except Exception:
+        pass
+
+    # Slow path: acquire lock so only one thread runs setup at a time
+    with _nopecha_profile_lock:
+        # Double-check after acquiring lock
+        try:
+            if os.path.isfile(marker_file) and open(marker_file).read().strip() == key_hash:
+                return profile_dir
+        except Exception:
+            pass
+
+        print(Colorate.Horizontal(Colors.cyan_to_blue,
+            "  [NoPeCHA] One-time profile setup — storing key in extension..."))
+
+        # Wipe any stale profile so we start clean
+        if os.path.isdir(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+        setup_kw = {
+            "headless": False,
+            "browser_args": [
+                f"--load-extension={ext_dir}",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run", "--disable-default-apps",
+                "--disable-dev-shm-usage",
+            ],
+        }
+        if brave_path:
+            setup_kw["browser_executable_path"] = brave_path
+
+        setup_browser = None
+        try:
+            setup_browser = await uc.start(**setup_kw)
+            injected = await inject_nopecha_key(setup_browser, NOPECHA_EXT_ID, api_key)
+            await asyncio.sleep(5)   # allow extension to flush chrome.storage to disk
+
+            if injected:
+                os.makedirs(profile_dir, exist_ok=True)
+                with open(marker_file, "w") as f:
+                    f.write(key_hash)
+                print(Colorate.Horizontal(Colors.green_to_cyan,
+                    "  [NoPeCHA] Profile ready — API key stored in extension ✓"))
+            else:
+                log.warning("[NoPeCHA] Profile setup: key injection uncertain — captcha solving may not work")
+
+            return profile_dir
+
+        except Exception as e:
+            log.warning(f"[NoPeCHA] Profile setup failed: {e}")
+            return None
+        finally:
+            if setup_browser:
+                try:
+                    await setup_browser.stop()
+                except Exception:
+                    pass
+
+
+async def click_hcaptcha_checkbox(page) -> bool:
+    """
+    Click the 'I am human' checkbox inside the hCaptcha widget iframe.
+
+    Discord sometimes requires a checkbox click to trigger the full challenge
+    before NoPeCHA can solve it.  We get the iframe's bounding rect from the
+    parent page and send a mouse click at the checkbox position (left ~28px,
+    vertically centred).  Cross-origin restrictions are bypassed because we
+    click at screen coordinates rather than accessing iframe DOM directly.
+    """
+    try:
+        rect = await page.evaluate(
+            "(() => {"
+            "  let f = document.querySelector('iframe[src*=\"hcaptcha.com\"][src*=\"checkbox\"]')"
+            "    || document.querySelector('iframe[data-hcaptcha-widget-id]')"
+            "    || document.querySelector('iframe[src*=\"hcaptcha\"]');"
+            "  if (!f) return null;"
+            "  let r = f.getBoundingClientRect();"
+            "  return {x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height)};"
+            "})()"
+        )
+        if not rect or not isinstance(rect, dict):
+            return False
+
+        # Checkbox lives in the left ~50 px of the iframe, vertically centred
+        click_x = rect.get("x", 0) + 28
+        click_y = rect.get("y", 0) + rect.get("h", 60) // 2
+
+        await page.mouse_click(click_x, click_y)
+        log.info(f"[hCaptcha] Clicked 'I am human' checkbox at ({click_x}, {click_y})")
+        await asyncio.sleep(2)
+        return True
+
+    except Exception as e:
+        log.debug(f"[hCaptcha] Checkbox click error: {e}")
         return False
 
 
@@ -2518,8 +2673,9 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
 
     hCaptcha takes a few seconds to load after form submission, so this
-    function first waits up to 20 seconds for the iframe to *appear*, then
-    waits up to `timeout` seconds for the extension to solve and clear it.
+    function first waits up to 120 seconds for the iframe to *appear*, then
+    clicks the 'I am human' checkbox (which triggers the full challenge),
+    then waits up to `timeout` seconds for the extension to solve and clear it.
     """
     _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
     _APPEAR_MAX = 120   # seconds to wait for captcha to show up
@@ -2540,10 +2696,16 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
             return True
 
     if not appeared:
-        log.debug("[NoPeCHA] No hCaptcha appeared within 20s — skipping")
+        log.debug("[NoPeCHA] No hCaptcha appeared within 120s — skipping")
         return True   # no captcha on this registration attempt
 
-    log.info("[NoPeCHA] hCaptcha detected — waiting for extension to auto-solve...")
+    log.info("[NoPeCHA] hCaptcha detected — clicking checkbox and waiting for extension to solve...")
+
+    # Click the 'I am human' checkbox to trigger the full image challenge.
+    # NoPeCHA should handle both, but clicking ensures the challenge fires even
+    # if the extension mis-times the auto-click.
+    await click_hcaptcha_checkbox(page)
+    await asyncio.sleep(2)
 
     # ── Phase 2: wait for extension to clear the iframe ──────────────────
     ticks = int(timeout / _POLL_STEP)
@@ -2790,29 +2952,52 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # ── NoPeCHA extension auto-setup ──────────────────────────────────
+        # ── NoPeCHA extension setup ────────────────────────────────────────
         # NoPeCHA is a browser extension solver — NOT a REST API.
-        # The first time a worker runs with NoPeCHA enabled, the extension CRX
-        # is downloaded from Google automatically and extracted to nopecha_ext/.
-        # On every run the browser is launched with --load-extension pointing
-        # to that folder, and the API key is injected into the extension UI
-        # right after startup. Zero manual setup required.
+        #
+        # Flow (all automatic, zero manual steps for workers):
+        #  1. ensure_nopecha_extension()   — downloads CRX once to nopecha_ext/
+        #  2. ensure_nopecha_profile()     — one-time setup browser that injects
+        #                                    the API key and lets the extension
+        #                                    save it to chrome.storage on disk
+        #  3. Each worker copies the profile to a temp dir and launches with
+        #     --load-extension + --user-data-dir so the key is always present
+        #     from the very first millisecond — no per-run injection needed.
         _nopecha_enabled = bool(config.get("nopechaEnabled"))
         _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
         _nopecha_ext_dir = None
+        _nopecha_temp_dir = None
 
         if _nopecha_enabled and _nopecha_api_key:
             _nopecha_ext_dir = ensure_nopecha_extension()
             if _nopecha_ext_dir:
-                start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
-                log.info(f"[NoPeCHA] Extension loaded: {_nopecha_ext_dir}")
+                # Ensure the persistent profile exists with the key stored.
+                # Fast (< 1ms) if already set up; runs a one-time setup browser
+                # only on first call or when the API key changes.
+                _profile_src = await ensure_nopecha_profile(
+                    _nopecha_ext_dir, _nopecha_api_key, brave_path
+                )
+
+                if _profile_src and os.path.isdir(_profile_src):
+                    # Each worker gets a fresh copy so threads don't share state
+                    _nopecha_temp_dir = tempfile.mkdtemp(prefix="nopecha_w_")
+                    shutil.copytree(_profile_src, _nopecha_temp_dir, dirs_exist_ok=True)
+                    start_kw["browser_args"].extend([
+                        f"--load-extension={_nopecha_ext_dir}",
+                        f"--user-data-dir={_nopecha_temp_dir}",
+                    ])
+                    log.info(f"[NoPeCHA] Profile loaded → key is pre-stored in extension")
+                else:
+                    # Profile setup failed — fall back to extension-only (key injected at runtime)
+                    start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
+                    log.warning("[NoPeCHA] Profile unavailable — key will be injected after launch")
             else:
                 log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
         browser = await uc.start(**start_kw)
 
-        # ── Inject NoPeCHA API key into extension (takes ~3-5s) ───────────
-        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
+        # Inject key at runtime only when profile fallback is used
+        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir and not _nopecha_temp_dir:
             await inject_nopecha_key(browser, NOPECHA_EXT_ID, _nopecha_api_key)
 
         # ── Fingerprint system ─────────────────────────────────────────────
@@ -3102,6 +3287,13 @@ async def worker():
         if browser:
             try:
                 await browser.stop()
+            except Exception:
+                pass
+
+        # Clean up the per-worker NoPeCHA profile temp copy
+        if _nopecha_temp_dir and os.path.isdir(_nopecha_temp_dir):
+            try:
+                shutil.rmtree(_nopecha_temp_dir, ignore_errors=True)
             except Exception:
                 pass
 
