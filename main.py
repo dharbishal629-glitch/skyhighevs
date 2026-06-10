@@ -2713,67 +2713,84 @@ async def click_hcaptcha_checkbox(page) -> bool:
 
 async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
-    Wait for NoPeCHA to solve the captcha (if any) on the Discord register page.
+    Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
 
-    WHY URL-BASED DETECTION:
-      All previous approaches tried to find the captcha iframe in the DOM
-      using CSS selectors (src*="hcaptcha", class*="captcha", etc.).  These
-      consistently failed because Discord's hCaptcha iframe src attribute is
-      set LAZILY — the iframe element is injected into the DOM before its src
-      is assigned, so any attribute-based selector fires before the src is
-      populated and returns nothing.  Inspecting the DOM is therefore
-      fundamentally unreliable.
-
-    CORRECT SIGNAL:
-      NoPeCHA detects and solves the captcha entirely on its own.  When done,
-      Discord redirects away from /register.  We simply watch
-      window.location.href — leaving /register means the captcha (if any)
-      is finished.
-
-    NOTE: this function runs as a background asyncio task alongside
-      wait_for_account_creation().  If we time out we return True (not False)
-      so that _wait_manual_captcha is NOT triggered; wait_for_account_creation
-      already has its own 300 s window and will surface the real outcome.
+    KEY RULES:
+    - Poll every 1 s (not 5 s) — NoPeCHA solves in 1-3 s and the page
+      navigates away immediately.  5-second polling misses the solve window.
+    - Only click the checkbox if the challenge is NOT already open.
+      NoPeCHA auto-clicks the checkbox itself; if we click again after the
+      drag/image challenge has opened we land inside the puzzle image and
+      disrupt the extension's solve sequence.
     """
-    _POLL      = 0.5
-    _LOG_EVERY = 15
-    _next_log  = _LOG_EVERY
-    elapsed    = 0.0
-    captcha_logged = False
+    _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
+    _APPEAR_MAX = 120   # seconds to wait for captcha to appear
+    _POLL_STEP  = 1.0   # poll every 1 s — fast enough to catch a 1-2 s solve
 
-    log.debug("[NoPeCHA] Monitoring register page for redirect (max %ds)...", timeout)
-
-    while elapsed < timeout:
-        await asyncio.sleep(_POLL)
-        elapsed += _POLL
-
+    # ── Phase 1: wait for hCaptcha iframe to appear ───────────────────────
+    log.debug("[NoPeCHA] Waiting for hCaptcha to load (up to 120s)...")
+    appeared = False
+    for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
+        await asyncio.sleep(_POLL_STEP)
         try:
-            url = str(await page.evaluate("window.location.href") or "")
+            if await page.evaluate(_HCAP_JS):
+                appeared = True
+                break
         except Exception:
-            # Page navigated / CDP connection broke — captcha is done
-            log.success("[NoPeCHA] Page navigated (CDP disconnected) — captcha done ✓")
+            log.debug("[NoPeCHA] Page navigated before captcha appeared — no solve needed")
             return True
 
-        if url and "register" not in url and "login" not in url:
-            if captcha_logged:
-                log.success("[NoPeCHA] Captcha solved — page redirected ✓")
-            else:
-                log.info("[NoPeCHA] Page left register (no captcha needed)")
-            return True
+    if not appeared:
+        log.debug("[NoPeCHA] No hCaptcha appeared within 120s — skipping")
+        return True
 
-        # Still on /register after 8 s → captcha is blocking
-        if elapsed > 8 and not captcha_logged:
-            log.info("[NoPeCHA] Captcha present — NoPeCHA is solving it...")
-            captcha_logged = True
+    log.info("[NoPeCHA] hCaptcha iframe detected — checking state...")
+
+    # ── Checkbox click only if challenge is NOT already open ─────────────
+    # NoPeCHA's content script auto-clicks the checkbox.  By the time our
+    # Phase 1 poll fires the drag/image challenge may already be visible.
+    # Clicking the checkbox area into an open challenge disrupts solving.
+    try:
+        challenge_open = await page.evaluate(
+            "(() => {"
+            "  let frames = Array.from(document.querySelectorAll('iframe[src*=\"hcaptcha\"]'));"
+            "  return frames.some(f => {"
+            "    let r = f.getBoundingClientRect();"
+            "    return r.width > 200 && r.height > 200;"
+            "  }) ? 'open' : 'checkbox-only';"
+            "})()"
+        )
+    except Exception:
+        challenge_open = "unknown"
+
+    if challenge_open == "checkbox-only":
+        log.debug("[NoPeCHA] Challenge not yet open — clicking checkbox to trigger it")
+        await click_hcaptcha_checkbox(page)
+        await asyncio.sleep(1)
+    else:
+        log.debug(f"[NoPeCHA] Challenge already open ({challenge_open}) — letting extension solve")
+
+    # ── Phase 2: wait for extension to clear the iframe ──────────────────
+    elapsed       = 0
+    _LOG_INTERVAL = 15
+    _next_log     = _LOG_INTERVAL
+    while elapsed < timeout:
+        await asyncio.sleep(_POLL_STEP)
+        elapsed += _POLL_STEP
+        try:
+            if not await page.evaluate(_HCAP_JS):
+                log.success("[NoPeCHA] Captcha cleared by extension ✓")
+                return True
+        except Exception:
+            # Page navigated — captcha solved or bypassed
+            return True
 
         if elapsed >= _next_log:
-            log.debug(f"[NoPeCHA] Waiting for captcha solve... ({elapsed:.0f}s / {timeout}s)")
-            _next_log += _LOG_EVERY
+            log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
+            _next_log += _LOG_INTERVAL
 
-    # Timeout — return True so _wait_manual_captcha is NOT called.
-    # wait_for_account_creation (running in parallel) owns the final verdict.
-    log.warning(f"[NoPeCHA] {timeout}s elapsed, still on register — captcha may still be solving")
-    return True
+    log.warning(f"[NoPeCHA] Timed out waiting for extension to solve ({timeout}s)")
+    return False
 
 
 async def wait_for_account_creation(page, timeout: int = 300) -> bool:
