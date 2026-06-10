@@ -1126,14 +1126,67 @@ def _fp_save_pool(pool: list) -> None:
         log.debug(f"[Fingerprint] Could not save pool: {e}")
 
 
+def _is_valid_xfp(s: str) -> bool:
+    """Return True if s looks like a Discord x-fingerprint (snowflake.base64url)."""
+    if not s or "." not in s:
+        return False
+    parts = s.strip().split(".", 1)
+    return len(parts) == 2 and parts[0].isdigit() and len(parts[1]) >= 10
+
+
+def fetch_xfp_from_server() -> Optional[str]:
+    """
+    Fetch a random enabled Discord x-fingerprint from the dashboard fingerprint pool.
+    The admin uploads x-fingerprints via the dashboard; workers pull a random one here.
+    Returns the raw string e.g. '1459182762186637497.SDYEKQ0S-IQ56DYu0Px65a3Kn1M'
+    or None if the pool is empty or the server is unreachable.
+    """
+    if not api_client:
+        return None
+    try:
+        resp = requests.get(
+            f"{api_client.base_url}/api/fingerprints",
+            headers=api_client._headers(),
+            timeout=10,
+            verify=False,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            fp_rec = data.get("fingerprint")
+            if fp_rec and isinstance(fp_rec, dict):
+                raw = (fp_rec.get("data") or "").strip()
+                if _is_valid_xfp(raw):
+                    return raw
+            # total=0 means pool is empty — silently fall through
+            if data.get("total", -1) == 0:
+                log.debug("[Fingerprint] Server pool is empty — using local/live fetch")
+        else:
+            log.debug(f"[Fingerprint] Server returned HTTP {resp.status_code}")
+    except Exception as e:
+        log.debug(f"[Fingerprint] Server fetch error: {e}")
+    return None
+
+
 def get_fingerprint(min_age_days: int = 0, pool_size: int = 200) -> dict:
     """
-    Return a Discord x-fingerprint entry from the pool aged ≥ min_age_days.
+    Return a Discord x-fingerprint entry.
+
+    Priority order:
+      1. Dashboard fingerprint pool on the API server  (admin-managed, aged)
+      2. Local aged fingerprint pool                    (auto-collected over time)
+      3. Fresh fetch from Discord /api/v9/experiments   (last resort)
+
     Each entry: {"id": str, "created_at": ISO str, "fingerprint": "snowflake.token"}
-    If no sufficiently-aged entry exists, fetches a fresh one from Discord,
-    stores it (so it ages over time), and returns it.
     Thread-safe via _FP_POOL_LOCK.
     """
+    # ── 1. Try the server-managed pool first ─────────────────────────────
+    server_fp = fetch_xfp_from_server()
+    if server_fp:
+        fp_id = server_fp.split(".")[0]
+        log.info(f"[Fingerprint] Server x-fingerprint: {server_fp}")
+        return {"id": fp_id, "created_at": datetime.now().isoformat(), "fingerprint": server_fp}
+
+    # ── 2. Local aged pool ────────────────────────────────────────────────
     with _FP_POOL_LOCK:
         pool = _fp_load_pool()
         now  = datetime.now()
@@ -1150,10 +1203,11 @@ def get_fingerprint(min_age_days: int = 0, pool_size: int = 200) -> dict:
                     pass
             if aged:
                 age_days, chosen = random.choice(aged)
-                log.info(f"[Fingerprint] Aged Discord fingerprint selected (id={chosen['id']}, age={age_days}d): {chosen['fingerprint']}")
+                log.info(f"[Fingerprint] Local aged fingerprint (id={chosen['id']}, age={age_days}d): {chosen['fingerprint']}")
                 return chosen
-            log.info(f"[Fingerprint] No Discord fingerprints ≥{min_age_days}d old — fetching fresh from Discord")
+            log.info(f"[Fingerprint] No local fingerprints ≥{min_age_days}d old — fetching fresh")
 
+        # ── 3. Fetch fresh from Discord ───────────────────────────────────
         fp_str = fetch_discord_fingerprint()
         fp_id  = fp_str.split(".")[0] if fp_str else hashlib.md5(f"{time.time()}".encode()).hexdigest()[:16]
         entry  = {
@@ -1167,7 +1221,7 @@ def get_fingerprint(min_age_days: int = 0, pool_size: int = 200) -> dict:
                 pool.sort(key=lambda x: x.get("created_at", ""))
                 pool = pool[-pool_size:]
             _fp_save_pool(pool)
-            log.info(f"[Fingerprint] Fresh Discord fingerprint fetched (id={fp_id}): {fp_str}")
+            log.info(f"[Fingerprint] Fresh Discord fingerprint (id={fp_id}): {fp_str}")
         else:
             log.warning("[Fingerprint] Could not fetch Discord fingerprint from /api/v9/experiments")
         return entry
@@ -2659,47 +2713,80 @@ async def click_hcaptcha_checkbox(page) -> bool:
 
 async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
-    Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
+    Wait for the NoPeCHA browser extension to auto-solve any captcha.
 
-    NoPeCHA's content script auto-detects the hCaptcha iframe, clicks the
-    checkbox, and solves the challenge entirely on its own.  We must NOT
-    click the checkbox ourselves — doing so either double-clicks before
-    NoPeCHA fires (causing a duplicate event the extension doesn't expect)
-    or clicks into an already-open puzzle and destroys the solve state.
+    Phase 1 — up to 120 s: wait for a captcha to appear.
+      Uses a BROAD detector covering every URL pattern Discord uses
+      (hcaptcha.com, newassets.hcaptcha.com, captcha.*, challenge.*) as
+      well as non-iframe widget containers.  The old narrow selector
+      'iframe[src*="hcaptcha"]' silently missed captchas that load from
+      different sub-domains or do not yet have their src set.
 
-    Strategy:
-      Phase 1 — poll up to 120 s for the hCaptcha iframe to appear.
-      Brief pause — give NoPeCHA time to initialise and auto-click.
-      Phase 2 — poll every 1 s until the iframe is gone (solved) or timeout.
+    Phase 2 — up to `timeout` s: wait for extension to clear it.
+      Also detects page navigation away from /register as a solved signal.
+
+    We never click the checkbox — NoPeCHA's content script does it.
     """
-    _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
-    _APPEAR_MAX = 120
     _POLL_STEP  = 1.0
+    _APPEAR_MAX = 120
 
-    # ── Phase 1: wait for hCaptcha iframe to appear ───────────────────────
-    log.debug("[NoPeCHA] Waiting for hCaptcha to load (up to 120s)...")
+    # Broad captcha presence check.  Covers:
+    #  - any iframe whose src/title contains "captcha" or "challenge"
+    #  - hCaptcha widget container divs
+    #  - Discord's own "#cf-turnstile" / Cloudflare challenge wrappers
+    _CAPTCHA_PRESENT_JS = (
+        "(()=>{"
+        "  try{"
+        "    const ff=Array.from(document.querySelectorAll('iframe'));"
+        "    for(const f of ff){"
+        "      const s=(f.src||'').toLowerCase();"
+        "      const t=(f.title||'').toLowerCase();"
+        "      if(s.includes('captcha')||s.includes('challenge')||"
+        "         t.includes('captcha')||t.includes('human')||"
+        "         t.includes('verify')) return true;"
+        "    }"
+        "    if(document.querySelector('[data-hcaptcha-widget-id]')||"
+        "       document.querySelector('.h-captcha')||"
+        "       document.querySelector('[class*=\"captcha\"]')||"
+        "       document.querySelector('[id*=\"captcha\"]')||"
+        "       document.querySelector('[id*=\"cf-\"]')) return true;"
+        "    return false;"
+        "  }catch(e){return false;}"
+        "})()"
+    )
+
+    # ── Phase 1: wait for captcha to appear ───────────────────────────────
+    log.debug("[NoPeCHA] Waiting for captcha to appear (up to 120s)...")
     appeared = False
     for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
         await asyncio.sleep(_POLL_STEP)
         try:
-            if await page.evaluate(_HCAP_JS):
+            if await page.evaluate(_CAPTCHA_PRESENT_JS):
                 appeared = True
                 break
+            # If page already navigated away from /register, no captcha needed
+            try:
+                url = str(await page.evaluate("window.location.href") or "")
+                if url and "register" not in url and "login" not in url:
+                    log.info("[NoPeCHA] Page left register — no captcha needed")
+                    return True
+            except Exception:
+                pass
         except Exception:
-            log.debug("[NoPeCHA] Page navigated before captcha appeared — no solve needed")
+            log.debug("[NoPeCHA] Page navigated during Phase 1 — no captcha needed")
             return True
 
     if not appeared:
-        log.debug("[NoPeCHA] No hCaptcha appeared within 120s — skipping")
+        log.info("[NoPeCHA] No captcha appeared within 120s — continuing")
         return True
 
-    log.info("[NoPeCHA] hCaptcha detected — letting extension handle it...")
+    log.info("[NoPeCHA] Captcha detected — letting extension handle it (not clicking ourselves)...")
 
-    # Give NoPeCHA's content script time to wake up, click the checkbox,
-    # and begin solving before we start polling for completion.
+    # Give NoPeCHA's content script time to initialise, detect, and
+    # auto-click the checkbox before we start polling for completion.
     await asyncio.sleep(4)
 
-    # ── Phase 2: wait for extension to clear the iframe ──────────────────
+    # ── Phase 2: wait for captcha to be cleared ───────────────────────────
     elapsed    = 0.0
     _LOG_EVERY = 15
     _next_log  = _LOG_EVERY
@@ -2707,18 +2794,25 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
         await asyncio.sleep(_POLL_STEP)
         elapsed += _POLL_STEP
         try:
-            if not await page.evaluate(_HCAP_JS):
+            if not await page.evaluate(_CAPTCHA_PRESENT_JS):
                 log.success("[NoPeCHA] Captcha cleared by extension ✓")
                 return True
+            # Page navigation = captcha solved / bypassed
+            try:
+                url = str(await page.evaluate("window.location.href") or "")
+                if url and "register" not in url and "login" not in url:
+                    log.success("[NoPeCHA] Page navigated away — captcha solved ✓")
+                    return True
+            except Exception:
+                return True
         except Exception:
-            # Page navigated — captcha solved or bypassed
             return True
 
         if elapsed >= _next_log:
             log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
             _next_log += _LOG_EVERY
 
-    log.warning(f"[NoPeCHA] Timed out waiting for extension to solve ({timeout}s)")
+    log.warning(f"[NoPeCHA] Timed out waiting for extension ({timeout}s)")
     return False
 
 
