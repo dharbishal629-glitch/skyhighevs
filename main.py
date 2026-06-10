@@ -2713,107 +2713,67 @@ async def click_hcaptcha_checkbox(page) -> bool:
 
 async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
-    Wait for the NoPeCHA browser extension to auto-solve any captcha.
+    Wait for NoPeCHA to solve the captcha (if any) on the Discord register page.
 
-    Phase 1 — up to 120 s: wait for a captcha to appear.
-      Uses a BROAD detector covering every URL pattern Discord uses
-      (hcaptcha.com, newassets.hcaptcha.com, captcha.*, challenge.*) as
-      well as non-iframe widget containers.  The old narrow selector
-      'iframe[src*="hcaptcha"]' silently missed captchas that load from
-      different sub-domains or do not yet have their src set.
+    WHY URL-BASED DETECTION:
+      All previous approaches tried to find the captcha iframe in the DOM
+      using CSS selectors (src*="hcaptcha", class*="captcha", etc.).  These
+      consistently failed because Discord's hCaptcha iframe src attribute is
+      set LAZILY — the iframe element is injected into the DOM before its src
+      is assigned, so any attribute-based selector fires before the src is
+      populated and returns nothing.  Inspecting the DOM is therefore
+      fundamentally unreliable.
 
-    Phase 2 — up to `timeout` s: wait for extension to clear it.
-      Also detects page navigation away from /register as a solved signal.
+    CORRECT SIGNAL:
+      NoPeCHA detects and solves the captcha entirely on its own.  When done,
+      Discord redirects away from /register.  We simply watch
+      window.location.href — leaving /register means the captcha (if any)
+      is finished.
 
-    We never click the checkbox — NoPeCHA's content script does it.
+    NOTE: this function runs as a background asyncio task alongside
+      wait_for_account_creation().  If we time out we return True (not False)
+      so that _wait_manual_captcha is NOT triggered; wait_for_account_creation
+      already has its own 300 s window and will surface the real outcome.
     """
-    _POLL_STEP  = 1.0
-    _APPEAR_MAX = 120
-
-    # Broad captcha presence check.  Covers:
-    #  - any iframe whose src/title contains "captcha" or "challenge"
-    #  - hCaptcha widget container divs
-    #  - Discord's own "#cf-turnstile" / Cloudflare challenge wrappers
-    _CAPTCHA_PRESENT_JS = (
-        "(()=>{"
-        "  try{"
-        "    const ff=Array.from(document.querySelectorAll('iframe'));"
-        "    for(const f of ff){"
-        "      const s=(f.src||'').toLowerCase();"
-        "      const t=(f.title||'').toLowerCase();"
-        "      if(s.includes('captcha')||s.includes('challenge')||"
-        "         t.includes('captcha')||t.includes('human')||"
-        "         t.includes('verify')) return true;"
-        "    }"
-        "    if(document.querySelector('[data-hcaptcha-widget-id]')||"
-        "       document.querySelector('.h-captcha')||"
-        "       document.querySelector('[class*=\"captcha\"]')||"
-        "       document.querySelector('[id*=\"captcha\"]')||"
-        "       document.querySelector('[id*=\"cf-\"]')) return true;"
-        "    return false;"
-        "  }catch(e){return false;}"
-        "})()"
-    )
-
-    # ── Phase 1: wait for captcha to appear ───────────────────────────────
-    log.debug("[NoPeCHA] Waiting for captcha to appear (up to 120s)...")
-    appeared = False
-    for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
-        await asyncio.sleep(_POLL_STEP)
-        try:
-            if await page.evaluate(_CAPTCHA_PRESENT_JS):
-                appeared = True
-                break
-            # If page already navigated away from /register, no captcha needed
-            try:
-                url = str(await page.evaluate("window.location.href") or "")
-                if url and "register" not in url and "login" not in url:
-                    log.info("[NoPeCHA] Page left register — no captcha needed")
-                    return True
-            except Exception:
-                pass
-        except Exception:
-            log.debug("[NoPeCHA] Page navigated during Phase 1 — no captcha needed")
-            return True
-
-    if not appeared:
-        log.info("[NoPeCHA] No captcha appeared within 120s — continuing")
-        return True
-
-    log.info("[NoPeCHA] Captcha detected — letting extension handle it (not clicking ourselves)...")
-
-    # Give NoPeCHA's content script time to initialise, detect, and
-    # auto-click the checkbox before we start polling for completion.
-    await asyncio.sleep(4)
-
-    # ── Phase 2: wait for captcha to be cleared ───────────────────────────
-    elapsed    = 0.0
+    _POLL      = 0.5
     _LOG_EVERY = 15
     _next_log  = _LOG_EVERY
+    elapsed    = 0.0
+    captcha_logged = False
+
+    log.debug("[NoPeCHA] Monitoring register page for redirect (max %ds)...", timeout)
+
     while elapsed < timeout:
-        await asyncio.sleep(_POLL_STEP)
-        elapsed += _POLL_STEP
+        await asyncio.sleep(_POLL)
+        elapsed += _POLL
+
         try:
-            if not await page.evaluate(_CAPTCHA_PRESENT_JS):
-                log.success("[NoPeCHA] Captcha cleared by extension ✓")
-                return True
-            # Page navigation = captcha solved / bypassed
-            try:
-                url = str(await page.evaluate("window.location.href") or "")
-                if url and "register" not in url and "login" not in url:
-                    log.success("[NoPeCHA] Page navigated away — captcha solved ✓")
-                    return True
-            except Exception:
-                return True
+            url = str(await page.evaluate("window.location.href") or "")
         except Exception:
+            # Page navigated / CDP connection broke — captcha is done
+            log.success("[NoPeCHA] Page navigated (CDP disconnected) — captcha done ✓")
             return True
 
+        if url and "register" not in url and "login" not in url:
+            if captcha_logged:
+                log.success("[NoPeCHA] Captcha solved — page redirected ✓")
+            else:
+                log.info("[NoPeCHA] Page left register (no captcha needed)")
+            return True
+
+        # Still on /register after 8 s → captcha is blocking
+        if elapsed > 8 and not captcha_logged:
+            log.info("[NoPeCHA] Captcha present — NoPeCHA is solving it...")
+            captcha_logged = True
+
         if elapsed >= _next_log:
-            log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
+            log.debug(f"[NoPeCHA] Waiting for captcha solve... ({elapsed:.0f}s / {timeout}s)")
             _next_log += _LOG_EVERY
 
-    log.warning(f"[NoPeCHA] Timed out waiting for extension ({timeout}s)")
-    return False
+    # Timeout — return True so _wait_manual_captcha is NOT called.
+    # wait_for_account_creation (running in parallel) owns the final verdict.
+    log.warning(f"[NoPeCHA] {timeout}s elapsed, still on register — captcha may still be solving")
+    return True
 
 
 async def wait_for_account_creation(page, timeout: int = 300) -> bool:
