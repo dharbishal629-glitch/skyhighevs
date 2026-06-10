@@ -2299,7 +2299,9 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
     return False
 
 
-NOPECHA_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+NOPECHA_EXT_ID      = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+_nopecha_key_lock   = threading.Lock()
+_nopecha_key_ready  = False   # True once the setup browser has saved the key this session
 
 
 def _get_tool_base_dir() -> str:
@@ -2539,6 +2541,82 @@ async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
     except Exception as e:
         log.warning(f"[NoPeCHA] Key inject error: {e}")
         return False
+
+
+async def ensure_nopecha_ready(ext_dir: str, api_key: str,
+                               brave_path: Optional[str] = None) -> Optional[str]:
+    """
+    Ensure nopecha_profile/ has the API key saved for this tool session.
+
+    First call (per process run):
+      Opens a setup browser with --user-data-dir=nopecha_profile/, opens the
+      extension popup, prompts the worker to click "Enter API key" ONCE, then
+      auto-fills and saves the key through NoPeCHA's own validation flow.
+      Sets the process-level _nopecha_key_ready flag so subsequent calls skip
+      all of this instantly.
+
+    Subsequent calls (same process, different worker threads):
+      _nopecha_key_ready is True → return the profile dir immediately.
+      No browser opened, no prompts, zero delay.
+
+    Tool restart → _nopecha_key_ready resets to False → asks once again.
+    """
+    global _nopecha_key_ready
+
+    profile_dir = os.path.join(_get_tool_base_dir(), "nopecha_profile")
+
+    # Fast path — key already set up this session
+    if _nopecha_key_ready and os.path.isdir(profile_dir):
+        return profile_dir
+
+    with _nopecha_key_lock:
+        # Double-check after lock acquisition (another thread may have finished)
+        if _nopecha_key_ready and os.path.isdir(profile_dir):
+            return profile_dir
+
+        # Wipe any stale profile so we start clean
+        if os.path.isdir(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        os.makedirs(profile_dir, exist_ok=True)
+
+        setup_kw = {
+            "headless": False,
+            "browser_args": [
+                f"--load-extension={ext_dir}",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run", "--disable-default-apps",
+                "--disable-dev-shm-usage",
+                "--no-default-browser-check",
+            ],
+        }
+        if brave_path:
+            setup_kw["browser_executable_path"] = brave_path
+
+        setup_browser = None
+        try:
+            setup_browser = await uc.start(**setup_kw)
+            injected = await inject_nopecha_key(setup_browser, NOPECHA_EXT_ID, api_key)
+            # Give Chrome extra time to flush chrome.storage LevelDB to disk
+            await asyncio.sleep(5)
+
+            if injected:
+                _nopecha_key_ready = True
+                print(Colorate.Horizontal(Colors.green_to_cyan,
+                    "  [NoPeCHA] Profile saved — all workers will use pre-loaded key ✓"))
+                return profile_dir
+            else:
+                log.warning("[NoPeCHA] Setup incomplete — workers will fall back to manual inject")
+                return None
+
+        except Exception as e:
+            log.warning(f"[NoPeCHA] Profile setup error: {e}")
+            return None
+        finally:
+            if setup_browser:
+                try:
+                    await setup_browser.stop()
+                except Exception:
+                    pass
 
 
 async def click_hcaptcha_checkbox(page) -> bool:
@@ -2864,34 +2942,45 @@ async def worker():
             log.info(f"Launching Brave: {brave_path}")
 
         # ── NoPeCHA extension setup ────────────────────────────────────────
-        # NoPeCHA is a browser extension solver — NOT a REST API.
-        #
-        # Flow (fully automatic):
-        #  1. ensure_nopecha_extension() — downloads CRX once to nopecha_ext/.
-        #  2. Browser launched with --load-extension pointing at that folder.
-        #  3. inject_nopecha_key()       — writes the key directly into
-        #     chrome.storage.local from the extension popup page context.
-        #     This happens BEFORE navigating to Discord so the extension has
-        #     the key ready when the captcha iframe appears.
-        #
-        # No persistent profile copy needed — chrome.storage writes persist
-        # for the lifetime of the browser session, which is all we need.
+        # Flow:
+        #  1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
+        #  2. ensure_nopecha_ready()      — ONE-TIME per tool run:
+        #       opens a setup browser, prompts the worker to click
+        #       "Enter API key" once, auto-fills + saves to the profile dir.
+        #       On subsequent workers the setup is already done (in-memory flag)
+        #       so this returns instantly with no browser opened.
+        #  3. Worker browser launched with --user-data-dir copy of the profile
+        #       so the key is pre-loaded — zero prompts, zero delays.
         _nopecha_enabled = bool(config.get("nopechaEnabled"))
         _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
         _nopecha_ext_dir = None
+        _nopecha_temp_dir = None
 
         if _nopecha_enabled and _nopecha_api_key:
             _nopecha_ext_dir = ensure_nopecha_extension()
             if _nopecha_ext_dir:
-                start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
-                log.info(f"[NoPeCHA] Extension loaded from {_nopecha_ext_dir}")
+                profile_src = await ensure_nopecha_ready(
+                    _nopecha_ext_dir, _nopecha_api_key, brave_path
+                )
+                if profile_src:
+                    _nopecha_temp_dir = tempfile.mkdtemp(prefix="nopecha_w_")
+                    shutil.copytree(profile_src, _nopecha_temp_dir, dirs_exist_ok=True)
+                    start_kw["browser_args"].extend([
+                        f"--load-extension={_nopecha_ext_dir}",
+                        f"--user-data-dir={_nopecha_temp_dir}",
+                    ])
+                    log.info("[NoPeCHA] Profile ready — key pre-loaded in worker browser")
+                else:
+                    # Setup failed — load extension and inject key at runtime
+                    start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
+                    log.warning("[NoPeCHA] Profile unavailable — will prompt for key after launch")
             else:
                 log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
         browser = await uc.start(**start_kw)
 
-        # Write the API key into extension storage before opening Discord.
-        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
+        # Fallback: if profile copy failed, inject key the semi-manual way now
+        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir and not _nopecha_temp_dir:
             await inject_nopecha_key(browser, NOPECHA_EXT_ID, _nopecha_api_key)
 
         # ── Fingerprint system ─────────────────────────────────────────────
@@ -3181,6 +3270,13 @@ async def worker():
         if browser:
             try:
                 await browser.stop()
+            except Exception:
+                pass
+
+        # Clean up the per-worker profile copy
+        if _nopecha_temp_dir and os.path.isdir(_nopecha_temp_dir):
+            try:
+                shutil.rmtree(_nopecha_temp_dir, ignore_errors=True)
             except Exception:
                 pass
 
