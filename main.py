@@ -2661,14 +2661,17 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
     Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
 
-    hCaptcha takes a few seconds to load after form submission, so this
-    function first waits up to 120 seconds for the iframe to *appear*, then
-    clicks the 'I am human' checkbox (which triggers the full challenge),
-    then waits up to `timeout` seconds for the extension to solve and clear it.
+    KEY RULES:
+    - Poll every 1 s (not 5 s) — NoPeCHA solves in 1-3 s and the page
+      navigates away immediately.  5-second polling misses the solve window.
+    - Only click the checkbox if the challenge is NOT already open.
+      NoPeCHA auto-clicks the checkbox itself; if we click again after the
+      drag/image challenge has opened we land inside the puzzle image and
+      disrupt the extension's solve sequence.
     """
     _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
-    _APPEAR_MAX = 120   # seconds to wait for captcha to show up
-    _POLL_STEP  = 5.0   # polling interval (check every 5 seconds)
+    _APPEAR_MAX = 120   # seconds to wait for captcha to appear
+    _POLL_STEP  = 1.0   # poll every 1 s — fast enough to catch a 1-2 s solve
 
     # ── Phase 1: wait for hCaptcha iframe to appear ───────────────────────
     log.debug("[NoPeCHA] Waiting for hCaptcha to load (up to 120s)...")
@@ -2680,37 +2683,57 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
                 appeared = True
                 break
         except Exception:
-            # Page navigated mid-wait → no captcha needed
             log.debug("[NoPeCHA] Page navigated before captcha appeared — no solve needed")
             return True
 
     if not appeared:
         log.debug("[NoPeCHA] No hCaptcha appeared within 120s — skipping")
-        return True   # no captcha on this registration attempt
+        return True
 
-    log.info("[NoPeCHA] hCaptcha detected — clicking checkbox and waiting for extension to solve...")
+    log.info("[NoPeCHA] hCaptcha iframe detected — checking state...")
 
-    # Click the 'I am human' checkbox to trigger the full image challenge.
-    # NoPeCHA should handle both, but clicking ensures the challenge fires even
-    # if the extension mis-times the auto-click.
-    await click_hcaptcha_checkbox(page)
-    await asyncio.sleep(2)
+    # ── Checkbox click only if challenge is NOT already open ─────────────
+    # NoPeCHA's content script auto-clicks the checkbox.  By the time our
+    # Phase 1 poll fires the drag/image challenge may already be visible.
+    # Clicking the checkbox area into an open challenge disrupts solving.
+    try:
+        challenge_open = await page.evaluate(
+            "(() => {"
+            "  let frames = Array.from(document.querySelectorAll('iframe[src*=\"hcaptcha\"]'));"
+            "  return frames.some(f => {"
+            "    let r = f.getBoundingClientRect();"
+            "    return r.width > 200 && r.height > 200;"  # challenge iframe is large
+            "  }) ? 'open' : 'checkbox-only';"
+            "})()"
+        )
+    except Exception:
+        challenge_open = "unknown"
+
+    if challenge_open == "checkbox-only":
+        log.debug("[NoPeCHA] Challenge not yet open — clicking checkbox to trigger it")
+        await click_hcaptcha_checkbox(page)
+        await asyncio.sleep(1)
+    else:
+        log.debug(f"[NoPeCHA] Challenge already open ({challenge_open}) — letting extension solve")
 
     # ── Phase 2: wait for extension to clear the iframe ──────────────────
-    ticks = int(timeout / _POLL_STEP)
-    for tick in range(ticks):
+    elapsed = 0
+    _LOG_INTERVAL = 15   # log progress every 15 s
+    _next_log     = _LOG_INTERVAL
+    while elapsed < timeout:
         await asyncio.sleep(_POLL_STEP)
+        elapsed += _POLL_STEP
         try:
             if not await page.evaluate(_HCAP_JS):
-                log.success("[NoPeCHA] Captcha cleared by extension!")
+                log.success("[NoPeCHA] Captcha cleared by extension ✓")
                 return True
         except Exception:
-            # Page navigated away — captcha solved/bypassed
+            # Page navigated — captcha solved or bypassed
             return True
 
-        if tick % 20 == 19:
-            elapsed = (tick + 1) * _POLL_STEP
+        if elapsed >= _next_log:
             log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
+            _next_log += _LOG_INTERVAL
 
     log.warning(f"[NoPeCHA] Timed out waiting for extension to solve ({timeout}s)")
     return False
