@@ -2422,68 +2422,119 @@ def ensure_nopecha_extension() -> Optional[str]:
 
 async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
     """
-    Store the NoPeCHA API key directly in chrome.storage from the extension page.
+    Semi-manual NoPeCHA key injection.
 
-    WHY chrome.storage instead of popup UI:
-    - Clicking "Enter API key" in the popup reveals an input, but pressing Enter
-      only triggers a validation POST to nopecha.com — it does NOT save the raw
-      key directly.  If the API call fails (e.g. network blip, free-plan IP
-      restriction) the key is never persisted.  Logs showed "saved-via-enter"
-      as a false positive because the Enter-key event fired, but chrome.storage
-      was never actually written.
-    - Navigating to chrome-extension://{id}/popup.html gives us the extension's
-      JS context, so we can call chrome.storage.local.set() directly.
-      chrome.storage.onChanged fires immediately → extension reloads its state.
+    Flow:
+      1. Open the NoPeCHA popup as a browser tab.
+      2. Print a one-line prompt — worker clicks "Enter API key" themselves.
+      3. Tool polls until the input field appears (user clicked the link).
+      4. Tool auto-fills the key, fires input/change events, then presses Enter.
+      5. Waits for the extension to validate & save, then confirms key is active.
 
-    We try all known NoPeCHA storage key formats so this works across versions.
+    This approach is reliable because the user's manual click properly opens
+    the input via the extension's own event handlers, so the subsequent Enter
+    goes through the real save path (NoPeCHA API validation + chrome.storage).
     """
     safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
 
     try:
-        ext_page = await browser.get(f"chrome-extension://{ext_id}/popup.html")
-        await asyncio.sleep(2)   # let extension initialise
-
-        # Write to chrome.storage with every known NoPeCHA key format.
-        # evaluate() is fire-and-forget for Promises — the writes happen async
-        # in the JS background; we wait 4 s below for them to settle.
-        await ext_page.evaluate(
-            f"(() => {{"
-            f"  let k = '{safe_key}';"
-            f"  try {{ chrome.storage.local.set({{key: k}}); }} catch(e) {{}}"
-            f"  try {{ chrome.storage.local.set({{settings: {{key: k}}}}) }} catch(e) {{}}"
-            f"  try {{ chrome.storage.local.set({{nc_key: k}}); }} catch(e) {{}}"
-            f"  try {{ chrome.storage.sync.set({{key: k}}); }} catch(e) {{}}"
-            f"  return 'storage-writes-fired';"
-            f"}})()"
-        )
-        await asyncio.sleep(4)   # wait for writes to flush
-
-        # Reload the popup so the extension picks up the new storage values.
+        # Open the NoPeCHA popup page as a tab so the user can see it.
         ext_page = await browser.get(f"chrome-extension://{ext_id}/popup.html")
         await asyncio.sleep(2)
 
-        # Verify: if the popup no longer shows "Enter API key" the key is active.
+        # Dismiss the "Join our Discord" banner if it's covering the UI.
+        await ext_page.evaluate(
+            "(() => {"
+            "  let all = Array.from(document.querySelectorAll('*'));"
+            "  let x = all.find(e =>"
+            "    ['×','✕','✖','x','X'].includes(e.textContent.trim()) &&"
+            "    e.getBoundingClientRect().width > 0 &&"
+            "    e.getBoundingClientRect().width < 40);"
+            "  if (x) x.click();"
+            "  return x ? 'dismissed' : 'no-banner';"
+            "})()"
+        )
+        await asyncio.sleep(0.3)
+
+        # ── Prompt the worker ───────────────────────────────────────────────
+        print()
+        print(Colorate.Horizontal(Colors.cyan_to_blue,
+            "  ╔══════════════════════════════════════════════════════╗"))
+        print(Colorate.Horizontal(Colors.cyan_to_blue,
+            "  ║  NoPeCHA: click  \"Enter API key\"  in the browser    ║"))
+        print(Colorate.Horizontal(Colors.cyan_to_blue,
+            "  ║  The key will be filled automatically once clicked.  ║"))
+        print(Colorate.Horizontal(Colors.cyan_to_blue,
+            "  ╚══════════════════════════════════════════════════════╝"))
+        print()
+
+        # ── Wait up to 120 s for the input field to appear ─────────────────
+        found_input = False
+        for tick in range(120):
+            has_input = await ext_page.evaluate(
+                "(() => {"
+                "  let inp = Array.from(document.querySelectorAll('input,textarea'))"
+                "    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
+                "  return inp ? 'yes' : 'no';"
+                "})()"
+            )
+            if has_input == "yes":
+                found_input = True
+                break
+            if tick % 10 == 0 and tick > 0:
+                log.debug(f"[NoPeCHA] Waiting for key input... ({tick}s)")
+            await asyncio.sleep(1)
+
+        if not found_input:
+            log.warning("[NoPeCHA] Timed out waiting for key input — continuing without key")
+            return False
+
+        log.info("[NoPeCHA] Input detected — filling API key...")
+
+        # ── Auto-fill the key via native React/Vue setter ───────────────────
+        await ext_page.evaluate(
+            f"(() => {{"
+            f"  let inp = Array.from(document.querySelectorAll('input,textarea'))"
+            f"    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
+            f"  if (!inp) return 'no-input';"
+            f"  let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;"
+            f"  if (setter) setter.call(inp, '{safe_key}'); else inp.value = '{safe_key}';"
+            f"  inp.dispatchEvent(new Event('input',  {{bubbles: true}}));"
+            f"  inp.dispatchEvent(new Event('change', {{bubbles: true}}));"
+            f"  return 'filled';"
+            f"}})()"
+        )
+        await asyncio.sleep(0.5)
+
+        # ── Press Enter to trigger the save (NoPeCHA API validation + store) ─
+        await ext_page.evaluate(
+            "(() => {"
+            "  let inp = Array.from(document.querySelectorAll('input,textarea'))"
+            "    .find(i => i.getBoundingClientRect().width > 0 && i.type !== 'checkbox');"
+            "  if (!inp) return 'no-input';"
+            "  inp.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',keyCode:13,which:13,bubbles:true}));"
+            "  inp.dispatchEvent(new KeyboardEvent('keyup',   {key:'Enter',keyCode:13,which:13,bubbles:true}));"
+            "  return 'enter-sent';"
+            "})()"
+        )
+        await asyncio.sleep(4)   # wait for NoPeCHA to validate + persist
+
+        # ── Verify the key is now active (popup stops showing "Enter API key") ─
         still_empty = await ext_page.evaluate(
             "(() => {"
             "  let els = Array.from(document.querySelectorAll('*'));"
             "  let asking = els.find(e => e.getBoundingClientRect().width > 0"
-            "    && (e.textContent||'').includes('Enter API key'));"
+            "    && (e.textContent || '').includes('Enter API key'));"
             "  return asking ? 'yes' : 'no';"
             "})()"
         )
 
         if still_empty == "no":
-            log.success("[NoPeCHA] API key active in extension ✓ (storage write confirmed)")
+            log.success("[NoPeCHA] API key saved and active ✓")
             return True
 
-        # Key wasn't picked up yet — this can happen when the extension validates
-        # the key with nopecha.com before accepting it (paid-plan requirement).
-        # Log the warning and continue; solving may still work on clean IPs.
-        log.warning(
-            "[NoPeCHA] Extension still shows 'Enter API key' after storage write — "
-            "key may need API validation (paid plan) or IP is flagged as VPN/proxy."
-        )
-        return True   # don't abort the worker — let it attempt the captcha
+        log.warning("[NoPeCHA] Key may not have saved — check your NoPeCHA plan/credits")
+        return True   # still proceed; captcha solve attempt will show if it works
 
     except Exception as e:
         log.warning(f"[NoPeCHA] Key inject error: {e}")
