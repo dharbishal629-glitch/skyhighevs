@@ -2810,20 +2810,58 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
         await asyncio.sleep(2)
 
     # ── Phase 3: wait for page to leave /register ─────────────────────────
-    elapsed    = 0.0
-    _LOG_EVERY = 15
-    _next_log  = _LOG_EVERY
+    # NoPeCHA is a visual cursor-based solver — it physically moves the mouse
+    # inside the browser to solve the challenge. Our only job here is to wait
+    # for the page to redirect away from /register, which happens the moment
+    # NoPeCHA submits a correct answer and Discord creates the account.
+    #
+    # SKIP CYCLING: Drag/shape challenges are harder for NoPeCHA. Every 45 s
+    # we click the Skip button (bottom-right of the challenge iframe) to cycle
+    # to a new, potentially easier challenge type. NoPeCHA will then attempt
+    # the fresh challenge automatically.
+    elapsed      = 0.0
+    _LOG_EVERY   = 15
+    _next_log    = _LOG_EVERY
+    _SKIP_EVERY  = 45          # click Skip every 45 s to cycle challenges
+    _last_skip   = 0.0
+
     while elapsed < timeout:
         await asyncio.sleep(_POLL)
         elapsed += _POLL
+
         try:
             url = str(await page.evaluate("window.location.href") or "")
         except Exception:
-            log.success("[NoPeCHA] Page navigated (CDP) — captcha solved ✓")
+            log.success("[NoPeCHA] Page navigated — captcha solved ✓")
             return True
+
         if url and "register" not in url and "login" not in url:
             log.success("[NoPeCHA] Captcha solved — page redirected ✓")
             return True
+
+        # ── Skip to cycle to a new challenge every 45 s ──────────────────
+        if elapsed - _last_skip >= _SKIP_EVERY:
+            _last_skip = elapsed
+            try:
+                skip_pos = await page.evaluate(
+                    "(()=>{"
+                    " const ff=Array.from(document.querySelectorAll('iframe'));"
+                    " const big=ff.find(f=>{"
+                    "  const r=f.getBoundingClientRect();"
+                    "  return r.width*r.height>40000;"
+                    " });"
+                    " if(!big)return null;"
+                    " const r=big.getBoundingClientRect();"
+                    " return {x:Math.round(r.right-45),y:Math.round(r.bottom-15)};"
+                    "})()"
+                )
+                if skip_pos and isinstance(skip_pos, dict):
+                    await page.mouse_click(skip_pos["x"], skip_pos["y"])
+                    log.debug(f"[NoPeCHA] Clicked Skip → cycling to new challenge ({elapsed:.0f}s)")
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
         if elapsed >= _next_log:
             log.debug(f"[NoPeCHA] Waiting for NoPeCHA to solve... ({elapsed:.0f}s / {timeout}s)")
             _next_log += _LOG_EVERY
