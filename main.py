@@ -2677,24 +2677,29 @@ async def click_hcaptcha_checkbox(page) -> bool:
     """
     Click the 'I am human' checkbox inside the hCaptcha widget iframe.
 
-    Discord sometimes requires a checkbox click to trigger the full challenge
-    before NoPeCHA can solve it.  We get the iframe's bounding rect from the
-    parent page and send a mouse click at the checkbox position (left ~28px,
-    vertically centred).  Cross-origin restrictions are bypassed because we
-    click at screen coordinates rather than accessing iframe DOM directly.
+    We locate the iframe by data attribute or class — NOT by src URL, because
+    Discord's hCaptcha iframe src is set lazily (after element insertion) and
+    is an empty string at the moment most code checks it.  As a final fallback
+    we pick the first rendered iframe with a reasonable bounding rect (the
+    register page has no other iframes).
     """
     try:
         rect = await page.evaluate(
             "(() => {"
-            "  let f = document.querySelector('iframe[src*=\"hcaptcha.com\"][src*=\"checkbox\"]')"
-            "    || document.querySelector('iframe[data-hcaptcha-widget-id]')"
-            "    || document.querySelector('iframe[src*=\"hcaptcha\"]');"
+            "  let f = document.querySelector('iframe[data-hcaptcha-widget-id]')"
+            "    || document.querySelector('.h-captcha iframe')"
+            "    || document.querySelector('iframe[src*=\"hcaptcha\"]')"
+            "    || Array.from(document.querySelectorAll('iframe')).find(f => {"
+            "        const r = f.getBoundingClientRect();"
+            "        return r.width > 20 && r.width < 500 && r.height > 20 && r.top > 0;"
+            "      });"
             "  if (!f) return null;"
             "  let r = f.getBoundingClientRect();"
             "  return {x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height)};"
             "})()"
         )
         if not rect or not isinstance(rect, dict):
+            log.debug("[hCaptcha] No iframe found to click")
             return False
 
         # Checkbox lives in the left ~50 px of the iframe, vertically centred
@@ -2715,25 +2720,51 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
     Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
 
-    KEY RULES:
-    - Poll every 1 s (not 5 s) — NoPeCHA solves in 1-3 s and the page
-      navigates away immediately.  5-second polling misses the solve window.
-    - Only click the checkbox if the challenge is NOT already open.
-      NoPeCHA auto-clicks the checkbox itself; if we click again after the
-      drag/image challenge has opened we land inside the puzzle image and
-      disrupt the extension's solve sequence.
-    """
-    _HCAP_JS    = "() => !!document.querySelector('iframe[src*=\"hcaptcha\"]')"
-    _APPEAR_MAX = 120   # seconds to wait for captcha to appear
-    _POLL_STEP  = 1.0   # poll every 1 s — fast enough to catch a 1-2 s solve
+    WHY WE DO NOT USE iframe[src*="hcaptcha"]:
+      Discord's hCaptcha iframe `src` attribute is populated LAZILY — the
+      <iframe> element is injected into the DOM first and its src is set by
+      a subsequent JS call.  Any code that reads f.src immediately after the
+      element appears sees an empty string.  The selector therefore returns
+      null even when the captcha widget is fully visible on screen.
 
-    # ── Phase 1: wait for hCaptcha iframe to appear ───────────────────────
-    log.debug("[NoPeCHA] Waiting for hCaptcha to load (up to 120s)...")
+    WHAT WE USE INSTEAD:
+      Phase 1 — hCaptcha widget presence:
+        .h-captcha              always present (Discord's wrapper div)
+        [data-hcaptcha-widget-id]  set on the iframe synchronously by hCaptcha JS
+        Either selector fires as soon as the widget is initialised.
+        As a last resort: any iframe whose bounding rect is > 20x20 visible px.
+
+      Phase 2 — challenge open vs. checkbox-only:
+        We compare the AREA of all visible iframes.  The checkbox widget is
+        ~300×74 px.  The open challenge (image grid) is ~400×600 px.
+        A frame with area > 60 000 px² means the challenge is open.
+
+      Phase 3 — solved:
+        Same widget selectors — when they return null the captcha is gone.
+    """
+    _POLL_STEP  = 1.0
+    _APPEAR_MAX = 120
+
+    # ── Widget-presence selector (no src URL) ─────────────────────────────
+    _WIDGET_JS = (
+        "() => !!("
+        "  document.querySelector('.h-captcha') || "
+        "  document.querySelector('[data-hcaptcha-widget-id]') || "
+        "  document.querySelector('iframe[src*=\"hcaptcha\"]') || "
+        "  Array.from(document.querySelectorAll('iframe')).some(f => {"
+        "    const r = f.getBoundingClientRect();"
+        "    return r.width > 20 && r.height > 20 && r.top > 0;"
+        "  })"
+        ")"
+    )
+
+    # ── Phase 1: wait for hCaptcha widget to appear ───────────────────────
+    log.debug("[NoPeCHA] Waiting for hCaptcha widget (up to 120s)...")
     appeared = False
     for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
         await asyncio.sleep(_POLL_STEP)
         try:
-            if await page.evaluate(_HCAP_JS):
+            if await page.evaluate(_WIDGET_JS):
                 appeared = True
                 break
         except Exception:
@@ -2741,23 +2772,21 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
             return True
 
     if not appeared:
-        log.debug("[NoPeCHA] No hCaptcha appeared within 120s — skipping")
+        log.debug("[NoPeCHA] No hCaptcha widget appeared within 120s — skipping")
         return True
 
-    log.info("[NoPeCHA] hCaptcha iframe detected — checking state...")
+    log.info("[NoPeCHA] hCaptcha widget detected!")
 
-    # ── Checkbox click only if challenge is NOT already open ─────────────
-    # NoPeCHA's content script auto-clicks the checkbox.  By the time our
-    # Phase 1 poll fires the drag/image challenge may already be visible.
-    # Clicking the checkbox area into an open challenge disrupts solving.
+    # ── Phase 2: challenge open? — use bounding rect area, not src ────────
     try:
         challenge_open = await page.evaluate(
             "(() => {"
-            "  let frames = Array.from(document.querySelectorAll('iframe[src*=\"hcaptcha\"]'));"
-            "  return frames.some(f => {"
-            "    let r = f.getBoundingClientRect();"
-            "    return r.width > 200 && r.height > 200;"
-            "  }) ? 'open' : 'checkbox-only';"
+            "  const frames = Array.from(document.querySelectorAll('iframe'));"
+            "  const large = frames.filter(f => {"
+            "    const r = f.getBoundingClientRect();"
+            "    return r.width * r.height > 60000;"   # >60k px² = open challenge
+            "  });"
+            "  return large.length > 0 ? 'open' : 'checkbox-only';"
             "})()"
         )
     except Exception:
@@ -2768,9 +2797,9 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
         await click_hcaptcha_checkbox(page)
         await asyncio.sleep(1)
     else:
-        log.debug(f"[NoPeCHA] Challenge already open ({challenge_open}) — letting extension solve")
+        log.debug(f"[NoPeCHA] Challenge already open — letting extension solve")
 
-    # ── Phase 2: wait for extension to clear the iframe ──────────────────
+    # ── Phase 3: wait for extension to clear the widget ──────────────────
     elapsed       = 0
     _LOG_INTERVAL = 15
     _next_log     = _LOG_INTERVAL
@@ -2778,12 +2807,12 @@ async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
         await asyncio.sleep(_POLL_STEP)
         elapsed += _POLL_STEP
         try:
-            if not await page.evaluate(_HCAP_JS):
+            still_present = await page.evaluate(_WIDGET_JS)
+            if not still_present:
                 log.success("[NoPeCHA] Captcha cleared by extension ✓")
                 return True
         except Exception:
-            # Page navigated — captcha solved or bypassed
-            return True
+            return True  # Page navigated — captcha solved/bypassed
 
         if elapsed >= _next_log:
             log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
