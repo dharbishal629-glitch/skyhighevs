@@ -2718,108 +2718,120 @@ async def click_hcaptcha_checkbox(page) -> bool:
 
 async def wait_for_nopecha_solve(page, timeout: int = 120) -> bool:
     """
-    Wait for the NoPeCHA browser extension to auto-solve hCaptcha.
+    Wait for NoPeCHA to solve the hCaptcha on discord.com/register.
 
-    WHY WE DO NOT USE iframe[src*="hcaptcha"]:
-      Discord's hCaptcha iframe `src` attribute is populated LAZILY — the
-      <iframe> element is injected into the DOM first and its src is set by
-      a subsequent JS call.  Any code that reads f.src immediately after the
-      element appears sees an empty string.  The selector therefore returns
-      null even when the captcha widget is fully visible on screen.
+    DETECTION STRATEGY — "still on /register = captcha is blocking":
+      Every DOM-based approach (iframe src, .h-captcha class, data-attr,
+      bounding-rect) has proven unreliable because Discord's hCaptcha
+      integration may not expose standard markers in the top-level document.
+      The only signal that is 100% reliable: the page stays on /register
+      after a successful form submission, meaning a captcha is blocking.
 
-    WHAT WE USE INSTEAD:
-      Phase 1 — hCaptcha widget presence:
-        .h-captcha              always present (Discord's wrapper div)
-        [data-hcaptcha-widget-id]  set on the iframe synchronously by hCaptcha JS
-        Either selector fires as soon as the widget is initialised.
-        As a last resort: any iframe whose bounding rect is > 20x20 visible px.
+    FLOW:
+      1. Poll window.location.href every 1 s for 15 s after form submit.
+         - If page leaves /register → no captcha, return True immediately.
+         - If still on /register after 15 s → captcha is blocking.
+      2. Check whether the challenge is already open (large visible iframe
+         area > 40 000 px²).  If not, click the checkbox to trigger it.
+      3. Poll every 1 s until the page leaves /register (captcha solved
+         and Discord redirected) or timeout.
+      4. Always return True on timeout — do NOT trigger the manual-wait
+         fallback; wait_for_account_creation (running in parallel with a
+         600 s window) owns the final success/failure verdict.
 
-      Phase 2 — challenge open vs. checkbox-only:
-        We compare the AREA of all visible iframes.  The checkbox widget is
-        ~300×74 px.  The open challenge (image grid) is ~400×600 px.
-        A frame with area > 60 000 px² means the challenge is open.
-
-      Phase 3 — solved:
-        Same widget selectors — when they return null the captcha is gone.
+    DEBUG: A DOM dump is logged ~5 s into Phase 1 so future developers
+      can see exactly which iframe/element the captcha actually lives in.
     """
-    _POLL_STEP  = 1.0
-    _APPEAR_MAX = 120
+    _POLL = 1.0
 
-    # ── Widget-presence selector (no src URL) ─────────────────────────────
-    _WIDGET_JS = (
-        "() => !!("
-        "  document.querySelector('.h-captcha') || "
-        "  document.querySelector('[data-hcaptcha-widget-id]') || "
-        "  document.querySelector('iframe[src*=\"hcaptcha\"]') || "
-        "  Array.from(document.querySelectorAll('iframe')).some(f => {"
-        "    const r = f.getBoundingClientRect();"
-        "    return r.width > 20 && r.height > 20 && r.top > 0;"
-        "  })"
-        ")"
-    )
-
-    # ── Phase 1: wait for hCaptcha widget to appear ───────────────────────
-    log.debug("[NoPeCHA] Waiting for hCaptcha widget (up to 120s)...")
-    appeared = False
-    for _ in range(int(_APPEAR_MAX / _POLL_STEP)):
-        await asyncio.sleep(_POLL_STEP)
+    # ── DOM debug dump (fires ~5 s after call, once, non-blocking) ────────
+    async def _dump_dom():
+        await asyncio.sleep(5)
         try:
-            if await page.evaluate(_WIDGET_JS):
-                appeared = True
-                break
+            dom = await page.evaluate(
+                "(()=>{"
+                " const ff=Array.from(document.querySelectorAll('iframe'));"
+                " return {"
+                "  n:ff.length,"
+                "  frames:ff.map(f=>({src:(f.src||'').slice(0,60)||'(empty)',"
+                "    title:f.title||'',"
+                "    wid:f.getAttribute('data-hcaptcha-widget-id')||'',"
+                "    rect:(r=>Math.round(r.width)+'x'+Math.round(r.height)+'@y'+Math.round(r.top))(f.getBoundingClientRect())"
+                "  })),"
+                "  hcls:!!document.querySelector('.h-captcha'),"
+                "  hattr:!!document.querySelector('[data-hcaptcha-widget-id]'),"
+                "  url:window.location.href.slice(-40)"
+                " };"
+                "})()"
+            )
+            log.debug(f"[NoPeCHA] DOM scan → {dom}")
+        except Exception as ex:
+            log.debug(f"[NoPeCHA] DOM scan failed: {ex}")
+
+    asyncio.ensure_future(_dump_dom())
+
+    # ── Phase 1: 15 s fast-exit check ─────────────────────────────────────
+    log.debug("[NoPeCHA] Waiting to see if page stays on /register (captcha)...")
+    for _ in range(15):
+        await asyncio.sleep(_POLL)
+        try:
+            url = str(await page.evaluate("window.location.href") or "")
         except Exception:
-            log.debug("[NoPeCHA] Page navigated before captcha appeared — no solve needed")
+            log.info("[NoPeCHA] Page navigated — no captcha needed")
+            return True
+        if url and "register" not in url:
+            log.info("[NoPeCHA] Page left register — no captcha needed")
             return True
 
-    if not appeared:
-        log.debug("[NoPeCHA] No hCaptcha widget appeared within 120s — skipping")
-        return True
+    # Still on /register after 15 s → captcha is present
+    log.info("[NoPeCHA] Captcha blocking register page — NoPeCHA handling...")
 
-    log.info("[NoPeCHA] hCaptcha widget detected!")
-
-    # ── Phase 2: challenge open? — use bounding rect area, not src ────────
+    # ── Phase 2: is challenge already open? ───────────────────────────────
+    # Challenge iframe (image grid / drag puzzle) is ~400×500+ px (area > 40k).
+    # Checkbox-only widget is ~300×74 px (area ≈ 22k).
     try:
-        challenge_open = await page.evaluate(
-            "(() => {"
-            "  const frames = Array.from(document.querySelectorAll('iframe'));"
-            "  const large = frames.filter(f => {"
-            "    const r = f.getBoundingClientRect();"
-            "    return r.width * r.height > 60000;"   # >60k px² = open challenge
-            "  });"
-            "  return large.length > 0 ? 'open' : 'checkbox-only';"
+        has_large_frame = await page.evaluate(
+            "(()=>{"
+            " const ff=Array.from(document.querySelectorAll('iframe'));"
+            " return ff.some(f=>{"
+            "  const r=f.getBoundingClientRect();"
+            "  return r.width*r.height>40000;"
+            " });"
             "})()"
         )
     except Exception:
-        challenge_open = "unknown"
+        has_large_frame = False
 
-    if challenge_open == "checkbox-only":
+    if has_large_frame:
+        log.debug("[NoPeCHA] Challenge already open — letting extension solve")
+    else:
         log.debug("[NoPeCHA] Challenge not yet open — clicking checkbox to trigger it")
         await click_hcaptcha_checkbox(page)
-        await asyncio.sleep(1)
-    else:
-        log.debug(f"[NoPeCHA] Challenge already open — letting extension solve")
+        await asyncio.sleep(2)
 
-    # ── Phase 3: wait for extension to clear the widget ──────────────────
-    elapsed       = 0
-    _LOG_INTERVAL = 15
-    _next_log     = _LOG_INTERVAL
+    # ── Phase 3: wait for page to leave /register ─────────────────────────
+    elapsed    = 0.0
+    _LOG_EVERY = 15
+    _next_log  = _LOG_EVERY
     while elapsed < timeout:
-        await asyncio.sleep(_POLL_STEP)
-        elapsed += _POLL_STEP
+        await asyncio.sleep(_POLL)
+        elapsed += _POLL
         try:
-            still_present = await page.evaluate(_WIDGET_JS)
-            if not still_present:
-                log.success("[NoPeCHA] Captcha cleared by extension ✓")
-                return True
+            url = str(await page.evaluate("window.location.href") or "")
         except Exception:
-            return True  # Page navigated — captcha solved/bypassed
-
+            log.success("[NoPeCHA] Page navigated (CDP) — captcha solved ✓")
+            return True
+        if url and "register" not in url and "login" not in url:
+            log.success("[NoPeCHA] Captcha solved — page redirected ✓")
+            return True
         if elapsed >= _next_log:
-            log.debug(f"[NoPeCHA] Still solving... ({elapsed:.0f}s / {timeout}s)")
-            _next_log += _LOG_INTERVAL
+            log.debug(f"[NoPeCHA] Waiting for NoPeCHA to solve... ({elapsed:.0f}s / {timeout}s)")
+            _next_log += _LOG_EVERY
 
-    log.warning(f"[NoPeCHA] Timed out waiting for extension to solve ({timeout}s)")
-    return False
+    # Timeout — return True so _wait_manual_captcha is NOT triggered.
+    # wait_for_account_creation runs in parallel and owns the final verdict.
+    log.warning(f"[NoPeCHA] {timeout}s elapsed — captcha may still be solving (account-wait continues)")
+    return True
 
 
 async def wait_for_account_creation(page, timeout: int = 300) -> bool:
@@ -3227,7 +3239,7 @@ async def worker():
 
         # Wait for account creation (redirect to discord.com/channels/@me)
         # We use a dedicated task reference so we can tell if IT completed vs gave-up
-        account_task = asyncio.ensure_future(wait_for_account_creation(page, timeout=300))
+        account_task = asyncio.ensure_future(wait_for_account_creation(page, timeout=600))
         gaveup_task  = asyncio.ensure_future(captcha_gave_up.wait())
 
         done, pending = await asyncio.wait(
