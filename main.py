@@ -2478,43 +2478,97 @@ def ensure_nopecha_extension() -> Optional[str]:
 
 async def _worker_inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
     """
-    Silently write the NoPeCHA API key directly into chrome.storage.local
-    from the extension popup page — no user interaction required.
+    Ensure the NoPeCHA API key is active in the worker browser without any
+    user interaction.
 
-    Called after every worker browser launch to ensure the key is live
-    regardless of whether the profile copy's LevelDB was intact.
-
-    NoPeCHA's storage keys (from extension source / observed behaviour):
-      key        — the API key string
-      enabled    — bool: auto-solve on/off
-      services   — object with per-captcha-type toggles
+    Strategy:
+      1. Open the NoPeCHA popup tab.
+      2. Check if the key is already set (popup shows plan/credits info, not
+         "Enter API key").  If set → done immediately.
+      3. If not set → automatically click the "Enter API key" link/button
+         (no user action needed), wait for the input to appear, fill the key,
+         press Enter, and confirm it saved.
     """
     safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
     try:
         popup = await browser.get(f"chrome-extension://{ext_id}/popup.html")
         await asyncio.sleep(2)
 
-        # Write key + enable all solving via chrome.storage.local
-        result = await popup.evaluate(
-            f"new Promise(resolve => {{"
-            f"  chrome.storage.local.set({{"
-            f"    key: '{safe_key}',"
-            f"    enabled: true,"
-            f"    services: {{hcaptcha: true, recaptcha: true, funcaptcha: true, awscaptcha: true}}"
-            f"  }}, () => {{"
-            f"    chrome.storage.local.get(['key','enabled'], d => resolve(d));"
-            f"  }});"
-            f"}})"
+        # ── Step 1: is the key already active? ────────────────────────────
+        asking = await popup.evaluate(
+            "(()=>{"
+            "  let els=Array.from(document.querySelectorAll('*'));"
+            "  return els.some(e=>e.getBoundingClientRect().width>0"
+            "    && (e.textContent||'').includes('Enter API key'));"
+            "})()"
         )
-        saved_key = (result or {}).get("key", "") if isinstance(result, dict) else ""
-        if saved_key == api_key:
-            log.success("[NoPeCHA] Key written to extension storage ✓")
+        if not asking:
+            log.success("[NoPeCHA] Key already active in worker browser ✓")
             return True
-        else:
-            log.warning(f"[NoPeCHA] Storage write result: {result}")
+
+        # ── Step 2: auto-click "Enter API key" ────────────────────────────
+        log.debug("[NoPeCHA] Auto-clicking 'Enter API key'...")
+        await popup.evaluate(
+            "(()=>{"
+            "  let els=Array.from(document.querySelectorAll('*'));"
+            "  let btn=els.find(e=>e.getBoundingClientRect().width>0"
+            "    && (e.textContent||'').trim()==='Enter API key');"
+            "  if(btn) btn.click();"
+            "  return btn?'clicked':'not-found';"
+            "})()"
+        )
+        await asyncio.sleep(1)
+
+        # ── Step 3: wait for input, fill key, press Enter ──────────────────
+        found = False
+        for _ in range(15):
+            has = await popup.evaluate(
+                "(()=>{"
+                "  let i=Array.from(document.querySelectorAll('input,textarea'))"
+                "    .find(x=>x.getBoundingClientRect().width>0&&x.type!=='checkbox');"
+                "  return i?'yes':'no';"
+                "})()"
+            )
+            if has == "yes":
+                found = True
+                break
+            await asyncio.sleep(1)
+
+        if not found:
+            log.warning("[NoPeCHA] Could not find key input in worker popup")
             return False
+
+        # Fill via native setter (React-compatible)
+        await popup.evaluate(
+            f"(()=>{{"
+            f"  let i=Array.from(document.querySelectorAll('input,textarea'))"
+            f"    .find(x=>x.getBoundingClientRect().width>0&&x.type!=='checkbox');"
+            f"  let s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;"
+            f"  if(s)s.call(i,'{safe_key}');else i.value='{safe_key}';"
+            f"  i.dispatchEvent(new Event('input',{{bubbles:true}}));"
+            f"  i.dispatchEvent(new Event('change',{{bubbles:true}}));"
+            f"  i.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}}));"
+            f"  i.dispatchEvent(new KeyboardEvent('keyup',  {{key:'Enter',keyCode:13,bubbles:true}}));"
+            f"}})()"
+        )
+        await asyncio.sleep(4)  # wait for NoPeCHA to validate + persist
+
+        # ── Step 4: confirm saved ──────────────────────────────────────────
+        still_asking = await popup.evaluate(
+            "(()=>{"
+            "  let els=Array.from(document.querySelectorAll('*'));"
+            "  return els.some(e=>e.getBoundingClientRect().width>0"
+            "    && (e.textContent||'').includes('Enter API key'));"
+            "})()"
+        )
+        if not still_asking:
+            log.success("[NoPeCHA] Key auto-injected in worker browser ✓")
+            return True
+        log.warning("[NoPeCHA] Worker key inject may not have saved — check credits/plan")
+        return True  # proceed anyway; captcha attempt will reveal the truth
+
     except Exception as e:
-        log.warning(f"[NoPeCHA] Silent key inject error: {e}")
+        log.warning(f"[NoPeCHA] Worker key inject error: {e}")
         return False
 
 
