@@ -2476,6 +2476,48 @@ def ensure_nopecha_extension() -> Optional[str]:
     return ext_dir
 
 
+async def _worker_inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
+    """
+    Silently write the NoPeCHA API key directly into chrome.storage.local
+    from the extension popup page — no user interaction required.
+
+    Called after every worker browser launch to ensure the key is live
+    regardless of whether the profile copy's LevelDB was intact.
+
+    NoPeCHA's storage keys (from extension source / observed behaviour):
+      key        — the API key string
+      enabled    — bool: auto-solve on/off
+      services   — object with per-captcha-type toggles
+    """
+    safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
+    try:
+        popup = await browser.get(f"chrome-extension://{ext_id}/popup.html")
+        await asyncio.sleep(2)
+
+        # Write key + enable all solving via chrome.storage.local
+        result = await popup.evaluate(
+            f"new Promise(resolve => {{"
+            f"  chrome.storage.local.set({{"
+            f"    key: '{safe_key}',"
+            f"    enabled: true,"
+            f"    services: {{hcaptcha: true, recaptcha: true, funcaptcha: true, awscaptcha: true}}"
+            f"  }}, () => {{"
+            f"    chrome.storage.local.get(['key','enabled'], d => resolve(d));"
+            f"  }});"
+            f"}})"
+        )
+        saved_key = (result or {}).get("key", "") if isinstance(result, dict) else ""
+        if saved_key == api_key:
+            log.success("[NoPeCHA] Key written to extension storage ✓")
+            return True
+        else:
+            log.warning(f"[NoPeCHA] Storage write result: {result}")
+            return False
+    except Exception as e:
+        log.warning(f"[NoPeCHA] Silent key inject error: {e}")
+        return False
+
+
 async def inject_nopecha_key(browser, ext_id: str, api_key: str) -> bool:
     """
     Semi-manual NoPeCHA key injection.
@@ -2994,7 +3036,14 @@ async def worker():
 
         browser = await uc.start(**start_kw)
 
-        # Fallback: if profile copy failed, inject key the semi-manual way now
+        # Always write the NoPeCHA key directly into chrome.storage.local of the
+        # worker browser — this guarantees the key is live even when the copied
+        # profile's LevelDB wasn't properly flushed before copytree.
+        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
+            await _worker_inject_nopecha_key(browser, NOPECHA_EXT_ID, _nopecha_api_key)
+
+        # Fallback: if profile copy failed, also do the semi-manual inject
+        # (prompts user once; only runs when profile setup failed entirely)
         if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir and not _nopecha_temp_dir:
             await inject_nopecha_key(browser, NOPECHA_EXT_ID, _nopecha_api_key)
 
