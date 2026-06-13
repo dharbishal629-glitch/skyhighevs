@@ -2673,240 +2673,61 @@ async def ensure_nopecha_ready(ext_dir: str, api_key: str,
                     pass
 
 
-async def _nopecha_api_solve(api_key: str, sitekey: str, page_url: str, ua: str = "", timeout: int = 120) -> "str | None":
-    """
-    Call the NoPeCHA REST API to solve an hCaptcha challenge.
-
-    Flow:
-      POST https://api.nopecha.com/  →  {"data": "JOB_ID"}
-      GET  https://api.nopecha.com/?id=JOB_ID&key=KEY  →  {"data": "TOKEN"}
-    Error code 8 means "not ready yet" — keep polling.
-    Any other error code or timeout → return None.
-    """
-    import urllib.request as _ul
-
-    payload = {
-        "type": "hcaptcha",
-        "key": api_key,
-        "sitekey": sitekey,
-        "url": page_url,
-    }
-    if ua:
-        payload["useragent"] = ua
-
-    def _post(url, data):
-        req = _ul.Request(
-            url,
-            data=json.dumps(data).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _ul.urlopen(req, timeout=30) as r:
-            return json.loads(r.read())
-
-    def _get(url):
-        with _ul.urlopen(url, timeout=30) as r:
-            return json.loads(r.read())
-
-    loop = asyncio.get_event_loop()
-
-    # ── Submit task ────────────────────────────────────────────────────────
-    try:
-        resp = await loop.run_in_executor(None, _post, "https://api.nopecha.com/", payload)
-    except Exception as e:
-        log.warning(f"[NoPeCHA API] Submit failed: {e}")
-        return None
-
-    if resp.get("error"):
-        log.warning(f"[NoPeCHA API] Submit error {resp.get('error')}: {resp}")
-        return None
-
-    job_id = resp.get("data")
-    if not job_id:
-        log.warning(f"[NoPeCHA API] No job ID in response: {resp}")
-        return None
-
-    log.debug(f"[NoPeCHA API] Task submitted — polling for token...")
-
-    # ── Poll for result ────────────────────────────────────────────────────
-    poll_url = f"https://api.nopecha.com/?id={job_id}&key={api_key}"
-    start = time.time()
-    attempt = 0
-
-    while time.time() - start < timeout:
-        wait = 4 if attempt < 5 else 6
-        await asyncio.sleep(wait)
-        attempt += 1
-
-        try:
-            p = await loop.run_in_executor(None, _get, poll_url)
-        except Exception as e:
-            log.debug(f"[NoPeCHA API] Poll request error: {e}")
-            continue
-
-        err = p.get("error")
-        if err and err != 8:   # 8 = "not ready yet" — keep polling
-            log.warning(f"[NoPeCHA API] Error {err}: {p}")
-            return None
-
-        token = p.get("data")
-        if token and isinstance(token, str) and len(token) > 20:
-            log.success(f"[NoPeCHA API] Token received in {time.time()-start:.0f}s ✓")
-            return token
-
-        log.debug(f"[NoPeCHA API] Pending... ({time.time()-start:.0f}s / {timeout}s)")
-
-    log.warning(f"[NoPeCHA API] Timed out after {timeout}s")
-    return None
-
-
-async def _inject_hcaptcha_token(page, token: str) -> bool:
-    """
-    Inject a solved hCaptcha token into Discord's page and trigger form submit.
-
-    Strategy (applied in order):
-      1. Set h-captcha-response textarea via React-safe native property setter
-         so React's synthetic events fire correctly.
-      2. Call hCaptcha's widget callback (window.hcaptcha._widgets[id].callback)
-         so Discord's registered success handler receives the token.
-      3. Dispatch a postMessage simulating hCaptcha's iframe solve notification.
-      4. Click the form's submit/Continue button as a fallback.
-    """
-    try:
-        await page.evaluate(
-            "(function(tok){"
-            # Strategy 1: set the hidden textarea value (React-safe)
-            "  const ta=document.querySelector('[name=\"h-captcha-response\"]');"
-            "  if(ta){"
-            "    const set=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set"
-            "      ||Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;"
-            "    if(set)set.call(ta,tok);else ta.value=tok;"
-            "    ta.dispatchEvent(new Event('input',{bubbles:true}));"
-            "    ta.dispatchEvent(new Event('change',{bubbles:true}));"
-            "  }"
-            # Strategy 2: call hCaptcha widget callback directly
-            "  if(window.hcaptcha){"
-            "    try{"
-            "      Object.values(window.hcaptcha._widgets||{}).forEach(w=>{"
-            "        try{(w.callback||w?.s?.callback)?.(tok);}catch(e){}"
-            "      });"
-            "    }catch(e){}"
-            "  }"
-            # Strategy 3: postMessage from hCaptcha origin
-            "  window.dispatchEvent(new MessageEvent('message',{"
-            "    data:JSON.stringify({action:'hcaptcha',token:tok,id:null}),"
-            "    origin:'https://newassets.hcaptcha.com'"
-            "  }));"
-            "})(arguments[0])",
-            token,
-        )
-        await asyncio.sleep(2)
-        # Strategy 4: click the Continue/submit button
-        await page.evaluate(
-            "(function(){"
-            "  const btns=Array.from(document.querySelectorAll('button'));"
-            "  const sub=btns.find(b=>b.type==='submit'"
-            "    ||b.textContent.trim().toLowerCase()==='continue');"
-            "  if(sub){sub.disabled=false;sub.click();}"
-            "})()"
-        )
-        log.info("[NoPeCHA API] Token injected + submit triggered")
-        return True
-    except Exception as e:
-        log.warning(f"[NoPeCHA API] Injection error: {e}")
-        return False
-
-
 async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 120) -> bool:
     """
-    Solve the hCaptcha on discord.com/register using the NoPeCHA REST API.
+    Wait for the NoPeCHA browser extension to solve the hCaptcha.
 
-    APPROACH — REST API (not browser extension cursor):
-      1. Wait up to 15 s after form submit. If page leaves /register → no
-         captcha needed, return True immediately.
-      2. Still on /register after 15 s → captcha is blocking. Extract the
-         hCaptcha sitekey from the page (fall back to Discord's known key).
-      3. POST a solve task to https://api.nopecha.com/ and poll for the
-         token. NoPeCHA's servers solve the challenge and return a P1_ token.
-      4. Inject the token into the page (set h-captcha-response, trigger
-         hCaptcha widget callback, dispatch postMessage, click submit button).
-      5. Wait up to 30 s for Discord to redirect after token injection.
-      6. Always return True — never trigger the manual-wait fallback.
-         wait_for_account_creation (600 s) owns the final success verdict.
+    NoPeCHA is an EXTENSION-based solver — it detects the captcha visually,
+    moves a cursor inside the challenge iframe, and submits the answer.
+    Our code must NOT interfere: no clicking, no API calls, no DOM changes.
 
-    Discord's hCaptcha sitekey: 4c672d35-0701-42b2-88c3-78380b0db560
+    Flow:
+      1. Poll window.location.href for 15 s. If page leaves /register → no
+         captcha needed, return True.
+      2. Still on /register after 15 s → captcha is blocking. Log that
+         NoPeCHA is handling it and wait passively.
+      3. Poll every 1 s until page leaves /register (NoPeCHA solved and
+         Discord redirected) OR timeout is reached.
+      4. Always return True on timeout — never trigger the manual-wait path.
+         wait_for_account_creation (600 s) continues running in parallel and
+         will catch the redirect whenever NoPeCHA finishes.
     """
-    _DISCORD_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
-
-    # ── Phase 1: 15 s fast-exit — is captcha even present? ────────────────
-    log.debug("[NoPeCHA] Checking if captcha is blocking...")
+    # ── Phase 1: 15 s fast-exit ────────────────────────────────────────────
     for _ in range(15):
         await asyncio.sleep(1.0)
         try:
             url = str(await page.evaluate("window.location.href") or "")
         except Exception:
-            log.info("[NoPeCHA] Page navigated — no captcha needed")
             return True
         if url and "register" not in url:
-            log.info("[NoPeCHA] Page left register — no captcha needed")
+            log.info("[NoPeCHA] No captcha — page already moved on")
             return True
 
-    log.info("[NoPeCHA] Captcha detected — calling NoPeCHA API...")
+    # ── Phase 2: captcha is blocking — let NoPeCHA do its thing ───────────
+    log.info("[NoPeCHA] Captcha detected — extension is solving (blue cursor)...")
 
-    # ── Phase 2: extract sitekey from page ────────────────────────────────
-    try:
-        sitekey = await page.evaluate(
-            "(()=>{"
-            " const el=document.querySelector('[data-sitekey]');"
-            " if(el)return el.getAttribute('data-sitekey');"
-            " for(const f of document.querySelectorAll('iframe')){"
-            "  const m=(f.src||'').match(/sitekey=([a-f0-9-]{36})/);"
-            "  if(m)return m[1];"
-            " }"
-            " return null;"
-            "})()"
-        ) or _DISCORD_SITEKEY
-    except Exception:
-        sitekey = _DISCORD_SITEKEY
-
-    # Get browser user-agent to pass to NoPeCHA for better accuracy
-    try:
-        ua = str(await page.evaluate("navigator.userAgent") or "")
-    except Exception:
-        ua = ""
-
-    log.debug(f"[NoPeCHA API] sitekey={sitekey[:8]}... ua={ua[:40]}...")
-
-    # ── Phase 3: NoPeCHA REST API — submit + poll ─────────────────────────
-    token = await _nopecha_api_solve(
-        api_key=api_key,
-        sitekey=sitekey,
-        page_url="https://discord.com/register",
-        ua=ua,
-        timeout=min(timeout, 90),
-    )
-
-    if not token:
-        log.warning("[NoPeCHA API] No token received — account-wait will keep trying")
-        return True   # still return True; wait_for_account_creation continues
-
-    # ── Phase 4: inject token into page ───────────────────────────────────
-    await _inject_hcaptcha_token(page, token)
-
-    # ── Phase 5: wait for Discord to redirect after token injection ────────
-    log.debug("[NoPeCHA API] Waiting for Discord to process token...")
-    for _ in range(30):
+    # ── Phase 3: wait passively for redirect ──────────────────────────────
+    elapsed   = 0.0
+    _LOG_STEP = 30
+    _next_log = _LOG_STEP
+    while elapsed < timeout:
         await asyncio.sleep(1.0)
+        elapsed += 1.0
         try:
             url = str(await page.evaluate("window.location.href") or "")
         except Exception:
-            log.success("[NoPeCHA API] Page navigated after token injection ✓")
+            log.success("[NoPeCHA] Page navigated — captcha solved ✓")
             return True
         if url and "register" not in url and "login" not in url:
-            log.success("[NoPeCHA API] Account created — page redirected ✓")
+            log.success("[NoPeCHA] Captcha solved — page redirected ✓")
             return True
+        if elapsed >= _next_log:
+            log.debug(f"[NoPeCHA] Extension solving... ({elapsed:.0f}s / {timeout}s)")
+            _next_log += _LOG_STEP
 
-    log.warning("[NoPeCHA API] Token injected but no redirect in 30 s — account-wait continues")
+    # Timeout — return True so _wait_manual_captcha is NOT called.
+    # wait_for_account_creation (600 s) still running and will catch any redirect.
+    log.warning(f"[NoPeCHA] {timeout}s elapsed — extension may still be solving")
     return True
 
 
