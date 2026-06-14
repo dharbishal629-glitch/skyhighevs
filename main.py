@@ -2726,14 +2726,36 @@ async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 300) ->
             log.success("[NoPeCHA] Captcha solved — page redirected ✓")
             return True
 
-        # Signal 2: hCaptcha iframe disappeared (answer submitted, Discord processing)
+        # Signal 2: hCaptcha iframe gone AND stays gone for 3 s (avoids false-positive
+        # during challenge loading/transition where the iframe briefly disappears)
         try:
             has_captcha = await page.evaluate(
                 "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
             )
             if not has_captcha:
-                log.success("[NoPeCHA] hCaptcha iframe gone — answer submitted ✓")
-                return True
+                # Confirm it stays absent for 3 consecutive seconds
+                confirmed = True
+                for _ in range(3):
+                    await asyncio.sleep(1.0)
+                    elapsed += 1.0
+                    try:
+                        still_gone = not await page.evaluate(
+                            "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+                        )
+                        # Also check URL again — if redirected, we're definitely done
+                        chk_url = str(await page.evaluate("window.location.href") or "")
+                        if chk_url and "register" not in chk_url and "login" not in chk_url:
+                            log.success("[NoPeCHA] Captcha solved — page redirected ✓")
+                            return True
+                    except Exception:
+                        log.success("[NoPeCHA] Page navigated — captcha solved ✓")
+                        return True
+                    if not still_gone:
+                        confirmed = False
+                        break
+                if confirmed:
+                    log.success("[NoPeCHA] hCaptcha iframe confirmed gone — answer submitted ✓")
+                    return True
         except Exception:
             pass
 
