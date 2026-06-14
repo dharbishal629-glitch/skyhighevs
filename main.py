@@ -2674,12 +2674,12 @@ async def ensure_nopecha_ready(ext_dir: str, api_key: str,
                     pass
 
 
-async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 120) -> bool:
+async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 300) -> bool:
     """
     Wait for the NoPeCHA browser extension to solve the hCaptcha.
 
     NoPeCHA is an EXTENSION-based solver — it detects the captcha visually,
-    moves a cursor inside the challenge iframe, and submits the answer.
+    moves a blue cursor inside the challenge iframe, and submits the answer.
     Our code must NOT interfere: no clicking, no API calls, no DOM changes.
 
     Flow:
@@ -2687,11 +2687,12 @@ async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 120) ->
          captcha needed, return True.
       2. Still on /register after 15 s → captcha is blocking. Log that
          NoPeCHA is handling it and wait passively.
-      3. Poll every 1 s until page leaves /register (NoPeCHA solved and
-         Discord redirected) OR timeout is reached.
-      4. Always return True on timeout — never trigger the manual-wait path.
-         wait_for_account_creation (600 s) continues running in parallel and
-         will catch the redirect whenever NoPeCHA finishes.
+      3. Poll every 1 s. Return True when EITHER:
+           - Page URL leaves /register (NoPeCHA solved + Discord redirected), OR
+           - hCaptcha iframe disappears from the DOM (captcha submitted).
+      4. On timeout return False — caller can decide next action.
+         NoPeCHA extension keeps running independently; wait_for_account_creation
+         (600 s) continues and will catch the redirect whenever NoPeCHA finishes.
     """
     # ── Phase 1: 15 s fast-exit ────────────────────────────────────────────
     for _ in range(15):
@@ -2707,7 +2708,7 @@ async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 120) ->
     # ── Phase 2: captcha is blocking — let NoPeCHA do its thing ───────────
     log.info("[NoPeCHA] Captcha detected — extension is solving (blue cursor)...")
 
-    # ── Phase 3: wait passively for redirect ──────────────────────────────
+    # ── Phase 3: wait passively for redirect OR captcha iframe removal ─────
     elapsed   = 0.0
     _LOG_STEP = 30
     _next_log = _LOG_STEP
@@ -2719,17 +2720,29 @@ async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 120) ->
         except Exception:
             log.success("[NoPeCHA] Page navigated — captcha solved ✓")
             return True
+
+        # Signal 1: URL left the register page
         if url and "register" not in url and "login" not in url:
             log.success("[NoPeCHA] Captcha solved — page redirected ✓")
             return True
+
+        # Signal 2: hCaptcha iframe disappeared (answer submitted, Discord processing)
+        try:
+            has_captcha = await page.evaluate(
+                "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+            )
+            if not has_captcha:
+                log.success("[NoPeCHA] hCaptcha iframe gone — answer submitted ✓")
+                return True
+        except Exception:
+            pass
+
         if elapsed >= _next_log:
             log.debug(f"[NoPeCHA] Extension solving... ({elapsed:.0f}s / {timeout}s)")
             _next_log += _LOG_STEP
 
-    # Timeout — return True so _wait_manual_captcha is NOT called.
-    # wait_for_account_creation (600 s) still running and will catch any redirect.
-    log.warning(f"[NoPeCHA] {timeout}s elapsed — extension may still be solving")
-    return True
+    log.warning(f"[NoPeCHA] {timeout}s elapsed — extension may still be solving in background")
+    return False
 
 
 async def wait_for_account_creation(page, timeout: int = 300) -> bool:
@@ -3103,14 +3116,36 @@ async def worker():
                 # ── NoPeCHA Extension mode ─────────────────────────────────
                 # The browser was launched with the nopecha_profile that has
                 # the extension installed and the API key pre-configured.
-                # The extension auto-detects and solves hCaptcha — we just
-                # wait for the captcha iframe to disappear.
+                # NoPeCHA is an extension-based solver — it detects the captcha
+                # visually with a blue cursor and submits the answer automatically.
+                # We must NOT interfere; just wait for the solve signal.
                 await asyncio.sleep(2)  # brief pause for captcha to mount
-                captcha_timeout = int(config.get("captchaTimeoutSeconds", 120))
+                captcha_timeout = int(config.get("captchaTimeoutSeconds", 300))
                 solved = await wait_for_nopecha_solve(page, api_key=nopecha_key, timeout=captcha_timeout)
                 if not solved:
-                    log.warning("[NoPeCHA] Solve timed out — falling back to manual wait")
-                    await _wait_manual_captcha()
+                    # NoPeCHA timed out but the extension is STILL running in the browser.
+                    # Keep polling for captcha iframe disappearance instead of calling
+                    # manual wait — the extension will keep retrying automatically.
+                    log.warning("[NoPeCHA] Primary timeout hit — extension still active, monitoring...")
+                    _ext_wait = 0
+                    _ext_max  = 300  # up to 5 more minutes while wait_for_account_creation runs
+                    while _ext_wait < _ext_max:
+                        await asyncio.sleep(2)
+                        _ext_wait += 2
+                        try:
+                            url = str(await page.evaluate("window.location.href") or "")
+                            if url and "register" not in url and "login" not in url:
+                                log.success("[NoPeCHA] Captcha eventually solved — page redirected ✓")
+                                return
+                            has_captcha = await page.evaluate(
+                                "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+                            )
+                            if not has_captcha:
+                                log.success("[NoPeCHA] hCaptcha cleared after extended wait ✓")
+                                return
+                        except Exception:
+                            return  # page navigated
+                    log.warning("[NoPeCHA] Extended wait exhausted — captcha may still be present")
                 return
 
             elif solver_enabled:
@@ -3414,8 +3449,10 @@ async def main():
     config.setdefault("openRouterApiKey",      "")
     config.setdefault("openRouterModel",       "google/gemini-2.0-flash-001")
     config.setdefault("captchaMaxAttempts",    4)
+    config.setdefault("nopechaEnabled",        False)
     config.setdefault("nopechaApiKey",         "")
     config.setdefault("nopechaKey",            "")   # legacy fallback
+    config.setdefault("captchaTimeoutSeconds", 300)
     config.setdefault("fingerprintEnabled",    False)
     config.setdefault("fingerprintMinAgeDays", 0)
     config.setdefault("fingerprintPoolSize",   200)
