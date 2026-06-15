@@ -2353,9 +2353,10 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
     return False
 
 
-NOPECHA_EXT_ID      = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
-_nopecha_key_lock   = threading.Lock()
-_nopecha_key_ready  = False   # True once the setup browser has saved the key this session
+NOPECHA_EXT_ID           = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+_nopecha_profile_dir: Optional[str] = None   # path to master session profile (set once)
+_nopecha_profile_lock    = threading.Lock()   # prevents two workers creating it simultaneously
+_nopecha_profile_ready   = threading.Event()  # set once profile is ready to copy
 
 
 def _get_nopecha_popup_path(ext_dir: str) -> str:
@@ -2502,6 +2503,115 @@ def ensure_nopecha_extension() -> Optional[str]:
         f"  [NoPeCHA] Extension ready → {ext_dir}"))
     return ext_dir
 
+
+async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
+                                  brave_path: str = "") -> Optional[str]:
+    """
+    Create (once per process) a master Chrome profile that has the NoPeCHA
+    API key already stored in chrome.storage.local.
+
+    How it works:
+      1. First worker to call this spins up a throwaway setup browser with
+         --user-data-dir pointing at <tool_dir>/nopecha_session/.
+      2. Injects the key via the callback+poll storage write.
+      3. Closes the browser — Chrome flushes LevelDB to disk on clean exit.
+      4. Saves a hash of the API key so we know when to rebuild the profile.
+
+    Every subsequent worker just copies the saved profile to a temp dir and
+    starts with --user-data-dir pointing there — key is already present in
+    the LevelDB, NO injection needed.
+
+    Thread-safe: only ONE setup browser ever runs; others wait then reuse.
+    """
+    global _nopecha_profile_dir
+    import hashlib, shutil as _shutil
+
+    # Fast path — already created this process run
+    if _nopecha_profile_dir:
+        return _nopecha_profile_dir
+
+    # Another thread may already be creating it — spin-wait for up to 120 s
+    if not _nopecha_profile_lock.acquire(blocking=False):
+        log.debug("[NoPeCHA] Waiting for profile setup to complete in another worker...")
+        _nopecha_profile_ready.wait(timeout=120)
+        return _nopecha_profile_dir   # may be None if setup failed
+
+    try:
+        base         = _get_tool_base_dir()
+        profile_dir  = os.path.join(base, "nopecha_session")
+        hash_file    = os.path.join(base, ".nopecha_key_hash")
+        current_hash = hashlib.md5(api_key.encode()).hexdigest()
+
+        # Check whether the saved profile is valid for the current key
+        profile_ok = False
+        if os.path.isdir(profile_dir) and os.path.isfile(hash_file):
+            try:
+                if open(hash_file).read().strip() == current_hash:
+                    profile_ok = True
+            except Exception:
+                pass
+
+        if profile_ok:
+            log.info("[NoPeCHA] Reusing saved session profile — key already stored on disk.")
+            _nopecha_profile_dir = profile_dir
+            return profile_dir
+
+        # ── Build (or rebuild) the master profile ──────────────────────────
+        log.info("[NoPeCHA] Building persistent session profile (runs once per key change)...")
+
+        if os.path.isdir(profile_dir):
+            _shutil.rmtree(profile_dir, ignore_errors=True)
+        os.makedirs(profile_dir, exist_ok=True)
+
+        import nodriver as _uc_setup
+
+        setup_args: dict = {
+            "headless": False,
+            "browser_args": [
+                f"--user-data-dir={profile_dir}",
+                f"--load-extension={ext_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-notifications",
+                "--disable-popup-blocking",
+            ],
+        }
+        if brave_path:
+            setup_args["browser_executable_path"] = brave_path
+
+        setup_browser = None
+        success = False
+        try:
+            setup_browser = await _uc_setup.start(**setup_args)
+            success = await inject_nopecha_key_auto(
+                setup_browser, ext_id, api_key, ext_dir=ext_dir
+            )
+        except Exception as e:
+            log.warning(f"[NoPeCHA] Profile setup browser error: {e}")
+        finally:
+            if setup_browser:
+                try:
+                    await setup_browser.stop()
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)   # let Chrome flush LevelDB to disk
+
+        if success:
+            try:
+                with open(hash_file, "w") as f:
+                    f.write(current_hash)
+            except Exception:
+                pass
+            log.success("[NoPeCHA] Session profile saved — workers will reuse it without re-injecting ✓")
+        else:
+            log.warning("[NoPeCHA] Profile setup failed — workers will fall back to per-run injection")
+
+        _nopecha_profile_dir = profile_dir
+        return profile_dir
+
+    finally:
+        _nopecha_profile_lock.release()
+        _nopecha_profile_ready.set()
 
 
 async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
@@ -2923,37 +3033,51 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # ── NoPeCHA extension setup ────────────────────────────────────────
-        # Flow:
-        #  1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
-        #  2. Worker browser started with --load-extension pointing at nopecha_ext/
-        #  3. inject_nopecha_key_auto()   — runs for EVERY worker browser:
-        #       opens popup, auto-clicks "Enter API key", fills key, presses Enter.
-        #       NoPeCHA validates the key via its servers and saves to chrome.storage.
-        #       No profile copy — LevelDB files from an active Chrome session
-        #       cannot be reliably cloned; the extension would load but find no key.
+        # ── NoPeCHA extension + persistent session profile setup ──────────────
+        # Flow (first run ever / after key change):
+        #   1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
+        #   2. ensure_nopecha_profile()    — spin up a throwaway browser, write
+        #        key to chrome.storage.local, close browser → LevelDB flushed to
+        #        nopecha_session/ on disk.  Runs only ONCE per key; all workers wait.
+        #   3. Worker copies nopecha_session/ → temp dir, starts with
+        #        --user-data-dir={temp} — key is already in the profile, no injection.
+        #
+        # Flow (subsequent runs, key unchanged):
+        #   1 & 2 are instant (profile already on disk).
+        #   3 same as above — just a fast directory copy.
+        import shutil as _shutil
         _nopecha_enabled = bool(config.get("nopechaEnabled"))
         _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
-        _nopecha_ext_dir = None
+        _nopecha_ext_dir   = None
+        _worker_profile    = None   # temp copy of master profile for this worker
 
         if _nopecha_enabled and _nopecha_api_key:
             _nopecha_ext_dir = ensure_nopecha_extension()
             if _nopecha_ext_dir:
-                # Load the extension — key is injected directly after the browser
-                # starts. We do NOT copy Chrome profiles (LevelDB can't be cloned
-                # reliably from a running session; extension reads no key → silent fail).
+                # Build / reuse the persistent master profile (once per process)
+                _master_profile = await ensure_nopecha_profile(
+                    _nopecha_ext_dir, NOPECHA_EXT_ID, _nopecha_api_key,
+                    brave_path=brave_path or ""
+                )
+
+                if _master_profile and os.path.isdir(_master_profile):
+                    # Copy master profile to a fresh temp dir for this worker so
+                    # concurrent workers don't share LevelDB files (Chrome locks them)
+                    _worker_profile = tempfile.mkdtemp(prefix="np_worker_")
+                    _shutil.copytree(_master_profile, _worker_profile, dirs_exist_ok=True)
+                    start_kw["browser_args"].append(f"--user-data-dir={_worker_profile}")
+                    log.info("[NoPeCHA] Worker using saved session profile — no key injection needed.")
+
                 start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
-                log.info("[NoPeCHA] Extension loaded — will auto-inject key after browser start")
             else:
                 log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
         browser = await uc.start(**start_kw)
 
-        # Always inject the NoPeCHA API key directly into the worker browser.
-        # inject_nopecha_key_auto opens the extension popup, clicks "Enter API key",
-        # fills the key via native events, and presses Enter — fully automatic.
-        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
-            log.info("[NoPeCHA] Injecting API key into worker browser...")
+        # If the profile copy failed or profile couldn't be built, fall back to
+        # per-worker injection so we're never stuck without captcha solving.
+        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir and not _worker_profile:
+            log.info("[NoPeCHA] Falling back to per-worker key injection...")
             await inject_nopecha_key_auto(browser, NOPECHA_EXT_ID, _nopecha_api_key,
                                           ext_dir=_nopecha_ext_dir)
 
