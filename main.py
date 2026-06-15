@@ -2578,21 +2578,76 @@ async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
         )
         await asyncio.sleep(0.4)
 
-        # Auto-click "Enter API key" button so the input field appears
-        clicked = await ext_page.evaluate(
-            "(() => {"
-            "  let all = Array.from(document.querySelectorAll('button,a,span,p,div,li'));"
-            "  let btn = all.find(e => {"
-            "    if (!e.getBoundingClientRect().width) return false;"
-            "    let t = (e.textContent || '').trim().toLowerCase();"
-            "    return t.includes('enter api key') || t === 'api key' || t === 'key';"
-            "  });"
-            "  if (btn) { btn.click(); return 'clicked'; }"
-            "  return 'not-found';"
-            "})()"
-        )
+        # ── Find and real-click the "Enter API key" button ──────────────────
+        # NoPeCHA's popup is a React app that listens on mousedown/mouseup,
+        # NOT just "click". A bare .click() call registers as "clicked" in JS
+        # but React's synthetic event system ignores it, so the input never
+        # appears.  We dispatch the full mouse-event sequence instead, which
+        # is equivalent to an actual cursor click.
+        REAL_CLICK_JS = """
+(() => {
+  function realClick(el) {
+    var rect = el.getBoundingClientRect();
+    var cx = Math.round(rect.left + rect.width  / 2);
+    var cy = Math.round(rect.top  + rect.height / 2);
+    ['mouseover','mouseenter','mousemove',
+     'mousedown','mouseup','click'].forEach(function(evtName) {
+      var opts = {
+        bubbles: true, cancelable: true, view: window,
+        clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+        button: 0, buttons: 1
+      };
+      el.dispatchEvent(new MouseEvent(evtName, opts));
+    });
+  }
+
+  // Strategy 1 – deepest visible node whose FULL text == 'enter api key'
+  var all = Array.from(document.querySelectorAll('*'));
+  var btn = all.find(function(e) {
+    var r = e.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    var t = (e.innerText || e.textContent || '').trim().toLowerCase();
+    return t === 'enter api key';
+  });
+
+  // Strategy 2 – any visible element that contains the phrase
+  if (!btn) {
+    btn = all.find(function(e) {
+      var r = e.getBoundingClientRect();
+      if (!r.width || !r.height) return false;
+      var t = (e.innerText || e.textContent || '').trim().toLowerCase();
+      return t.includes('enter api key');
+    });
+    // prefer the most-specific (deepest) child
+    if (btn) {
+      var deep = btn.querySelector('*');
+      while (deep) {
+        var r2 = deep.getBoundingClientRect();
+        var t2 = (deep.innerText || deep.textContent || '').trim().toLowerCase();
+        if (r2.width && t2.includes('enter api key')) { btn = deep; }
+        deep = deep.querySelector('*');
+      }
+    }
+  }
+
+  // Strategy 3 – any SVG pencil / edit icon sibling next to "api key" text
+  if (!btn) {
+    btn = all.find(function(e) {
+      var r = e.getBoundingClientRect();
+      if (!r.width || !r.height) return false;
+      var t = (e.innerText || e.textContent || '').trim().toLowerCase();
+      return t === 'api key' || t === 'enter key' || t === 'key';
+    });
+  }
+
+  if (!btn) return 'not-found';
+  realClick(btn);
+  return 'clicked:' + (btn.tagName || '?') + ':' + (btn.innerText || '').trim().slice(0,20);
+})()
+"""
+        clicked = await ext_page.evaluate(REAL_CLICK_JS)
         log.debug(f"[NoPeCHA] 'Enter API key' click: {clicked}")
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1.2)   # give React time to re-render the input
 
         # Wait up to 10 s for the input field to appear
         found_input = False
