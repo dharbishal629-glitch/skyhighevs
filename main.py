@@ -2580,49 +2580,86 @@ async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
         setup_browser = None
         success = False
         try:
+            from nodriver import cdp as _cdp
             setup_browser = await _uc_setup.start(**setup_args)
 
-            # Open the NoPeCHA popup so the human can see it
+            # Open the NoPeCHA popup
             popup_file = _get_nopecha_popup_path(ext_dir)
             popup_url  = f"chrome-extension://{ext_id}/{popup_file}"
             ext_page   = await setup_browser.get(popup_url)
             await asyncio.sleep(1.5)
 
-            # Tell the operator what to do
+            # Tell the operator the ONE thing they need to do
             log.warning("=" * 60)
-            log.warning("[NoPeCHA] ACTION REQUIRED")
-            log.warning("  Enter your NoPeCHA API key in the browser popup")
-            log.warning("  then press Enter / Save inside the extension.")
-            log.warning("  This will only happen ONCE — session saved after.")
+            log.warning("[NoPeCHA] Click  'Enter API Key'  in the popup.")
+            log.warning("          The tool will paste the key automatically.")
+            log.warning("          This happens ONCE — session saved after.")
             log.warning("=" * 60)
 
-            # Wait up to 5 minutes for the key to be entered
-            # Poll: once "Enter API key" is no longer visible the key is saved
-            saved = False
-            for _ in range(300):   # 300 × 1 s = 5 min
+            # ── Wait for human to click "Enter API Key" → input appears ──────
+            # As soon as any visible text input appears in the popup we know
+            # the human clicked the button and React rendered the input field.
+            inp_coords = None
+            for _ in range(300):   # wait up to 5 min
                 await asyncio.sleep(1)
                 try:
-                    still_asking = await ext_page.evaluate(
+                    inp = await ext_page.evaluate(
                         "(function(){"
-                        "  return !!Array.from(document.querySelectorAll('*')).find(function(e){"
-                        "    var r=e.getBoundingClientRect();"
-                        "    return r.width>0 && (e.innerText||e.textContent||'')"
-                        "      .trim().toLowerCase().includes('enter api key');"
-                        "  });"
+                        "  var i=Array.from(document.querySelectorAll("
+                        "    'input[type=text],input:not([type]),textarea'))"
+                        "    .find(function(e){"
+                        "      var r=e.getBoundingClientRect();"
+                        "      return r.width>0&&r.height>0;"
+                        "    });"
+                        "  if(!i)return null;"
+                        "  var r=i.getBoundingClientRect();"
+                        "  return{x:r.left+r.width/2,y:r.top+r.height/2};"
                         "})()"
                     )
-                    if not still_asking:
-                        saved = True
+                    if inp:
+                        inp_coords = inp
                         break
                 except Exception:
-                    pass   # page may briefly reload after save
+                    pass
 
-            if saved:
-                log.success("[NoPeCHA] Key saved by operator ✓  Session will be reused.")
-                success = True
+            if not inp_coords:
+                log.warning("[NoPeCHA] Timed out — input never appeared. Continuing without key.")
+                success = True   # keep profile anyway
             else:
-                log.warning("[NoPeCHA] Timed out waiting for key entry — proceeding anyway.")
-                success = True   # keep the profile even if we timed out
+                log.info("[NoPeCHA] Input field detected — pasting API key...")
+
+                # CDP-click the input to focus it
+                for ev in ("mousePressed", "mouseReleased"):
+                    await ext_page.send(_cdp.input_.dispatch_mouse_event(
+                        type_=ev,
+                        x=float(inp_coords["x"]), y=float(inp_coords["y"]),
+                        button=_cdp.input_.MouseButton.left,
+                        click_count=1, modifiers=0,
+                    ))
+                    await asyncio.sleep(0.05)
+                await asyncio.sleep(0.2)
+
+                # Type the key character by character via CDP
+                for char in api_key:
+                    await ext_page.send(_cdp.input_.dispatch_key_event(
+                        type_="char", text=char, unmodified_text=char,
+                    ))
+                    await asyncio.sleep(0.03)
+
+                await asyncio.sleep(0.2)
+
+                # Press Enter — NoPeCHA validates + saves the key itself
+                for ev in ("rawKeyDown", "keyUp"):
+                    await ext_page.send(_cdp.input_.dispatch_key_event(
+                        type_=ev, key="Enter", code="Enter",
+                        windows_virtual_key_code=13, native_virtual_key_code=13,
+                    ))
+                    await asyncio.sleep(0.05)
+
+                log.info("[NoPeCHA] Key pasted and Enter sent — waiting for NoPeCHA to save...")
+                await asyncio.sleep(4)   # NoPeCHA validates via server then writes to storage
+                log.success("[NoPeCHA] Key saved ✓")
+                success = True
 
         except Exception as e:
             log.warning(f"[NoPeCHA] Profile setup error: {e}")
