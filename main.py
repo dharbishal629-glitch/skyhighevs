@@ -2851,6 +2851,40 @@ DISPLAY_NAMES = [
     'Ashton','Bradley','Calvin','Derek','Ethan','Fiona','Graham','Harper','Jackson',
 ]
 
+async def _clear_discord_session(browser) -> None:
+    """
+    Wipe Discord's cookies + localStorage via CDP — equivalent to
+    "Clear site data" in DevTools.
+
+    This is NOT a logout: it never calls Discord's /api/v9/auth/logout
+    endpoint, so the token that was already extracted remains valid.
+    Without this, the old account's session cookie stays in the browser
+    and the next discord.com/register tab redirects straight to the
+    home feed instead of the registration form.
+    """
+    try:
+        from nodriver import cdp as _cdp
+        # Preferred: clear only discord.com origin data (cookies + storage)
+        await browser.connection.send(
+            _cdp.storage.clear_data_for_origin(
+                origin="https://discord.com",
+                storage_types="cookies,local_storage,indexedDB,service_workers,cache_storage",
+            )
+        )
+        log.debug("[Session] discord.com site data cleared — next tab will start fresh")
+        return
+    except Exception as e:
+        log.debug(f"[Session] clear_data_for_origin failed ({e}), falling back to clear_browser_cookies")
+
+    # Fallback: clear all cookies in the browser profile (broader but reliable)
+    try:
+        from nodriver import cdp as _cdp
+        await browser.connection.send(_cdp.network.clear_browser_cookies())
+        log.debug("[Session] All browser cookies cleared (fallback)")
+    except Exception as e:
+        log.debug(f"[Session] Cookie clear fallback also failed: {e}")
+
+
 async def worker():
     """
     Persistent-browser worker.
@@ -3277,6 +3311,13 @@ async def worker():
                         log.debug("[Tab] Discord tab closed — NoPeCHA tab still active for next account")
                     except Exception:
                         pass
+
+                # Clear discord.com session data so the next tab opens on
+                # the register page instead of redirecting to the home feed.
+                # This uses CDP (equivalent to browser "Clear site data") —
+                # it does NOT call the Discord logout API, so the token we
+                # already extracted stays valid on Discord's servers.
+                await _clear_discord_session(browser)
 
                 # Cooldown before next account
                 cooldown = int(config.get("cooldownSeconds", 0))
