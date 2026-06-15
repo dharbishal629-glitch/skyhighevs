@@ -2557,8 +2557,6 @@ async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
             return profile_dir
 
         # ── Build (or rebuild) the master profile ──────────────────────────
-        log.info("[NoPeCHA] Building persistent session profile (runs once per key change)...")
-
         if os.path.isdir(profile_dir):
             _shutil.rmtree(profile_dir, ignore_errors=True)
         os.makedirs(profile_dir, exist_ok=True)
@@ -2583,18 +2581,58 @@ async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
         success = False
         try:
             setup_browser = await _uc_setup.start(**setup_args)
-            success = await inject_nopecha_key_auto(
-                setup_browser, ext_id, api_key, ext_dir=ext_dir
-            )
+
+            # Open the NoPeCHA popup so the human can see it
+            popup_file = _get_nopecha_popup_path(ext_dir)
+            popup_url  = f"chrome-extension://{ext_id}/{popup_file}"
+            ext_page   = await setup_browser.get(popup_url)
+            await asyncio.sleep(1.5)
+
+            # Tell the operator what to do
+            log.warning("=" * 60)
+            log.warning("[NoPeCHA] ACTION REQUIRED")
+            log.warning("  Enter your NoPeCHA API key in the browser popup")
+            log.warning("  then press Enter / Save inside the extension.")
+            log.warning("  This will only happen ONCE — session saved after.")
+            log.warning("=" * 60)
+
+            # Wait up to 5 minutes for the key to be entered
+            # Poll: once "Enter API key" is no longer visible the key is saved
+            saved = False
+            for _ in range(300):   # 300 × 1 s = 5 min
+                await asyncio.sleep(1)
+                try:
+                    still_asking = await ext_page.evaluate(
+                        "(function(){"
+                        "  return !!Array.from(document.querySelectorAll('*')).find(function(e){"
+                        "    var r=e.getBoundingClientRect();"
+                        "    return r.width>0 && (e.innerText||e.textContent||'')"
+                        "      .trim().toLowerCase().includes('enter api key');"
+                        "  });"
+                        "})()"
+                    )
+                    if not still_asking:
+                        saved = True
+                        break
+                except Exception:
+                    pass   # page may briefly reload after save
+
+            if saved:
+                log.success("[NoPeCHA] Key saved by operator ✓  Session will be reused.")
+                success = True
+            else:
+                log.warning("[NoPeCHA] Timed out waiting for key entry — proceeding anyway.")
+                success = True   # keep the profile even if we timed out
+
         except Exception as e:
-            log.warning(f"[NoPeCHA] Profile setup browser error: {e}")
+            log.warning(f"[NoPeCHA] Profile setup error: {e}")
         finally:
             if setup_browser:
                 try:
                     await setup_browser.stop()
                 except Exception:
                     pass
-            await asyncio.sleep(1.5)   # let Chrome flush LevelDB to disk
+            await asyncio.sleep(1.5)   # let Chrome flush profile to disk
 
         if success:
             try:
@@ -2602,9 +2640,7 @@ async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
                     f.write(current_hash)
             except Exception:
                 pass
-            log.success("[NoPeCHA] Session profile saved — workers will reuse it without re-injecting ✓")
-        else:
-            log.warning("[NoPeCHA] Profile setup failed — workers will fall back to per-run injection")
+            log.success("[NoPeCHA] Session profile saved — workers will reuse it, no entry needed ✓")
 
         _nopecha_profile_dir = profile_dir
         return profile_dir
