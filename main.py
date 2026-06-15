@@ -2507,21 +2507,21 @@ def ensure_nopecha_extension() -> Optional[str]:
 async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
                                   brave_path: str = "") -> Optional[str]:
     """
-    Create (once per process) a master Chrome profile that has the NoPeCHA
-    API key already stored in chrome.storage.local.
+    Enter the NoPeCHA API key via the popup UI exactly ONCE per tool session.
 
     How it works:
-      1. First worker to call this spins up a throwaway setup browser with
-         --user-data-dir pointing at <tool_dir>/nopecha_session/.
-      2. Injects the key via the callback+poll storage write.
-      3. Closes the browser — Chrome flushes LevelDB to disk on clean exit.
-      4. Saves a hash of the API key so we know when to rebuild the profile.
+      1. First call spins up a throwaway browser pointed at nopecha_session/.
+      2. Opens the NoPeCHA popup and enters the key via real CDP mouse+keyboard
+         events (clicks "Enter API key", types the key, presses Enter).
+      3. Closes the browser — NoPeCHA's own save handler has already written
+         the key to the profile on disk.
+      4. Saves a hash of the API key so we know when to redo this.
 
-    Every subsequent worker just copies the saved profile to a temp dir and
-    starts with --user-data-dir pointing there — key is already present in
-    the LevelDB, NO injection needed.
+    Every worker after that just copies nopecha_session/ to a temp dir and
+    starts with --user-data-dir pointing there — key already present, no
+    entry needed.
 
-    Thread-safe: only ONE setup browser ever runs; others wait then reuse.
+    Thread-safe: only ONE setup browser ever runs; all other workers wait.
     """
     global _nopecha_profile_dir
     import hashlib, shutil as _shutil
@@ -3101,18 +3101,17 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # ── NoPeCHA extension + persistent session profile setup ──────────────
-        # Flow (first run ever / after key change):
+        # ── NoPeCHA: enter key once via popup UI, reuse profile for all workers ─
+        # First worker:
         #   1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
-        #   2. ensure_nopecha_profile()    — spin up a throwaway browser, write
-        #        key to chrome.storage.local, close browser → LevelDB flushed to
-        #        nopecha_session/ on disk.  Runs only ONCE per key; all workers wait.
-        #   3. Worker copies nopecha_session/ → temp dir, starts with
-        #        --user-data-dir={temp} — key is already in the profile, no injection.
+        #   2. ensure_nopecha_profile()    — opens a throwaway browser, CDP-clicks
+        #        "Enter API key" in the popup, types the key, presses Enter.
+        #        Browser closes → profile saved to nopecha_session/.
+        #        Runs only ONCE per session; other workers wait then reuse.
+        #   3. Worker copies nopecha_session/ → temp dir, starts Brave with that
+        #        profile — key already present, no entry needed.
         #
-        # Flow (subsequent runs, key unchanged):
-        #   1 & 2 are instant (profile already on disk).
-        #   3 same as above — just a fast directory copy.
+        # All other workers: steps 1 & 2 are instant (profile on disk), step 3 only.
         import shutil as _shutil
         _nopecha_enabled = bool(config.get("nopechaEnabled"))
         _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
