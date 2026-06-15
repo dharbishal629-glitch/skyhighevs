@@ -2358,6 +2358,33 @@ _nopecha_key_lock   = threading.Lock()
 _nopecha_key_ready  = False   # True once the setup browser has saved the key this session
 
 
+def _get_nopecha_popup_path(ext_dir: str) -> str:
+    """
+    Read the extension manifest.json to find the actual popup HTML file.
+
+    Different NoPeCHA versions/releases use different filenames:
+      Manifest V2: browser_action.default_popup
+      Manifest V3: action.default_popup
+    Falls back to common names if the manifest can't be read.
+    """
+    import json as _json
+
+    manifest_path = os.path.join(ext_dir, "manifest.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = _json.load(f)
+        for key in ("action", "browser_action", "page_action"):
+            popup = manifest.get(key, {}).get("default_popup", "")
+            if popup:
+                log.debug(f"[NoPeCHA] manifest popup path: {popup}")
+                return popup.lstrip("/")
+    except Exception as e:
+        log.debug(f"[NoPeCHA] Could not read manifest: {e}")
+
+    # Fallback: try common filenames (checked in order by inject_nopecha_key_auto)
+    return "popup.html"
+
+
 def _get_tool_base_dir() -> str:
     """Return the directory containing the tool (exe or script)."""
     if getattr(sys, "frozen", False):
@@ -2477,7 +2504,8 @@ def ensure_nopecha_extension() -> Optional[str]:
 
 
 
-async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str) -> bool:
+async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
+                                  ext_dir: str = "") -> bool:
     """
     Fully automatic NoPeCHA API key injection — ZERO user interaction required.
 
@@ -2488,19 +2516,54 @@ async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str) -> bool:
       solve them. This function injects the key fresh every time instead.
 
     Flow:
-      1. Open the NoPeCHA popup as a browser tab (extension context).
-      2. Dismiss any promo banner.
-      3. Programmatically click the "Enter API key" button/link.
-      4. Wait for the input field to appear, fill key via native setter.
-      5. Fire input/change events + press Enter to trigger NoPeCHA's own
-         validation + chrome.storage.local save path.
-      6. Verify key is active (popup no longer shows "Enter API key").
+      1. Determine the correct popup HTML path from the extension manifest
+         (different NoPeCHA versions use different filenames).
+      2. Open that popup as a browser tab; fall back through common names if
+         ERR_FILE_NOT_FOUND.
+      3. Dismiss any promo banner.
+      4. Programmatically click the "Enter API key" button/link.
+      5. Fill key via native setter + fire events + press Enter → NoPeCHA
+         validates via its servers and saves to chrome.storage.local.
+      6. Verify key is now active.
     """
     safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
-    try:
-        ext_page = await browser.get(f"chrome-extension://{ext_id}/popup.html")
-        await asyncio.sleep(2)
 
+    # ── Determine the correct popup file from the manifest ──────────────────
+    # Different NoPeCHA releases use different filenames. We read the manifest
+    # first; fall back to a list of common names if that fails or 404s.
+    popup_candidates: list[str] = []
+    if ext_dir:
+        manifest_popup = _get_nopecha_popup_path(ext_dir)
+        popup_candidates.append(manifest_popup)
+    for fallback in ("popup.html", "index.html", "app.html", "main.html", "panel.html"):
+        if fallback not in popup_candidates:
+            popup_candidates.append(fallback)
+
+    ext_page = None
+    for popup_file in popup_candidates:
+        popup_url = f"chrome-extension://{ext_id}/{popup_file}"
+        try:
+            candidate = await browser.get(popup_url)
+            await asyncio.sleep(1.5)
+            # Check whether the page actually loaded (vs ERR_FILE_NOT_FOUND)
+            title = await candidate.evaluate("document.title || ''")
+            body  = await candidate.evaluate("document.body ? document.body.innerText.slice(0,80) : ''")
+            if "not found" in str(body).lower() or "file_not_found" in str(body).lower():
+                log.debug(f"[NoPeCHA] {popup_file} → not found, trying next...")
+                continue
+            ext_page = candidate
+            log.debug(f"[NoPeCHA] Popup loaded: {popup_file} (title={title!r})")
+            break
+        except Exception as e:
+            log.debug(f"[NoPeCHA] {popup_file} → error: {e}, trying next...")
+
+    if ext_page is None:
+        log.warning("[NoPeCHA] Could not open extension popup (all candidates failed)")
+        return False
+
+    await asyncio.sleep(0.5)
+
+    try:
         # Dismiss the "Join our Discord" promo banner if present
         await ext_page.evaluate(
             "(() => {"
@@ -2918,7 +2981,8 @@ async def worker():
         # fills the key via native events, and presses Enter — fully automatic.
         if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
             log.info("[NoPeCHA] Injecting API key into worker browser...")
-            await inject_nopecha_key_auto(browser, NOPECHA_EXT_ID, _nopecha_api_key)
+            await inject_nopecha_key_auto(browser, NOPECHA_EXT_ID, _nopecha_api_key,
+                                          ext_dir=_nopecha_ext_dir)
 
         # ── Fingerprint system ─────────────────────────────────────────────
         # Two separate concerns handled here:
