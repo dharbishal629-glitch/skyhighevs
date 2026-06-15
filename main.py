@@ -2561,157 +2561,64 @@ async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
         log.warning("[NoPeCHA] Could not open extension popup (all candidates failed)")
         return False
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.8)
 
     try:
-        # ── PRIMARY: write key directly to chrome.storage (no UI clicks needed) ──
+        # ── Write key via chrome.storage.local using callback + poll ────────────
         #
-        # We are already inside the extension popup's JS context, so
-        # chrome.storage.local is fully accessible.  Writing here fires
-        # chrome.storage.onChanged which NoPeCHA's background worker listens to,
-        # so the key becomes active immediately without any button interaction.
+        # IMPORTANT: nodriver's evaluate() silently discards Promise return
+        # values (returns None).  We must use the OLD-STYLE callback API and
+        # signal completion through a window-level flag, then poll for it.
         #
-        # Key name discovery: first read existing storage so we can reuse any
-        # existing key-like field name; also always write under "key" (the name
-        # used in NoPeCHA ≥ 0.4) and common alternatives.
-        STORAGE_JS = f"""
-new Promise((resolve) => {{
-  if (typeof chrome === 'undefined' || !chrome.storage) {{
-    resolve('no-chrome-storage');
-    return;
+        # We write under every key name NoPeCHA has ever used across versions,
+        # and also try chrome.storage.sync as a belt-and-suspenders fallback.
+        STORAGE_INIT_JS = f"""
+(function() {{
+  window.__np_status = 'pending';
+  if (typeof chrome === 'undefined' || !chrome || !chrome.storage) {{
+    window.__np_status = 'no-storage';
+    return 'no-storage';
   }}
-  // Read first so we can see what's already there
-  chrome.storage.local.get(null, (existing) => {{
-    var err = chrome.runtime.lastError;
-    var existingKeys = existing ? Object.keys(existing) : [];
-
-    // Always write these key names (covers NoPeCHA v0.3-0.6+)
-    var toSet = {{
-      'key':        '{safe_key}',
-      'apiKey':     '{safe_key}',
-      'api_key':    '{safe_key}',
-      'nopechaKey': '{safe_key}'
-    }};
-
-    // If storage already has a key-like field, overwrite it with correct value
-    existingKeys.forEach(function(k) {{
-      var kl = k.toLowerCase();
-      if (kl === 'key' || kl.includes('api') || kl.includes('token')) {{
-        toSet[k] = '{safe_key}';
-      }}
-    }});
-
-    chrome.storage.local.set(toSet, () => {{
-      var err2 = chrome.runtime.lastError;
-      if (err2) {{ resolve('error:' + err2.message); return; }}
-
-      // Also try sync storage as a fallback
-      try {{
-        chrome.storage.sync.set({{'key': '{safe_key}'}}, () => {{ }});
-      }} catch(e) {{ }}
-
-      resolve('saved:local:keys=' + Object.keys(toSet).join(','));
-    }});
+  var val = '{safe_key}';
+  var toSet = {{ key: val, apiKey: val, api_key: val, nopechaKey: val, nopecha_key: val }};
+  chrome.storage.local.set(toSet, function() {{
+    if (chrome.runtime && chrome.runtime.lastError) {{
+      window.__np_status = 'err:' + chrome.runtime.lastError.message;
+    }} else {{
+      window.__np_status = 'done';
+    }}
   }});
-}})
-"""
-        storage_result = await ext_page.evaluate(STORAGE_JS)
-        log.debug(f"[NoPeCHA] Storage write: {storage_result}")
-
-        if storage_result and storage_result.startswith("saved:"):
-            log.success("[NoPeCHA] API key written directly to extension storage ✓")
-            await asyncio.sleep(1.5)   # let background worker pick up the change
-            return True
-
-        # ── FALLBACK: UI-based injection if storage API wasn't available ────
-        log.warning(f"[NoPeCHA] Storage write failed ({storage_result}), trying UI fallback...")
-
-        # Dismiss any promo banner first
-        await ext_page.evaluate(
-            "(() => {"
-            "  let x = Array.from(document.querySelectorAll('*')).find(e =>"
-            "    ['×','✕','✖','x','X'].includes(e.textContent.trim()) &&"
-            "    e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().width < 40);"
-            "  if (x) x.click();"
-            "})()"
-        )
-        await asyncio.sleep(0.4)
-
-        # Try to find an already-visible input or a visible "Enter API key" link
-        # Use pointer + mouse event sequence (React needs more than a bare click())
-        UI_INJECT_JS = f"""
-(() => {{
-  // Helper: dispatch realistic mouse events on an element
-  function realClick(el) {{
-    var r = el.getBoundingClientRect();
-    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    ['pointerover','pointerenter','mouseover','mouseenter',
-     'pointermove','mousemove',
-     'pointerdown','mousedown','pointerup','mouseup','click'
-    ].forEach(function(n) {{
-      var E = n.startsWith('pointer') ? PointerEvent : MouseEvent;
-      el.dispatchEvent(new E(n, {{
-        bubbles:true, cancelable:true, view:window,
-        clientX:cx, clientY:cy, screenX:cx, screenY:cy,
-        button:0, buttons:1, pointerId:1, isPrimary:true
-      }}));
-    }});
-  }}
-
-  // Look for a visible text input first (may already be open)
-  var inp = Array.from(document.querySelectorAll('input[type=text],input:not([type]),textarea'))
-    .find(function(e) {{ var r=e.getBoundingClientRect(); return r.width>0 && r.height>0; }});
-  if (inp) {{
-    var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
-    if (setter && setter.set) setter.set.call(inp, '{safe_key}');
-    else inp.value = '{safe_key}';
-    ['input','change'].forEach(function(n) {{
-      inp.dispatchEvent(new Event(n, {{bubbles:true}}));
-    }});
-    ['keydown','keyup'].forEach(function(n) {{
-      inp.dispatchEvent(new KeyboardEvent(n,
-        {{key:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}}));
-    }});
-    return 'filled-existing-input';
-  }}
-
-  // No input yet — click the "Enter API key" link to reveal one
-  var all = Array.from(document.querySelectorAll('*'));
-  var btn = null;
-  // exact match first
-  btn = all.find(function(e) {{
-    var r=e.getBoundingClientRect(); if(!r.width||!r.height) return false;
-    return (e.innerText||e.textContent||'').trim().toLowerCase()==='enter api key';
-  }});
-  // partial match
-  if (!btn) btn = all.find(function(e) {{
-    var r=e.getBoundingClientRect(); if(!r.width||!r.height) return false;
-    return (e.innerText||e.textContent||'').trim().toLowerCase().includes('enter api key');
-  }});
-  if (!btn) return 'no-button-found';
-  realClick(btn);
-  return 'button-clicked:' + btn.tagName + ':' + (btn.innerText||'').trim().slice(0,20);
+  // Also attempt sync storage (some NoPeCHA builds use this)
+  try {{ chrome.storage.sync.set({{ key: val }}, function() {{}}); }} catch(e) {{}}
+  return 'initiated';
 }})()
 """
-        ui_result = await ext_page.evaluate(UI_INJECT_JS)
-        log.debug(f"[NoPeCHA] UI fallback: {ui_result}")
-        await asyncio.sleep(2.0)
+        init = await ext_page.evaluate(STORAGE_INIT_JS)
+        log.debug(f"[NoPeCHA] Storage init: {init}")
 
-        # If we clicked the button, wait for input and fill it
-        if "button-clicked" in str(ui_result):
-            for _ in range(20):
-                has_input = await ext_page.evaluate(
-                    "!!Array.from(document.querySelectorAll('input[type=text],input:not([type]),textarea'))"
-                    ".find(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;})"
-                )
-                if has_input:
-                    await ext_page.evaluate(UI_INJECT_JS)  # re-run now that input exists
-                    log.info("[NoPeCHA] UI fallback: input filled")
-                    await asyncio.sleep(3)
-                    break
-                await asyncio.sleep(0.5)
+        if init == "no-storage":
+            log.warning("[NoPeCHA] chrome.storage not available — key injection skipped")
+            return False
 
-        return True  # proceed; extension logs will confirm if key is active
+        # Poll until the callback fires (up to 3 s)
+        status = "pending"
+        for _ in range(60):
+            status = await ext_page.evaluate("window.__np_status || 'pending'")
+            if status != "pending":
+                break
+            await asyncio.sleep(0.05)
+
+        log.debug(f"[NoPeCHA] Storage status after poll: {status}")
+
+        if status == "done":
+            log.success("[NoPeCHA] API key written to extension storage ✓  (persists this session)")
+            await asyncio.sleep(0.8)
+            return True
+
+        # If storage write failed, log the real reason and give up cleanly
+        log.warning(f"[NoPeCHA] chrome.storage.local.set failed: {status!r}")
+        log.warning("[NoPeCHA] Captcha solving will be skipped — check NoPeCHA plan/credits")
+        return False
 
     except Exception as e:
         log.warning(f"[NoPeCHA] Key inject error: {e}")
