@@ -2564,143 +2564,154 @@ async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
     await asyncio.sleep(0.5)
 
     try:
-        # Dismiss the "Join our Discord" promo banner if present
+        # ── PRIMARY: write key directly to chrome.storage (no UI clicks needed) ──
+        #
+        # We are already inside the extension popup's JS context, so
+        # chrome.storage.local is fully accessible.  Writing here fires
+        # chrome.storage.onChanged which NoPeCHA's background worker listens to,
+        # so the key becomes active immediately without any button interaction.
+        #
+        # Key name discovery: first read existing storage so we can reuse any
+        # existing key-like field name; also always write under "key" (the name
+        # used in NoPeCHA ≥ 0.4) and common alternatives.
+        STORAGE_JS = f"""
+new Promise((resolve) => {{
+  if (typeof chrome === 'undefined' || !chrome.storage) {{
+    resolve('no-chrome-storage');
+    return;
+  }}
+  // Read first so we can see what's already there
+  chrome.storage.local.get(null, (existing) => {{
+    var err = chrome.runtime.lastError;
+    var existingKeys = existing ? Object.keys(existing) : [];
+
+    // Always write these key names (covers NoPeCHA v0.3-0.6+)
+    var toSet = {{
+      'key':        '{safe_key}',
+      'apiKey':     '{safe_key}',
+      'api_key':    '{safe_key}',
+      'nopechaKey': '{safe_key}'
+    }};
+
+    // If storage already has a key-like field, overwrite it with correct value
+    existingKeys.forEach(function(k) {{
+      var kl = k.toLowerCase();
+      if (kl === 'key' || kl.includes('api') || kl.includes('token')) {{
+        toSet[k] = '{safe_key}';
+      }}
+    }});
+
+    chrome.storage.local.set(toSet, () => {{
+      var err2 = chrome.runtime.lastError;
+      if (err2) {{ resolve('error:' + err2.message); return; }}
+
+      // Also try sync storage as a fallback
+      try {{
+        chrome.storage.sync.set({{'key': '{safe_key}'}}, () => {{ }});
+      }} catch(e) {{ }}
+
+      resolve('saved:local:keys=' + Object.keys(toSet).join(','));
+    }});
+  }});
+}})
+"""
+        storage_result = await ext_page.evaluate(STORAGE_JS)
+        log.debug(f"[NoPeCHA] Storage write: {storage_result}")
+
+        if storage_result and storage_result.startswith("saved:"):
+            log.success("[NoPeCHA] API key written directly to extension storage ✓")
+            await asyncio.sleep(1.5)   # let background worker pick up the change
+            return True
+
+        # ── FALLBACK: UI-based injection if storage API wasn't available ────
+        log.warning(f"[NoPeCHA] Storage write failed ({storage_result}), trying UI fallback...")
+
+        # Dismiss any promo banner first
         await ext_page.evaluate(
             "(() => {"
-            "  let all = Array.from(document.querySelectorAll('*'));"
-            "  let x = all.find(e =>"
+            "  let x = Array.from(document.querySelectorAll('*')).find(e =>"
             "    ['×','✕','✖','x','X'].includes(e.textContent.trim()) &&"
-            "    e.getBoundingClientRect().width > 0 &&"
-            "    e.getBoundingClientRect().width < 40);"
+            "    e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().width < 40);"
             "  if (x) x.click();"
-            "  return x ? 'dismissed' : 'none';"
             "})()"
         )
         await asyncio.sleep(0.4)
 
-        # ── Find and real-click the "Enter API key" button ──────────────────
-        # NoPeCHA's popup is a React app that listens on mousedown/mouseup,
-        # NOT just "click". A bare .click() call registers as "clicked" in JS
-        # but React's synthetic event system ignores it, so the input never
-        # appears.  We dispatch the full mouse-event sequence instead, which
-        # is equivalent to an actual cursor click.
-        REAL_CLICK_JS = """
-(() => {
-  function realClick(el) {
-    var rect = el.getBoundingClientRect();
-    var cx = Math.round(rect.left + rect.width  / 2);
-    var cy = Math.round(rect.top  + rect.height / 2);
-    ['mouseover','mouseenter','mousemove',
-     'mousedown','mouseup','click'].forEach(function(evtName) {
-      var opts = {
-        bubbles: true, cancelable: true, view: window,
-        clientX: cx, clientY: cy, screenX: cx, screenY: cy,
-        button: 0, buttons: 1
-      };
-      el.dispatchEvent(new MouseEvent(evtName, opts));
-    });
-  }
+        # Try to find an already-visible input or a visible "Enter API key" link
+        # Use pointer + mouse event sequence (React needs more than a bare click())
+        UI_INJECT_JS = f"""
+(() => {{
+  // Helper: dispatch realistic mouse events on an element
+  function realClick(el) {{
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    ['pointerover','pointerenter','mouseover','mouseenter',
+     'pointermove','mousemove',
+     'pointerdown','mousedown','pointerup','mouseup','click'
+    ].forEach(function(n) {{
+      var E = n.startsWith('pointer') ? PointerEvent : MouseEvent;
+      el.dispatchEvent(new E(n, {{
+        bubbles:true, cancelable:true, view:window,
+        clientX:cx, clientY:cy, screenX:cx, screenY:cy,
+        button:0, buttons:1, pointerId:1, isPrimary:true
+      }}));
+    }});
+  }}
 
-  // Strategy 1 – deepest visible node whose FULL text == 'enter api key'
+  // Look for a visible text input first (may already be open)
+  var inp = Array.from(document.querySelectorAll('input[type=text],input:not([type]),textarea'))
+    .find(function(e) {{ var r=e.getBoundingClientRect(); return r.width>0 && r.height>0; }});
+  if (inp) {{
+    var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+    if (setter && setter.set) setter.set.call(inp, '{safe_key}');
+    else inp.value = '{safe_key}';
+    ['input','change'].forEach(function(n) {{
+      inp.dispatchEvent(new Event(n, {{bubbles:true}}));
+    }});
+    ['keydown','keyup'].forEach(function(n) {{
+      inp.dispatchEvent(new KeyboardEvent(n,
+        {{key:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}}));
+    }});
+    return 'filled-existing-input';
+  }}
+
+  // No input yet — click the "Enter API key" link to reveal one
   var all = Array.from(document.querySelectorAll('*'));
-  var btn = all.find(function(e) {
-    var r = e.getBoundingClientRect();
-    if (!r.width || !r.height) return false;
-    var t = (e.innerText || e.textContent || '').trim().toLowerCase();
-    return t === 'enter api key';
-  });
-
-  // Strategy 2 – any visible element that contains the phrase
-  if (!btn) {
-    btn = all.find(function(e) {
-      var r = e.getBoundingClientRect();
-      if (!r.width || !r.height) return false;
-      var t = (e.innerText || e.textContent || '').trim().toLowerCase();
-      return t.includes('enter api key');
-    });
-    // prefer the most-specific (deepest) child
-    if (btn) {
-      var deep = btn.querySelector('*');
-      while (deep) {
-        var r2 = deep.getBoundingClientRect();
-        var t2 = (deep.innerText || deep.textContent || '').trim().toLowerCase();
-        if (r2.width && t2.includes('enter api key')) { btn = deep; }
-        deep = deep.querySelector('*');
-      }
-    }
-  }
-
-  // Strategy 3 – any SVG pencil / edit icon sibling next to "api key" text
-  if (!btn) {
-    btn = all.find(function(e) {
-      var r = e.getBoundingClientRect();
-      if (!r.width || !r.height) return false;
-      var t = (e.innerText || e.textContent || '').trim().toLowerCase();
-      return t === 'api key' || t === 'enter key' || t === 'key';
-    });
-  }
-
-  if (!btn) return 'not-found';
+  var btn = null;
+  // exact match first
+  btn = all.find(function(e) {{
+    var r=e.getBoundingClientRect(); if(!r.width||!r.height) return false;
+    return (e.innerText||e.textContent||'').trim().toLowerCase()==='enter api key';
+  }});
+  // partial match
+  if (!btn) btn = all.find(function(e) {{
+    var r=e.getBoundingClientRect(); if(!r.width||!r.height) return false;
+    return (e.innerText||e.textContent||'').trim().toLowerCase().includes('enter api key');
+  }});
+  if (!btn) return 'no-button-found';
   realClick(btn);
-  return 'clicked:' + (btn.tagName || '?') + ':' + (btn.innerText || '').trim().slice(0,20);
-})()
+  return 'button-clicked:' + btn.tagName + ':' + (btn.innerText||'').trim().slice(0,20);
+}})()
 """
-        clicked = await ext_page.evaluate(REAL_CLICK_JS)
-        log.debug(f"[NoPeCHA] 'Enter API key' click: {clicked}")
-        await asyncio.sleep(1.2)   # give React time to re-render the input
+        ui_result = await ext_page.evaluate(UI_INJECT_JS)
+        log.debug(f"[NoPeCHA] UI fallback: {ui_result}")
+        await asyncio.sleep(2.0)
 
-        # Wait up to 10 s for the input field to appear
-        found_input = False
-        for _ in range(20):
-            has = await ext_page.evaluate(
-                "(() => {"
-                "  let i = Array.from(document.querySelectorAll('input,textarea'))"
-                "    .find(e => e.getBoundingClientRect().width > 0 && e.type !== 'checkbox');"
-                "  return i ? 'yes' : 'no';"
-                "})()"
-            )
-            if has == "yes":
-                found_input = True
-                break
-            await asyncio.sleep(0.5)
+        # If we clicked the button, wait for input and fill it
+        if "button-clicked" in str(ui_result):
+            for _ in range(20):
+                has_input = await ext_page.evaluate(
+                    "!!Array.from(document.querySelectorAll('input[type=text],input:not([type]),textarea'))"
+                    ".find(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;})"
+                )
+                if has_input:
+                    await ext_page.evaluate(UI_INJECT_JS)  # re-run now that input exists
+                    log.info("[NoPeCHA] UI fallback: input filled")
+                    await asyncio.sleep(3)
+                    break
+                await asyncio.sleep(0.5)
 
-        if not found_input:
-            log.warning("[NoPeCHA] Input field not found after clicking — key inject skipped")
-            return False
-
-        log.info("[NoPeCHA] Input detected — filling API key automatically...")
-
-        # Fill key via native React/Vue setter + fire events + press Enter
-        await ext_page.evaluate(
-            f"(() => {{"
-            f"  let inp = Array.from(document.querySelectorAll('input,textarea'))"
-            f"    .find(e => e.getBoundingClientRect().width > 0 && e.type !== 'checkbox');"
-            f"  if (!inp) return;"
-            f"  let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
-            f"  if (setter) setter.call(inp, '{safe_key}'); else inp.value = '{safe_key}';"
-            f"  inp.dispatchEvent(new Event('input',  {{bubbles:true}}));"
-            f"  inp.dispatchEvent(new Event('change', {{bubbles:true}}));"
-            f"  inp.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,which:13,bubbles:true}}));"
-            f"  inp.dispatchEvent(new KeyboardEvent('keyup',  {{key:'Enter',keyCode:13,which:13,bubbles:true}}));"
-            f"}})()"
-        )
-        await asyncio.sleep(5)  # NoPeCHA validates key via its servers + flushes chrome.storage
-
-        # Confirm key is now active
-        still_asking = await ext_page.evaluate(
-            "(() => {"
-            "  let els = Array.from(document.querySelectorAll('*'));"
-            "  let e = els.find(e => e.getBoundingClientRect().width > 0"
-            "    && (e.textContent || '').trim().toLowerCase().includes('enter api key'));"
-            "  return e ? 'yes' : 'no';"
-            "})()"
-        )
-        if still_asking == "no":
-            log.success("[NoPeCHA] API key saved and active in worker browser ✓")
-            return True
-
-        log.warning("[NoPeCHA] Key may not have saved — check NoPeCHA plan/credits")
-        return True  # proceed anyway; extension will show whether it works
+        return True  # proceed; extension logs will confirm if key is active
 
     except Exception as e:
         log.warning(f"[NoPeCHA] Key inject error: {e}")
