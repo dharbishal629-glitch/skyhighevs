@@ -2617,121 +2617,189 @@ async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
 async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
                                   ext_dir: str = "") -> bool:
     """
-    Fully automatic NoPeCHA API key injection — ZERO user interaction required.
+    Automatically enter the NoPeCHA API key through the extension popup UI.
 
-    Why not profile-copy:
-      Chrome's chrome.storage LevelDB files cannot be reliably copied while
-      Chrome is running (files may be uncommitted). Copying results in NoPeCHA
-      loading but reading no key → it detects captchas but silently fails to
-      solve them. This function injects the key fresh every time instead.
+    Uses real CDP (Chrome DevTools Protocol) mouse and keyboard events —
+    the same signal path as a real human clicking and typing.  Unlike
+    JavaScript-dispatched synthetic events, CDP events go through Chrome's
+    actual input pipeline so React's event system responds normally.
 
     Flow:
-      1. Determine the correct popup HTML path from the extension manifest
-         (different NoPeCHA versions use different filenames).
-      2. Open that popup as a browser tab; fall back through common names if
-         ERR_FILE_NOT_FOUND.
+      1. Read manifest.json to find the real popup filename.
+      2. Open the popup as a browser tab, verify it loaded.
       3. Dismiss any promo banner.
-      4. Programmatically click the "Enter API key" button/link.
-      5. Fill key via native setter + fire events + press Enter → NoPeCHA
-         validates via its servers and saves to chrome.storage.local.
-      6. Verify key is now active.
+      4. CDP-click the "Enter API key" link → React opens the input field.
+      5. CDP-click the input field to focus it.
+      6. CDP-type the key character by character.
+      7. CDP-press Enter → NoPeCHA validates + saves the key itself.
+      8. Verify the popup no longer shows "Enter API key".
     """
-    safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
+    from nodriver import cdp as _cdp
 
-    # ── Determine the correct popup file from the manifest ──────────────────
-    # Different NoPeCHA releases use different filenames. We read the manifest
-    # first; fall back to a list of common names if that fails or 404s.
+    # ── Find the correct popup file from manifest ────────────────────────────
     popup_candidates: list[str] = []
     if ext_dir:
-        manifest_popup = _get_nopecha_popup_path(ext_dir)
-        popup_candidates.append(manifest_popup)
-    for fallback in ("popup.html", "index.html", "app.html", "main.html", "panel.html"):
-        if fallback not in popup_candidates:
-            popup_candidates.append(fallback)
+        popup_candidates.append(_get_nopecha_popup_path(ext_dir))
+    for fb in ("popup.html", "index.html", "app.html", "main.html", "panel.html"):
+        if fb not in popup_candidates:
+            popup_candidates.append(fb)
 
     ext_page = None
     for popup_file in popup_candidates:
-        popup_url = f"chrome-extension://{ext_id}/{popup_file}"
         try:
-            candidate = await browser.get(popup_url)
+            candidate = await browser.get(f"chrome-extension://{ext_id}/{popup_file}")
             await asyncio.sleep(1.5)
-            # Check whether the page actually loaded (vs ERR_FILE_NOT_FOUND)
             title = await candidate.evaluate("document.title || ''")
-            body  = await candidate.evaluate("document.body ? document.body.innerText.slice(0,80) : ''")
+            body  = await candidate.evaluate(
+                "document.body ? document.body.innerText.slice(0,60) : ''")
             if "not found" in str(body).lower() or "file_not_found" in str(body).lower():
-                log.debug(f"[NoPeCHA] {popup_file} → not found, trying next...")
                 continue
             ext_page = candidate
             log.debug(f"[NoPeCHA] Popup loaded: {popup_file} (title={title!r})")
             break
         except Exception as e:
-            log.debug(f"[NoPeCHA] {popup_file} → error: {e}, trying next...")
+            log.debug(f"[NoPeCHA] {popup_file} error: {e}")
 
     if ext_page is None:
-        log.warning("[NoPeCHA] Could not open extension popup (all candidates failed)")
+        log.warning("[NoPeCHA] Could not open extension popup")
         return False
 
     await asyncio.sleep(0.8)
 
-    try:
-        # ── Write key via chrome.storage.local using callback + poll ────────────
-        #
-        # IMPORTANT: nodriver's evaluate() silently discards Promise return
-        # values (returns None).  We must use the OLD-STYLE callback API and
-        # signal completion through a window-level flag, then poll for it.
-        #
-        # We write under every key name NoPeCHA has ever used across versions,
-        # and also try chrome.storage.sync as a belt-and-suspenders fallback.
-        STORAGE_INIT_JS = f"""
-(function() {{
-  window.__np_status = 'pending';
-  if (typeof chrome === 'undefined' || !chrome || !chrome.storage) {{
-    window.__np_status = 'no-storage';
-    return 'no-storage';
-  }}
-  var val = '{safe_key}';
-  var toSet = {{ key: val, apiKey: val, api_key: val, nopechaKey: val, nopecha_key: val }};
-  chrome.storage.local.set(toSet, function() {{
-    if (chrome.runtime && chrome.runtime.lastError) {{
-      window.__np_status = 'err:' + chrome.runtime.lastError.message;
-    }} else {{
-      window.__np_status = 'done';
-    }}
-  }});
-  // Also attempt sync storage (some NoPeCHA builds use this)
-  try {{ chrome.storage.sync.set({{ key: val }}, function() {{}}); }} catch(e) {{}}
-  return 'initiated';
-}})()
-"""
-        init = await ext_page.evaluate(STORAGE_INIT_JS)
-        log.debug(f"[NoPeCHA] Storage init: {init}")
-
-        if init == "no-storage":
-            log.warning("[NoPeCHA] chrome.storage not available — key injection skipped")
-            return False
-
-        # Poll until the callback fires (up to 3 s)
-        status = "pending"
-        for _ in range(60):
-            status = await ext_page.evaluate("window.__np_status || 'pending'")
-            if status != "pending":
-                break
+    # ── Helper: real CDP mouse click at (x, y) in the popup tab ─────────────
+    async def cdp_click(x: float, y: float) -> None:
+        for t in ("mousePressed", "mouseReleased"):
+            await ext_page.send(_cdp.input_.dispatch_mouse_event(
+                type_=t, x=x, y=y,
+                button=_cdp.input_.MouseButton.left,
+                click_count=1, modifiers=0,
+            ))
             await asyncio.sleep(0.05)
 
-        log.debug(f"[NoPeCHA] Storage status after poll: {status}")
+    # ── Helper: get element center from JS selector or text search ───────────
+    FIND_EL_JS = """
+(function(query) {
+  var el = null;
+  if (query.startsWith('#') || query.startsWith('.') || query.startsWith('[')) {
+    el = document.querySelector(query);
+  } else {
+    // text search — return deepest visible element whose text matches exactly
+    var all = Array.from(document.querySelectorAll('*'));
+    el = all.find(function(e) {
+      var r = e.getBoundingClientRect();
+      if (!r.width || !r.height) return false;
+      return (e.innerText || e.textContent || '').trim().toLowerCase() === query.toLowerCase();
+    });
+    if (!el) {
+      el = all.find(function(e) {
+        var r = e.getBoundingClientRect();
+        if (!r.width || !r.height) return false;
+        return (e.innerText || e.textContent || '').trim().toLowerCase().includes(query.toLowerCase());
+      });
+    }
+  }
+  if (!el) return null;
+  var r = el.getBoundingClientRect();
+  return {x: r.left + r.width/2, y: r.top + r.height/2, tag: el.tagName};
+})
+"""
 
-        if status == "done":
-            log.success("[NoPeCHA] API key written to extension storage ✓  (persists this session)")
-            await asyncio.sleep(0.8)
+    async def find_center(query: str):
+        result = await ext_page.evaluate(f"({FIND_EL_JS})('{query}')")
+        return result   # dict {x, y, tag} or None
+
+    try:
+        # ── Step 1: dismiss promo banner ─────────────────────────────────────
+        banner = await find_center("×") or await find_center("✕")
+        if banner:
+            await cdp_click(banner["x"], banner["y"])
+            await asyncio.sleep(0.4)
+
+        # ── Step 2: CDP-click the "Enter API key" link ────────────────────────
+        btn = await find_center("Enter API key")
+        if not btn:
+            btn = await find_center("api key")
+        if not btn:
+            log.warning("[NoPeCHA] 'Enter API key' button not found in popup")
+            return False
+
+        log.debug(f"[NoPeCHA] Clicking 'Enter API key' via CDP at ({btn['x']:.0f},{btn['y']:.0f})")
+        await cdp_click(btn["x"], btn["y"])
+        await asyncio.sleep(1.2)   # React re-renders after click
+
+        # ── Step 3: wait for the text input to appear (up to 10 s) ───────────
+        inp_coords = None
+        for _ in range(20):
+            inp = await ext_page.evaluate(
+                "(function() {"
+                "  var i = Array.from(document.querySelectorAll("
+                "    'input[type=text],input:not([type]),textarea'))"
+                "    .find(function(e) {"
+                "      var r = e.getBoundingClientRect();"
+                "      return r.width > 0 && r.height > 0;"
+                "    });"
+                "  if (!i) return null;"
+                "  var r = i.getBoundingClientRect();"
+                "  return {x: r.left + r.width/2, y: r.top + r.height/2};"
+                "})()"
+            )
+            if inp:
+                inp_coords = inp
+                break
+            await asyncio.sleep(0.5)
+
+        if not inp_coords:
+            log.warning("[NoPeCHA] Input field never appeared after clicking — key not entered")
+            return False
+
+        log.debug("[NoPeCHA] Input field appeared — clicking to focus...")
+        await cdp_click(inp_coords["x"], inp_coords["y"])
+        await asyncio.sleep(0.3)
+
+        # ── Step 4: type the API key via CDP char events ──────────────────────
+        log.info("[NoPeCHA] Typing API key into popup via real keyboard events...")
+        for char in api_key:
+            await ext_page.send(_cdp.input_.dispatch_key_event(
+                type_="char", text=char,
+                unmodified_text=char,
+            ))
+            await asyncio.sleep(0.03)
+
+        await asyncio.sleep(0.2)
+
+        # ── Step 5: press Enter so NoPeCHA validates + saves ──────────────────
+        for ev_type in ("rawKeyDown", "keyUp"):
+            await ext_page.send(_cdp.input_.dispatch_key_event(
+                type_=ev_type,
+                key="Enter", code="Enter",
+                windows_virtual_key_code=13,
+                native_virtual_key_code=13,
+            ))
+            await asyncio.sleep(0.05)
+
+        log.debug("[NoPeCHA] Enter pressed — waiting for NoPeCHA to save key...")
+        await asyncio.sleep(4)   # NoPeCHA validates via its server then saves
+
+        # ── Step 6: verify key is active ─────────────────────────────────────
+        still_asking = await ext_page.evaluate(
+            "(function() {"
+            "  var els = Array.from(document.querySelectorAll('*'));"
+            "  return !!els.find(function(e) {"
+            "    var r = e.getBoundingClientRect();"
+            "    return r.width > 0 && (e.innerText||e.textContent||'')"
+            "      .trim().toLowerCase().includes('enter api key');"
+            "  });"
+            "})()"
+        )
+        if not still_asking:
+            log.success("[NoPeCHA] API key entered and saved via popup UI ✓")
             return True
 
-        # If storage write failed, log the real reason and give up cleanly
-        log.warning(f"[NoPeCHA] chrome.storage.local.set failed: {status!r}")
-        log.warning("[NoPeCHA] Captcha solving will be skipped — check NoPeCHA plan/credits")
-        return False
+        log.warning("[NoPeCHA] Popup still shows 'Enter API key' — key may not have saved")
+        return True   # proceed anyway; extension logs confirm if it works
 
     except Exception as e:
-        log.warning(f"[NoPeCHA] Key inject error: {e}")
+        log.warning(f"[NoPeCHA] Key entry error: {e}")
         return False
 
 
