@@ -2353,10 +2353,9 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
     return False
 
 
-NOPECHA_EXT_ID           = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
-_nopecha_profile_dir: Optional[str] = None   # path to master session profile (set once)
-_nopecha_profile_lock    = threading.Lock()   # prevents two workers creating it simultaneously
-_nopecha_profile_ready   = threading.Event()  # set once profile is ready to copy
+NOPECHA_EXT_ID      = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+_nopecha_key_lock   = threading.Lock()
+_nopecha_key_ready  = False   # True once the setup browser has saved the key this session
 
 
 def _get_nopecha_popup_path(ext_dir: str) -> str:
@@ -2504,375 +2503,152 @@ def ensure_nopecha_extension() -> Optional[str]:
     return ext_dir
 
 
-async def ensure_nopecha_profile(ext_dir: str, ext_id: str, api_key: str,
-                                  brave_path: str = "") -> Optional[str]:
-    """
-    Enter the NoPeCHA API key via the popup UI exactly ONCE per tool session.
-
-    How it works:
-      1. First call spins up a throwaway browser pointed at nopecha_session/.
-      2. Opens the NoPeCHA popup and enters the key via real CDP mouse+keyboard
-         events (clicks "Enter API key", types the key, presses Enter).
-      3. Closes the browser — NoPeCHA's own save handler has already written
-         the key to the profile on disk.
-      4. Saves a hash of the API key so we know when to redo this.
-
-    Every worker after that just copies nopecha_session/ to a temp dir and
-    starts with --user-data-dir pointing there — key already present, no
-    entry needed.
-
-    Thread-safe: only ONE setup browser ever runs; all other workers wait.
-    """
-    global _nopecha_profile_dir
-    import hashlib, shutil as _shutil
-
-    # Fast path — already created this process run
-    if _nopecha_profile_dir:
-        return _nopecha_profile_dir
-
-    # Another thread may already be creating it — spin-wait for up to 120 s
-    if not _nopecha_profile_lock.acquire(blocking=False):
-        log.debug("[NoPeCHA] Waiting for profile setup to complete in another worker...")
-        _nopecha_profile_ready.wait(timeout=120)
-        return _nopecha_profile_dir   # may be None if setup failed
-
-    try:
-        base         = _get_tool_base_dir()
-        profile_dir  = os.path.join(base, "nopecha_session")
-        hash_file    = os.path.join(base, ".nopecha_key_hash")
-        current_hash = hashlib.md5(api_key.encode()).hexdigest()
-
-        # Check whether the saved profile is valid for the current key
-        profile_ok = False
-        if os.path.isdir(profile_dir) and os.path.isfile(hash_file):
-            try:
-                if open(hash_file).read().strip() == current_hash:
-                    profile_ok = True
-            except Exception:
-                pass
-
-        if profile_ok:
-            log.info("[NoPeCHA] Reusing saved session profile — key already stored on disk.")
-            _nopecha_profile_dir = profile_dir
-            return profile_dir
-
-        # ── Build (or rebuild) the master profile ──────────────────────────
-        if os.path.isdir(profile_dir):
-            _shutil.rmtree(profile_dir, ignore_errors=True)
-        os.makedirs(profile_dir, exist_ok=True)
-
-        import nodriver as _uc_setup
-
-        setup_args: dict = {
-            "headless": False,
-            "browser_args": [
-                f"--user-data-dir={profile_dir}",
-                f"--load-extension={ext_dir}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-notifications",
-                "--disable-popup-blocking",
-            ],
-        }
-        if brave_path:
-            setup_args["browser_executable_path"] = brave_path
-
-        setup_browser = None
-        success = False
-        try:
-            from nodriver import cdp as _cdp
-            setup_browser = await _uc_setup.start(**setup_args)
-
-            # Open the NoPeCHA popup
-            popup_file = _get_nopecha_popup_path(ext_dir)
-            popup_url  = f"chrome-extension://{ext_id}/{popup_file}"
-            ext_page   = await setup_browser.get(popup_url)
-            await asyncio.sleep(1.5)
-
-            # Tell the operator the ONE thing they need to do
-            log.warning("=" * 60)
-            log.warning("[NoPeCHA] Click  'Enter API Key'  in the popup.")
-            log.warning("          The tool will paste the key automatically.")
-            log.warning("          This happens ONCE — session saved after.")
-            log.warning("=" * 60)
-
-            # ── Wait for human to click "Enter API Key" → input appears ──────
-            # As soon as any visible text input appears in the popup we know
-            # the human clicked the button and React rendered the input field.
-            inp_coords = None
-            for _ in range(300):   # wait up to 5 min
-                await asyncio.sleep(1)
-                try:
-                    inp = await ext_page.evaluate(
-                        "(function(){"
-                        "  var i=Array.from(document.querySelectorAll("
-                        "    'input[type=text],input:not([type]),textarea'))"
-                        "    .find(function(e){"
-                        "      var r=e.getBoundingClientRect();"
-                        "      return r.width>0&&r.height>0;"
-                        "    });"
-                        "  if(!i)return null;"
-                        "  var r=i.getBoundingClientRect();"
-                        "  return{x:r.left+r.width/2,y:r.top+r.height/2};"
-                        "})()"
-                    )
-                    if inp:
-                        inp_coords = inp
-                        break
-                except Exception:
-                    pass
-
-            if not inp_coords:
-                log.warning("[NoPeCHA] Timed out — input never appeared. Continuing without key.")
-                success = True   # keep profile anyway
-            else:
-                log.info("[NoPeCHA] Input field detected — pasting API key...")
-
-                # CDP-click the input to focus it
-                for ev in ("mousePressed", "mouseReleased"):
-                    await ext_page.send(_cdp.input_.dispatch_mouse_event(
-                        type_=ev,
-                        x=float(inp_coords["x"]), y=float(inp_coords["y"]),
-                        button=_cdp.input_.MouseButton.left,
-                        click_count=1, modifiers=0,
-                    ))
-                    await asyncio.sleep(0.05)
-                await asyncio.sleep(0.2)
-
-                # Type the key character by character via CDP
-                for char in api_key:
-                    await ext_page.send(_cdp.input_.dispatch_key_event(
-                        type_="char", text=char, unmodified_text=char,
-                    ))
-                    await asyncio.sleep(0.03)
-
-                await asyncio.sleep(0.2)
-
-                # Press Enter — NoPeCHA validates + saves the key itself
-                for ev in ("rawKeyDown", "keyUp"):
-                    await ext_page.send(_cdp.input_.dispatch_key_event(
-                        type_=ev, key="Enter", code="Enter",
-                        windows_virtual_key_code=13, native_virtual_key_code=13,
-                    ))
-                    await asyncio.sleep(0.05)
-
-                log.info("[NoPeCHA] Key pasted and Enter sent — waiting for NoPeCHA to save...")
-                await asyncio.sleep(4)   # NoPeCHA validates via server then writes to storage
-                log.success("[NoPeCHA] Key saved ✓")
-                success = True
-
-        except Exception as e:
-            log.warning(f"[NoPeCHA] Profile setup error: {e}")
-        finally:
-            if setup_browser:
-                try:
-                    await setup_browser.stop()
-                except Exception:
-                    pass
-            await asyncio.sleep(1.5)   # let Chrome flush profile to disk
-
-        if success:
-            try:
-                with open(hash_file, "w") as f:
-                    f.write(current_hash)
-            except Exception:
-                pass
-            log.success("[NoPeCHA] Session profile saved — workers will reuse it, no entry needed ✓")
-
-        _nopecha_profile_dir = profile_dir
-        return profile_dir
-
-    finally:
-        _nopecha_profile_lock.release()
-        _nopecha_profile_ready.set()
-
 
 async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
                                   ext_dir: str = "") -> bool:
     """
-    Automatically enter the NoPeCHA API key through the extension popup UI.
+    Fully automatic NoPeCHA API key injection — ZERO user interaction required.
 
-    Uses real CDP (Chrome DevTools Protocol) mouse and keyboard events —
-    the same signal path as a real human clicking and typing.  Unlike
-    JavaScript-dispatched synthetic events, CDP events go through Chrome's
-    actual input pipeline so React's event system responds normally.
+    Why not profile-copy:
+      Chrome's chrome.storage LevelDB files cannot be reliably copied while
+      Chrome is running (files may be uncommitted). Copying results in NoPeCHA
+      loading but reading no key → it detects captchas but silently fails to
+      solve them. This function injects the key fresh every time instead.
 
     Flow:
-      1. Read manifest.json to find the real popup filename.
-      2. Open the popup as a browser tab, verify it loaded.
+      1. Determine the correct popup HTML path from the extension manifest
+         (different NoPeCHA versions use different filenames).
+      2. Open that popup as a browser tab; fall back through common names if
+         ERR_FILE_NOT_FOUND.
       3. Dismiss any promo banner.
-      4. CDP-click the "Enter API key" link → React opens the input field.
-      5. CDP-click the input field to focus it.
-      6. CDP-type the key character by character.
-      7. CDP-press Enter → NoPeCHA validates + saves the key itself.
-      8. Verify the popup no longer shows "Enter API key".
+      4. Programmatically click the "Enter API key" button/link.
+      5. Fill key via native setter + fire events + press Enter → NoPeCHA
+         validates via its servers and saves to chrome.storage.local.
+      6. Verify key is now active.
     """
-    from nodriver import cdp as _cdp
+    safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
 
-    # ── Find the correct popup file from manifest ────────────────────────────
+    # ── Determine the correct popup file from the manifest ──────────────────
+    # Different NoPeCHA releases use different filenames. We read the manifest
+    # first; fall back to a list of common names if that fails or 404s.
     popup_candidates: list[str] = []
     if ext_dir:
-        popup_candidates.append(_get_nopecha_popup_path(ext_dir))
-    for fb in ("popup.html", "index.html", "app.html", "main.html", "panel.html"):
-        if fb not in popup_candidates:
-            popup_candidates.append(fb)
+        manifest_popup = _get_nopecha_popup_path(ext_dir)
+        popup_candidates.append(manifest_popup)
+    for fallback in ("popup.html", "index.html", "app.html", "main.html", "panel.html"):
+        if fallback not in popup_candidates:
+            popup_candidates.append(fallback)
 
     ext_page = None
     for popup_file in popup_candidates:
+        popup_url = f"chrome-extension://{ext_id}/{popup_file}"
         try:
-            candidate = await browser.get(f"chrome-extension://{ext_id}/{popup_file}")
+            candidate = await browser.get(popup_url)
             await asyncio.sleep(1.5)
+            # Check whether the page actually loaded (vs ERR_FILE_NOT_FOUND)
             title = await candidate.evaluate("document.title || ''")
-            body  = await candidate.evaluate(
-                "document.body ? document.body.innerText.slice(0,60) : ''")
+            body  = await candidate.evaluate("document.body ? document.body.innerText.slice(0,80) : ''")
             if "not found" in str(body).lower() or "file_not_found" in str(body).lower():
+                log.debug(f"[NoPeCHA] {popup_file} → not found, trying next...")
                 continue
             ext_page = candidate
             log.debug(f"[NoPeCHA] Popup loaded: {popup_file} (title={title!r})")
             break
         except Exception as e:
-            log.debug(f"[NoPeCHA] {popup_file} error: {e}")
+            log.debug(f"[NoPeCHA] {popup_file} → error: {e}, trying next...")
 
     if ext_page is None:
-        log.warning("[NoPeCHA] Could not open extension popup")
+        log.warning("[NoPeCHA] Could not open extension popup (all candidates failed)")
         return False
 
-    await asyncio.sleep(0.8)
-
-    # ── Helper: real CDP mouse click at (x, y) in the popup tab ─────────────
-    async def cdp_click(x: float, y: float) -> None:
-        for t in ("mousePressed", "mouseReleased"):
-            await ext_page.send(_cdp.input_.dispatch_mouse_event(
-                type_=t, x=x, y=y,
-                button=_cdp.input_.MouseButton.left,
-                click_count=1, modifiers=0,
-            ))
-            await asyncio.sleep(0.05)
-
-    # ── Helper: get element center from JS selector or text search ───────────
-    FIND_EL_JS = """
-(function(query) {
-  var el = null;
-  if (query.startsWith('#') || query.startsWith('.') || query.startsWith('[')) {
-    el = document.querySelector(query);
-  } else {
-    // text search — return deepest visible element whose text matches exactly
-    var all = Array.from(document.querySelectorAll('*'));
-    el = all.find(function(e) {
-      var r = e.getBoundingClientRect();
-      if (!r.width || !r.height) return false;
-      return (e.innerText || e.textContent || '').trim().toLowerCase() === query.toLowerCase();
-    });
-    if (!el) {
-      el = all.find(function(e) {
-        var r = e.getBoundingClientRect();
-        if (!r.width || !r.height) return false;
-        return (e.innerText || e.textContent || '').trim().toLowerCase().includes(query.toLowerCase());
-      });
-    }
-  }
-  if (!el) return null;
-  var r = el.getBoundingClientRect();
-  return {x: r.left + r.width/2, y: r.top + r.height/2, tag: el.tagName};
-})
-"""
-
-    async def find_center(query: str):
-        result = await ext_page.evaluate(f"({FIND_EL_JS})('{query}')")
-        return result   # dict {x, y, tag} or None
+    await asyncio.sleep(0.5)
 
     try:
-        # ── Step 1: dismiss promo banner ─────────────────────────────────────
-        banner = await find_center("×") or await find_center("✕")
-        if banner:
-            await cdp_click(banner["x"], banner["y"])
-            await asyncio.sleep(0.4)
+        # Dismiss the "Join our Discord" promo banner if present
+        await ext_page.evaluate(
+            "(() => {"
+            "  let all = Array.from(document.querySelectorAll('*'));"
+            "  let x = all.find(e =>"
+            "    ['×','✕','✖','x','X'].includes(e.textContent.trim()) &&"
+            "    e.getBoundingClientRect().width > 0 &&"
+            "    e.getBoundingClientRect().width < 40);"
+            "  if (x) x.click();"
+            "  return x ? 'dismissed' : 'none';"
+            "})()"
+        )
+        await asyncio.sleep(0.4)
 
-        # ── Step 2: CDP-click the "Enter API key" link ────────────────────────
-        btn = await find_center("Enter API key")
-        if not btn:
-            btn = await find_center("api key")
-        if not btn:
-            log.warning("[NoPeCHA] 'Enter API key' button not found in popup")
-            return False
+        # Auto-click "Enter API key" button so the input field appears
+        clicked = await ext_page.evaluate(
+            "(() => {"
+            "  let all = Array.from(document.querySelectorAll('button,a,span,p,div,li'));"
+            "  let btn = all.find(e => {"
+            "    if (!e.getBoundingClientRect().width) return false;"
+            "    let t = (e.textContent || '').trim().toLowerCase();"
+            "    return t.includes('enter api key') || t === 'api key' || t === 'key';"
+            "  });"
+            "  if (btn) { btn.click(); return 'clicked'; }"
+            "  return 'not-found';"
+            "})()"
+        )
+        log.debug(f"[NoPeCHA] 'Enter API key' click: {clicked}")
+        await asyncio.sleep(0.8)
 
-        log.debug(f"[NoPeCHA] Clicking 'Enter API key' via CDP at ({btn['x']:.0f},{btn['y']:.0f})")
-        await cdp_click(btn["x"], btn["y"])
-        await asyncio.sleep(1.2)   # React re-renders after click
-
-        # ── Step 3: wait for the text input to appear (up to 10 s) ───────────
-        inp_coords = None
+        # Wait up to 10 s for the input field to appear
+        found_input = False
         for _ in range(20):
-            inp = await ext_page.evaluate(
-                "(function() {"
-                "  var i = Array.from(document.querySelectorAll("
-                "    'input[type=text],input:not([type]),textarea'))"
-                "    .find(function(e) {"
-                "      var r = e.getBoundingClientRect();"
-                "      return r.width > 0 && r.height > 0;"
-                "    });"
-                "  if (!i) return null;"
-                "  var r = i.getBoundingClientRect();"
-                "  return {x: r.left + r.width/2, y: r.top + r.height/2};"
+            has = await ext_page.evaluate(
+                "(() => {"
+                "  let i = Array.from(document.querySelectorAll('input,textarea'))"
+                "    .find(e => e.getBoundingClientRect().width > 0 && e.type !== 'checkbox');"
+                "  return i ? 'yes' : 'no';"
                 "})()"
             )
-            if inp:
-                inp_coords = inp
+            if has == "yes":
+                found_input = True
                 break
             await asyncio.sleep(0.5)
 
-        if not inp_coords:
-            log.warning("[NoPeCHA] Input field never appeared after clicking — key not entered")
+        if not found_input:
+            log.warning("[NoPeCHA] Input field not found after clicking — key inject skipped")
             return False
 
-        log.debug("[NoPeCHA] Input field appeared — clicking to focus...")
-        await cdp_click(inp_coords["x"], inp_coords["y"])
-        await asyncio.sleep(0.3)
+        log.info("[NoPeCHA] Input detected — filling API key automatically...")
 
-        # ── Step 4: type the API key via CDP char events ──────────────────────
-        log.info("[NoPeCHA] Typing API key into popup via real keyboard events...")
-        for char in api_key:
-            await ext_page.send(_cdp.input_.dispatch_key_event(
-                type_="char", text=char,
-                unmodified_text=char,
-            ))
-            await asyncio.sleep(0.03)
+        # Fill key via native React/Vue setter + fire events + press Enter
+        await ext_page.evaluate(
+            f"(() => {{"
+            f"  let inp = Array.from(document.querySelectorAll('input,textarea'))"
+            f"    .find(e => e.getBoundingClientRect().width > 0 && e.type !== 'checkbox');"
+            f"  if (!inp) return;"
+            f"  let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+            f"  if (setter) setter.call(inp, '{safe_key}'); else inp.value = '{safe_key}';"
+            f"  inp.dispatchEvent(new Event('input',  {{bubbles:true}}));"
+            f"  inp.dispatchEvent(new Event('change', {{bubbles:true}}));"
+            f"  inp.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,which:13,bubbles:true}}));"
+            f"  inp.dispatchEvent(new KeyboardEvent('keyup',  {{key:'Enter',keyCode:13,which:13,bubbles:true}}));"
+            f"}})()"
+        )
+        await asyncio.sleep(5)  # NoPeCHA validates key via its servers + flushes chrome.storage
 
-        await asyncio.sleep(0.2)
-
-        # ── Step 5: press Enter so NoPeCHA validates + saves ──────────────────
-        for ev_type in ("rawKeyDown", "keyUp"):
-            await ext_page.send(_cdp.input_.dispatch_key_event(
-                type_=ev_type,
-                key="Enter", code="Enter",
-                windows_virtual_key_code=13,
-                native_virtual_key_code=13,
-            ))
-            await asyncio.sleep(0.05)
-
-        log.debug("[NoPeCHA] Enter pressed — waiting for NoPeCHA to save key...")
-        await asyncio.sleep(4)   # NoPeCHA validates via its server then saves
-
-        # ── Step 6: verify key is active ─────────────────────────────────────
+        # Confirm key is now active
         still_asking = await ext_page.evaluate(
-            "(function() {"
-            "  var els = Array.from(document.querySelectorAll('*'));"
-            "  return !!els.find(function(e) {"
-            "    var r = e.getBoundingClientRect();"
-            "    return r.width > 0 && (e.innerText||e.textContent||'')"
-            "      .trim().toLowerCase().includes('enter api key');"
-            "  });"
+            "(() => {"
+            "  let els = Array.from(document.querySelectorAll('*'));"
+            "  let e = els.find(e => e.getBoundingClientRect().width > 0"
+            "    && (e.textContent || '').trim().toLowerCase().includes('enter api key'));"
+            "  return e ? 'yes' : 'no';"
             "})()"
         )
-        if not still_asking:
-            log.success("[NoPeCHA] API key entered and saved via popup UI ✓")
+        if still_asking == "no":
+            log.success("[NoPeCHA] API key saved and active in worker browser ✓")
             return True
 
-        log.warning("[NoPeCHA] Popup still shows 'Enter API key' — key may not have saved")
-        return True   # proceed anyway; extension logs confirm if it works
+        log.warning("[NoPeCHA] Key may not have saved — check NoPeCHA plan/credits")
+        return True  # proceed anyway; extension will show whether it works
 
     except Exception as e:
-        log.warning(f"[NoPeCHA] Key entry error: {e}")
+        log.warning(f"[NoPeCHA] Key inject error: {e}")
         return False
 
 
@@ -3174,50 +2950,37 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # ── NoPeCHA: enter key once via popup UI, reuse profile for all workers ─
-        # First worker:
-        #   1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
-        #   2. ensure_nopecha_profile()    — opens a throwaway browser, CDP-clicks
-        #        "Enter API key" in the popup, types the key, presses Enter.
-        #        Browser closes → profile saved to nopecha_session/.
-        #        Runs only ONCE per session; other workers wait then reuse.
-        #   3. Worker copies nopecha_session/ → temp dir, starts Brave with that
-        #        profile — key already present, no entry needed.
-        #
-        # All other workers: steps 1 & 2 are instant (profile on disk), step 3 only.
-        import shutil as _shutil
+        # ── NoPeCHA extension setup ────────────────────────────────────────
+        # Flow:
+        #  1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
+        #  2. Worker browser started with --load-extension pointing at nopecha_ext/
+        #  3. inject_nopecha_key_auto()   — runs for EVERY worker browser:
+        #       opens popup, auto-clicks "Enter API key", fills key, presses Enter.
+        #       NoPeCHA validates the key via its servers and saves to chrome.storage.
+        #       No profile copy — LevelDB files from an active Chrome session
+        #       cannot be reliably cloned; the extension would load but find no key.
         _nopecha_enabled = bool(config.get("nopechaEnabled"))
         _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
-        _nopecha_ext_dir   = None
-        _worker_profile    = None   # temp copy of master profile for this worker
+        _nopecha_ext_dir = None
 
         if _nopecha_enabled and _nopecha_api_key:
             _nopecha_ext_dir = ensure_nopecha_extension()
             if _nopecha_ext_dir:
-                # Build / reuse the persistent master profile (once per process)
-                _master_profile = await ensure_nopecha_profile(
-                    _nopecha_ext_dir, NOPECHA_EXT_ID, _nopecha_api_key,
-                    brave_path=brave_path or ""
-                )
-
-                if _master_profile and os.path.isdir(_master_profile):
-                    # Copy master profile to a fresh temp dir for this worker so
-                    # concurrent workers don't share LevelDB files (Chrome locks them)
-                    _worker_profile = tempfile.mkdtemp(prefix="np_worker_")
-                    _shutil.copytree(_master_profile, _worker_profile, dirs_exist_ok=True)
-                    start_kw["browser_args"].append(f"--user-data-dir={_worker_profile}")
-                    log.info("[NoPeCHA] Worker using saved session profile — no key injection needed.")
-
+                # Load the extension — key is injected directly after the browser
+                # starts. We do NOT copy Chrome profiles (LevelDB can't be cloned
+                # reliably from a running session; extension reads no key → silent fail).
                 start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
+                log.info("[NoPeCHA] Extension loaded — will auto-inject key after browser start")
             else:
                 log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
         browser = await uc.start(**start_kw)
 
-        # If the profile copy failed or profile couldn't be built, fall back to
-        # per-worker injection so we're never stuck without captcha solving.
-        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir and not _worker_profile:
-            log.info("[NoPeCHA] Falling back to per-worker key injection...")
+        # Always inject the NoPeCHA API key directly into the worker browser.
+        # inject_nopecha_key_auto opens the extension popup, clicks "Enter API key",
+        # fills the key via native events, and presses Enter — fully automatic.
+        if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
+            log.info("[NoPeCHA] Injecting API key into worker browser...")
             await inject_nopecha_key_auto(browser, NOPECHA_EXT_ID, _nopecha_api_key,
                                           ext_dir=_nopecha_ext_dir)
 
