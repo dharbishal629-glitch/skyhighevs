@@ -2852,96 +2852,34 @@ DISPLAY_NAMES = [
 ]
 
 async def worker():
-    """Account creation worker — launches browser, fills form, verifies email."""
+    """
+    Persistent-browser worker.
+
+    Browser and NoPeCHA key are set up ONCE per worker session.
+    The NoPeCHA popup tab stays open for the entire session — it is never
+    navigated away from.  Each Discord account is created in a fresh tab;
+    only that tab is closed when the account is done, so NoPeCHA keeps
+    working without re-injection on every account.
+    """
     global SESSION_CREATED, SESSION_STOP
 
-    if SESSION_STOP:
-        return
-    if SESSION_TARGET > 0 and SESSION_CREATED >= SESSION_TARGET:
-        SESSION_STOP = True
-        return
+    _nopecha_enabled = bool(config.get("nopechaEnabled"))
+    _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+    _nopecha_ext_dir = None
+    adb_rot          = config.get("adb_rotator")
+    browser          = None
 
-    # ADB IP rotation before each account
-    adb_rot = config.get("adb_rotator")
-    if adb_rot:
-        log.info("Rotating IP via ADB...")
-        adb_rot.rotate_ip()
-
-    browser = None
     try:
-        # ── 1. Get email from configured provider ──────────────────────────
-        email_provider = config.get("emailProvider", "cybertemp")
-        email_obj      = None
-
-        if email_provider == "zeusx":
-            zx_key = config.get("zeusxApiKey") or ZEUS_API_KEY
-            if zx_key:
-                result = ZeusXAPI(zx_key).buy_email()
-                if result.get("success"):
-                    email_obj = result
-                    log.success(f"Zeus-X email: {result['email']}")
-                else:
-                    log.warning(f"Zeus-X failed: {result.get('error')} — trying CyberTemp fallback...")
-            else:
-                log.warning("Zeus-X selected but no API key — falling back to CyberTemp.")
-
-        elif email_provider == "hotmail007":
-            hm_key = config.get("hotmail007ClientKey", "")
-            if hm_key:
-                result = Hotmail007API(hm_key).buy_email()
-                if result.get("success"):
-                    email_obj = result
-                    log.success(f"Hotmail007 email: {result['email']}")
-                else:
-                    log.error(f"Hotmail007 failed: {result.get('error')}")
-            else:
-                log.warning("Hotmail007 selected but no client key — falling back to CyberTemp.")
-
-        elif email_provider == "draxono":
-            dx_api_key = config.get("draxonoApiKey", "") or None
-            dx_secret  = config.get("draxonoDomainSecret", "") or None
-            dx_domains = _parse_domains(config.get("draxonoCustomDomains", ""))
-            result = DraxonAPI(api_key=dx_api_key, domain_secret=dx_secret, custom_domains=dx_domains).get_email()
-            if result.get("success"):
-                email_obj = result
-                log.success(f"Draxono email: {result['email']}")
-            else:
-                log.warning(f"Draxono failed: {result.get('error')} — trying CyberTemp fallback...")
-
-        if not email_obj:
-            ct_key     = config.get("cybertempApiKey") or None
-            ct_domains = _parse_domains(config.get("cybertempCustomDomains", ""))
-            ct = CybertempAPI(ct_key, custom_domains=ct_domains)
-            result = ct.get_email()
-            if result.get("success"):
-                email_obj = result
-                email_provider = "cybertemp"
-                log.success(f"CyberTemp email: {result['email']}")
-            else:
-                log.warning(f"CyberTemp failed: {result.get('error')}")
-
-        if not email_obj or not email_obj.get("email"):
-            log.error("Could not obtain an email address — skipping this worker cycle.")
-            await asyncio.sleep(2)
-            return
-
-        account_email    = email_obj["email"]
-        account_password = email_obj.get("password") or generate_password()
-        account_username = generate_username()
-        display_name     = random.choice(DISPLAY_NAMES)
-
-        log.info(f"Worker starting | email={account_email} | provider={email_provider}")
-
-        # ── 2. Launch browser ──────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # ONE-TIME BROWSER + NOPECHA SETUP
+        # ══════════════════════════════════════════════════════════════════════
         brave_path = config.get("brave_executable")
         # NOTE: do NOT pass --disable-blink-features=AutomationControlled.
         # Brave shows a yellow "you are using an unsupported command-line flag"
         # banner above the page when this flag is set. That banner shifts the
-        # whole layout down and our click coordinates land on the wrong row
-        # (e.g. the Year dropdown opens but the listbox click misses).
-        # nodriver already removes the webdriver flag at the CDP level, so this
-        # arg is redundant anyway.
-        start_kw   = {"headless": False, "browser_args": [
+        # whole layout down and our click coordinates land on the wrong row.
+        # nodriver already removes the webdriver flag at the CDP level.
+        start_kw = {"headless": False, "browser_args": [
             "--no-first-run", "--disable-default-apps",
             "--disable-dev-shm-usage",
             "--no-default-browser-check",
@@ -2950,25 +2888,9 @@ async def worker():
             start_kw["browser_executable_path"] = brave_path
             log.info(f"Launching Brave: {brave_path}")
 
-        # ── NoPeCHA extension setup ────────────────────────────────────────
-        # Flow:
-        #  1. ensure_nopecha_extension()  — download CRX once to nopecha_ext/
-        #  2. Worker browser started with --load-extension pointing at nopecha_ext/
-        #  3. inject_nopecha_key_auto()   — runs for EVERY worker browser:
-        #       opens popup, auto-clicks "Enter API key", fills key, presses Enter.
-        #       NoPeCHA validates the key via its servers and saves to chrome.storage.
-        #       No profile copy — LevelDB files from an active Chrome session
-        #       cannot be reliably cloned; the extension would load but find no key.
-        _nopecha_enabled = bool(config.get("nopechaEnabled"))
-        _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
-        _nopecha_ext_dir = None
-
         if _nopecha_enabled and _nopecha_api_key:
             _nopecha_ext_dir = ensure_nopecha_extension()
             if _nopecha_ext_dir:
-                # Load the extension — key is injected directly after the browser
-                # starts. We do NOT copy Chrome profiles (LevelDB can't be cloned
-                # reliably from a running session; extension reads no key → silent fail).
                 start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
                 log.info("[NoPeCHA] Extension loaded — will auto-inject key after browser start")
             else:
@@ -2976,30 +2898,17 @@ async def worker():
 
         browser = await uc.start(**start_kw)
 
-        # Always inject the NoPeCHA API key directly into the worker browser.
-        # inject_nopecha_key_auto opens the extension popup, clicks "Enter API key",
-        # fills the key via native events, and presses Enter — fully automatic.
+        # Inject NoPeCHA key ONCE — the popup tab stays open for the whole
+        # session and is never navigated. Each account opens Discord in a new
+        # tab, so the extension remains active without re-injection.
         if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
-            log.info("[NoPeCHA] Injecting API key into worker browser...")
+            log.info("[NoPeCHA] Injecting API key (once for this browser session)...")
             await inject_nopecha_key_auto(browser, NOPECHA_EXT_ID, _nopecha_api_key,
                                           ext_dir=_nopecha_ext_dir)
+            log.info("[NoPeCHA] Popup tab kept open — key valid for all accounts this session")
 
-        # ── Fingerprint system ─────────────────────────────────────────────
-        # Two separate concerns handled here:
-        #
-        # A) Discord x-fingerprint (API calls via tls_client)
-        #    Fetched from Discord's /api/v9/experiments — returns a real token
-        #    like "1459182762186637497.SDYEKQ0S-IQ56DYu0Px65a3Kn1M".
-        #    Aged ones (from the pool) make the session look established.
-        #    Stored in config["_discord_xfp"] and sent as x-fingerprint header.
-        #
-        # B) Browser CDP injection (Brave browser automation)
-        #    Injects JS overrides (UA, screen, WebGL, canvas noise) into Brave
-        #    so the browser looks like a real desktop session to Discord's JS.
-        #    Uses an independently-generated random browser profile.
-        _discord_xfp = None
+        # Fingerprint: CDP script is injected once and applies to every new tab
         if config.get("fingerprintEnabled"):
-            # ── A. Discord x-fingerprint from aged pool ────────────────────
             min_age = int(config.get("fingerprintMinAgeDays", 0))
             pool_sz = int(config.get("fingerprintPoolSize", 200))
             _fp_entry = get_fingerprint(min_age_days=min_age, pool_size=pool_sz)
@@ -3010,7 +2919,6 @@ async def worker():
             else:
                 log.warning("[Fingerprint] No Discord x-fingerprint available — API calls will proceed without it")
 
-            # ── B. Browser CDP injection (independent browser profile) ─────
             _cdp_profile = _generate_cdp_profile()
             fp_js = make_fingerprint_js(_cdp_profile)
             injected = False
@@ -3027,286 +2935,371 @@ async def worker():
                 config["_fp_js_fallback"] = fp_js
                 log.info(f"[Fingerprint] Will inject browser profile per-page (id={_cdp_profile['id']})")
 
-        page = await safe_browser_get(browser, "https://discord.com/register")
-        log.info("Browser opened — navigated to Discord register page.")
+        # ══════════════════════════════════════════════════════════════════════
+        # PER-ACCOUNT INNER LOOP
+        # Browser and NoPeCHA tab stay alive. Only the Discord tab is opened
+        # and closed for each account.
+        # ══════════════════════════════════════════════════════════════════════
+        while not SESSION_STOP:
+            if SESSION_TARGET > 0 and SESSION_CREATED >= SESSION_TARGET:
+                SESSION_STOP = True
+                break
 
-        # Apply fingerprint fallback if CDP inject wasn't available
-        if config.get("_fp_js_fallback"):
+            discord_tab = None
             try:
-                await page.evaluate(config["_fp_js_fallback"])
-                log.debug("[Fingerprint] Per-page inject applied")
-            except Exception:
-                pass
+                # ADB IP rotation before each account
+                if adb_rot:
+                    log.info("Rotating IP via ADB...")
+                    adb_rot.rotate_ip()
 
-        # Wait for email input to confirm page is ready
-        page_ready = False
-        for _ in range(20):
-            try:
-                if await page.query_selector('input[name="email"]'):
-                    page_ready = True
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-        if not page_ready:
-            log.warning("Page load timeout — continuing anyway")
-        await asyncio.sleep(0.5)
+                # ── 1. Get email from configured provider ──────────────────
+                email_provider = config.get("emailProvider", "cybertemp")
+                email_obj      = None
 
-        # ── 3. Fill registration form ──────────────────────────────────────
-        success = await fill_registration_form(page, account_email, display_name, account_username, account_password)
-        if not success:
-            log.error("Form fill failed — skipping")
-            return
+                if email_provider == "zeusx":
+                    zx_key = config.get("zeusxApiKey") or ZEUS_API_KEY
+                    if zx_key:
+                        result = ZeusXAPI(zx_key).buy_email()
+                        if result.get("success"):
+                            email_obj = result
+                            log.success(f"Zeus-X email: {result['email']}")
+                        else:
+                            log.warning(f"Zeus-X failed: {result.get('error')} — trying CyberTemp fallback...")
+                    else:
+                        log.warning("Zeus-X selected but no API key — falling back to CyberTemp.")
 
-        # ── 4. Captcha solver + wait for account creation ───────────────────
-        log.info("Waiting for captcha solve + account creation...")
-        captcha_gave_up = asyncio.Event()
+                elif email_provider == "hotmail007":
+                    hm_key = config.get("hotmail007ClientKey", "")
+                    if hm_key:
+                        result = Hotmail007API(hm_key).buy_email()
+                        if result.get("success"):
+                            email_obj = result
+                            log.success(f"Hotmail007 email: {result['email']}")
+                        else:
+                            log.error(f"Hotmail007 failed: {result.get('error')}")
+                    else:
+                        log.warning("Hotmail007 selected but no client key — falling back to CyberTemp.")
 
-        async def _wait_manual_captcha():
-            """Poll until hCaptcha iframe disappears (user solved it manually)."""
-            log.info("Manual captcha mode — waiting up to 120s...")
-            for _ in range(240):  # 240 × 0.5s = 120s
+                elif email_provider == "draxono":
+                    dx_api_key = config.get("draxonoApiKey", "") or None
+                    dx_secret  = config.get("draxonoDomainSecret", "") or None
+                    dx_domains = _parse_domains(config.get("draxonoCustomDomains", ""))
+                    result = DraxonAPI(api_key=dx_api_key, domain_secret=dx_secret, custom_domains=dx_domains).get_email()
+                    if result.get("success"):
+                        email_obj = result
+                        log.success(f"Draxono email: {result['email']}")
+                    else:
+                        log.warning(f"Draxono failed: {result.get('error')} — trying CyberTemp fallback...")
+
+                if not email_obj:
+                    ct_key     = config.get("cybertempApiKey") or None
+                    ct_domains = _parse_domains(config.get("cybertempCustomDomains", ""))
+                    ct = CybertempAPI(ct_key, custom_domains=ct_domains)
+                    result = ct.get_email()
+                    if result.get("success"):
+                        email_obj = result
+                        email_provider = "cybertemp"
+                        log.success(f"CyberTemp email: {result['email']}")
+                    else:
+                        log.warning(f"CyberTemp failed: {result.get('error')}")
+
+                if not email_obj or not email_obj.get("email"):
+                    log.error("Could not obtain an email address — skipping this account cycle.")
+                    await asyncio.sleep(2)
+                    continue
+
+                account_email    = email_obj["email"]
+                account_password = email_obj.get("password") or generate_password()
+                account_username = generate_username()
+                display_name     = random.choice(DISPLAY_NAMES)
+
+                log.info(f"Worker starting | email={account_email} | provider={email_provider}")
+
+                # ── 2. Open Discord register in a NEW tab ──────────────────
+                # The NoPeCHA popup tab stays open — we open Discord in a
+                # separate tab so the extension remains active for this and
+                # every future account without re-injection.
+                log.info("[Tab] Opening discord.com/register in new tab...")
+                discord_tab = await browser.get("https://discord.com/register", new_tab=True)
+                log.info("New tab opened — navigated to Discord register page.")
+
+                # Apply fingerprint fallback if CDP inject wasn't available
+                if config.get("_fp_js_fallback"):
+                    try:
+                        await discord_tab.evaluate(config["_fp_js_fallback"])
+                        log.debug("[Fingerprint] Per-page inject applied")
+                    except Exception:
+                        pass
+
+                # Wait for email input to confirm page is ready
+                page_ready = False
+                for _ in range(20):
+                    try:
+                        if await discord_tab.query_selector('input[name="email"]'):
+                            page_ready = True
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+                if not page_ready:
+                    log.warning("Page load timeout — continuing anyway")
                 await asyncio.sleep(0.5)
-                try:
-                    has_captcha = await page.evaluate(
-                        "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
-                    )
-                    if not has_captcha:
-                        log.success("Captcha cleared — continuing!")
-                        return
-                except Exception:
-                    return
-            log.warning("Manual captcha wait timed out (120s)")
-            captcha_gave_up.set()
 
-        async def _captcha_loop():
-            nopecha_enabled = bool(config.get("nopechaEnabled"))
-            nopecha_key     = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
-            solver_enabled  = bool(config.get("captchaSolverEnabled"))
+                # ── 3. Fill registration form ──────────────────────────────
+                success = await fill_registration_form(discord_tab, account_email, display_name, account_username, account_password)
+                if not success:
+                    log.error("Form fill failed — skipping")
+                    continue
 
-            if nopecha_enabled and nopecha_key:
-                # ── NoPeCHA Extension mode ─────────────────────────────────
-                # The browser was launched with the nopecha_profile that has
-                # the extension installed and the API key pre-configured.
-                # NoPeCHA is an extension-based solver — it detects the captcha
-                # visually with a blue cursor and submits the answer automatically.
-                # We must NOT interfere; just wait for the solve signal.
-                await asyncio.sleep(2)  # brief pause for captcha to mount
-                captcha_timeout = int(config.get("captchaTimeoutSeconds", 300))
-                solved = await wait_for_nopecha_solve(page, api_key=nopecha_key, timeout=captcha_timeout)
-                if not solved:
-                    # NoPeCHA timed out but the extension is STILL running in the browser.
-                    # Keep polling for captcha iframe disappearance instead of calling
-                    # manual wait — the extension will keep retrying automatically.
-                    log.warning("[NoPeCHA] Primary timeout hit — extension still active, monitoring...")
-                    _ext_wait = 0
-                    _ext_max  = 300  # up to 5 more minutes while wait_for_account_creation runs
-                    while _ext_wait < _ext_max:
-                        await asyncio.sleep(2)
-                        _ext_wait += 2
+                # ── 4. Captcha solver + wait for account creation ──────────
+                log.info("Waiting for captcha solve + account creation...")
+                captcha_gave_up = asyncio.Event()
+
+                async def _wait_manual_captcha():
+                    """Poll until hCaptcha iframe disappears (user solved it manually)."""
+                    log.info("Manual captcha mode — waiting up to 120s...")
+                    for _ in range(240):  # 240 × 0.5s = 120s
+                        await asyncio.sleep(0.5)
                         try:
-                            url = str(await page.evaluate("window.location.href") or "")
-                            if url and "register" not in url and "login" not in url:
-                                log.success("[NoPeCHA] Captcha eventually solved — page redirected ✓")
-                                return
-                            has_captcha = await page.evaluate(
+                            has_captcha = await discord_tab.evaluate(
                                 "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
                             )
                             if not has_captcha:
-                                log.success("[NoPeCHA] hCaptcha cleared after extended wait ✓")
+                                log.success("Captcha cleared — continuing!")
                                 return
                         except Exception:
-                            return  # page navigated
-                    log.warning("[NoPeCHA] Extended wait exhausted — captcha may still be present")
-                return
+                            return
+                    log.warning("Manual captcha wait timed out (120s)")
+                    captcha_gave_up.set()
 
-            elif solver_enabled:
-                # ── OpenRouter vision solver ───────────────────────────────
-                solved = await solve_captcha_accessibility(page, config)
-                if not solved:
-                    # Solver failed — fall back to manual wait
-                    await _wait_manual_captcha()
+                async def _captcha_loop():
+                    nopecha_enabled = bool(config.get("nopechaEnabled"))
+                    nopecha_key     = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+                    solver_enabled  = bool(config.get("captchaSolverEnabled"))
 
-            else:
-                # ── Manual mode ────────────────────────────────────────────
-                # Check if captcha is actually present before waiting
-                await asyncio.sleep(1.5)
-                try:
-                    has_captcha = await page.evaluate(
-                        "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
-                    )
-                except Exception:
-                    has_captcha = False
-                if has_captcha:
-                    await _wait_manual_captcha()
+                    if nopecha_enabled and nopecha_key:
+                        # NoPeCHA extension mode — extension is already active in this
+                        # browser (popup tab is open, key is set). Just wait for solve.
+                        await asyncio.sleep(2)  # brief pause for captcha to mount
+                        captcha_timeout = int(config.get("captchaTimeoutSeconds", 300))
+                        solved = await wait_for_nopecha_solve(discord_tab, api_key=nopecha_key, timeout=captcha_timeout)
+                        if not solved:
+                            log.warning("[NoPeCHA] Primary timeout hit — extension still active, monitoring...")
+                            _ext_wait = 0
+                            _ext_max  = 300  # up to 5 more minutes
+                            while _ext_wait < _ext_max:
+                                await asyncio.sleep(2)
+                                _ext_wait += 2
+                                try:
+                                    url = str(await discord_tab.evaluate("window.location.href") or "")
+                                    if url and "register" not in url and "login" not in url:
+                                        log.success("[NoPeCHA] Captcha eventually solved — page redirected ✓")
+                                        return
+                                    has_captcha = await discord_tab.evaluate(
+                                        "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+                                    )
+                                    if not has_captcha:
+                                        log.success("[NoPeCHA] hCaptcha cleared after extended wait ✓")
+                                        return
+                                except Exception:
+                                    return  # page navigated
+                            log.warning("[NoPeCHA] Extended wait exhausted — captcha may still be present")
+                        return
 
-        asyncio.ensure_future(_captcha_loop())
+                    elif solver_enabled:
+                        solved = await solve_captcha_accessibility(discord_tab, config)
+                        if not solved:
+                            await _wait_manual_captcha()
 
-        # Wait for account creation (redirect to discord.com/channels/@me)
-        # We use a dedicated task reference so we can tell if IT completed vs gave-up
-        account_task = asyncio.ensure_future(wait_for_account_creation(page, timeout=600))
-        gaveup_task  = asyncio.ensure_future(captcha_gave_up.wait())
+                    else:
+                        await asyncio.sleep(1.5)
+                        try:
+                            has_captcha = await discord_tab.evaluate(
+                                "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
+                            )
+                        except Exception:
+                            has_captcha = False
+                        if has_captcha:
+                            await _wait_manual_captcha()
 
-        done, pending = await asyncio.wait(
-            [account_task, gaveup_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        # Cancel the remaining task to avoid resource leaks
-        for t in pending:
-            t.cancel()
+                asyncio.ensure_future(_captcha_loop())
 
-        # Only count as created if the account_task itself finished with True
-        created = (account_task in done
-                   and not account_task.exception()
-                   and account_task.result() is True)
-        if not created:
-            log.error("Account creation failed — captcha not solved or timed out")
-            return
+                account_task = asyncio.ensure_future(wait_for_account_creation(discord_tab, timeout=600))
+                gaveup_task  = asyncio.ensure_future(captcha_gave_up.wait())
 
-        # ── 5. Extract token ───────────────────────────────────────────────
-        log.info("Extracting Discord token...")
-        token = await extract_token_via_api(account_email, account_password)
+                done, pending = await asyncio.wait(
+                    [account_task, gaveup_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
 
-        # Fallback: try localStorage
-        if not token:
-            try:
-                await page.evaluate(JS_UTILS)
-                token = await page.evaluate('window.utils.waitForDiscordToken(8000)')
-            except Exception:
-                pass
+                created = (account_task in done
+                           and not account_task.exception()
+                           and account_task.result() is True)
+                if not created:
+                    log.error("Account creation failed — captcha not solved or timed out")
+                    continue
 
-        if not token:
-            log.warning(f"No token captured for {account_email} — captcha or rate-limit")
-            return
+                # ── 5. Extract token ───────────────────────────────────────
+                log.info("Extracting Discord token...")
+                token = await extract_token_via_api(account_email, account_password)
 
-        # Clean up token format
-        m = re.search(r'([A-Za-z0-9_-]{20,})\.([A-Za-z0-9_-]{6})\.([A-Za-z0-9_-]{27,})', token)
-        if m:
-            token = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+                if not token:
+                    try:
+                        await discord_tab.evaluate(JS_UTILS)
+                        token = await discord_tab.evaluate('window.utils.waitForDiscordToken(8000)')
+                    except Exception:
+                        pass
 
-        log.success(f"Token: {token[:30]}...")
+                if not token:
+                    log.warning(f"No token captured for {account_email} — captcha or rate-limit")
+                    continue
 
-        # ── 6. Email verification ──────────────────────────────────────────
-        verified, _ = check_email_verified_api(token)
-        if verified:
-            log.success("Email already verified!")
-        else:
-            log.info("Email not verified — fetching verification link...")
-            verify_url = None
+                m = re.search(r'([A-Za-z0-9_-]{20,})\.([A-Za-z0-9_-]{6})\.([A-Za-z0-9_-]{27,})', token)
+                if m:
+                    token = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
 
-            if email_provider == "hotmail007" and email_obj.get("token"):
-                verify_url = fetch_verification_url_graph({
-                    "token": email_obj.get("token", ""),
-                    "uuid":  email_obj.get("uuid", ""),
-                })
-            elif email_provider == "zeusx":
-                # Zeus-X accounts are Outlook — open outlook.com in a new tab to get the email
-                log.info("Opening Outlook.com to fetch verification email for Zeus-X account...")
-                try:
-                    verify_url = fetch_verification_url_graph({
-                        "token": email_obj.get("token", ""),
-                        "uuid":  email_obj.get("uuid", ""),
-                    })
-                except Exception:
-                    pass
-                if not verify_url:
-                    log.warning("Zeus-X: No Graph token available — manual inbox check required")
-            elif email_provider == "cybertemp":
-                ct_key       = config.get("cybertempApiKey") or None
-                ct_inbox_tok = email_obj.get("inbox_token") or None
-                verify_url   = fetch_verification_url_cybertemp(account_email, api_key=ct_key, inbox_token=ct_inbox_tok)
-            elif email_provider == "draxono":
-                dx_api_key = config.get("draxonoApiKey") or None
-                dx_secret  = config.get("draxonoDomainSecret") or None
-                verify_url = fetch_verification_url_draxono(account_email, api_key=dx_api_key, domain_secret=dx_secret)
+                log.success(f"Token: {token[:30]}...")
 
-            if verify_url and not _is_valid_verify_url(verify_url):
-                log.error(f"Refusing to navigate — extracted URL is not a valid verify link: {verify_url}")
-                verify_url = None
+                # ── 6. Email verification ──────────────────────────────────
+                verified, _ = check_email_verified_api(token)
+                if verified:
+                    log.success("Email already verified!")
+                else:
+                    log.info("Email not verified — fetching verification link...")
+                    verify_url = None
 
-            if verify_url:
-                log.success(f"Got verification link — opening: {verify_url[:80]}...")
-                try:
-                    verify_page = await safe_browser_get(browser, verify_url)
-                    await asyncio.sleep(4)
-                    # Poll until Discord confirms verified
-                    for _ in range(24):  # up to 2 minutes
-                        await asyncio.sleep(5)
-                        verified, _ = check_email_verified_api(token)
-                        if verified:
-                            log.success("Email verified successfully!")
-                            break
-                    if not verified:
-                        log.warning("Verification not confirmed after 2 min — may still be processing")
-                except Exception as e:
-                    log.error(f"Error opening verify URL: {e}")
-            else:
-                log.warning("Could not retrieve verification email from inbox")
+                    if email_provider == "hotmail007" and email_obj.get("token"):
+                        verify_url = fetch_verification_url_graph({
+                            "token": email_obj.get("token", ""),
+                            "uuid":  email_obj.get("uuid", ""),
+                        })
+                    elif email_provider == "zeusx":
+                        log.info("Opening Outlook.com to fetch verification email for Zeus-X account...")
+                        try:
+                            verify_url = fetch_verification_url_graph({
+                                "token": email_obj.get("token", ""),
+                                "uuid":  email_obj.get("uuid", ""),
+                            })
+                        except Exception:
+                            pass
+                        if not verify_url:
+                            log.warning("Zeus-X: No Graph token available — manual inbox check required")
+                    elif email_provider == "cybertemp":
+                        ct_key       = config.get("cybertempApiKey") or None
+                        ct_inbox_tok = email_obj.get("inbox_token") or None
+                        verify_url   = fetch_verification_url_cybertemp(account_email, api_key=ct_key, inbox_token=ct_inbox_tok)
+                    elif email_provider == "draxono":
+                        dx_api_key = config.get("draxonoApiKey") or None
+                        dx_secret  = config.get("draxonoDomainSecret") or None
+                        verify_url = fetch_verification_url_draxono(account_email, api_key=dx_api_key, domain_secret=dx_secret)
 
-        # ── 7. Check token status and save to database ────────────────────
-        log.info("Checking token status...")
-        status = check_token(token)
-        log.info(f"Token status: {status}")
+                    if verify_url and not _is_valid_verify_url(verify_url):
+                        log.error(f"Refusing to navigate — extracted URL is not a valid verify link: {verify_url}")
+                        verify_url = None
 
-        if api_client:
-            save_result = api_client.save_token(token, email=account_email, account_pass=account_password, status=status)
+                    if verify_url:
+                        log.success(f"Got verification link — opening: {verify_url[:80]}...")
+                        verify_tab = None
+                        try:
+                            verify_tab = await browser.get(verify_url, new_tab=True)
+                            await asyncio.sleep(4)
+                            for _ in range(24):  # up to 2 minutes
+                                await asyncio.sleep(5)
+                                verified, _ = check_email_verified_api(token)
+                                if verified:
+                                    log.success("Email verified successfully!")
+                                    break
+                            if not verified:
+                                log.warning("Verification not confirmed after 2 min — may still be processing")
+                        except Exception as e:
+                            log.error(f"Error opening verify URL: {e}")
+                        finally:
+                            if verify_tab is not None:
+                                try:
+                                    await verify_tab.close()
+                                except Exception:
+                                    pass
+                    else:
+                        log.warning("Could not retrieve verification email from inbox")
 
-            saved_by   = save_result.get("savedBy")
-            token_id   = save_result.get("tokenId")
-            today_total = save_result.get("todayTotal")
-            is_dup     = save_result.get("duplicate", False)
+                # ── 7. Check token status and save to database ─────────────
+                log.info("Checking token status...")
+                status = check_token(token)
+                log.info(f"Token status: {status}")
 
-            if saved_by:
-                # Server confirmed the DB row was physically written
-                confirm_msg = f"Saved via {saved_by}"
-                if token_id:
-                    confirm_msg += f" (DB #{token_id})"
-                if today_total is not None:
-                    confirm_msg += f" | today: {today_total}"
-                log.success(confirm_msg)
-            elif is_dup:
-                log.warning(f"Duplicate token — already in DB, status refreshed (NOT counted in stats)")
-            else:
-                err = save_result.get("error") or save_result.get("detail") or "unknown error"
-                log.error(f"TOKEN NOT SAVED TO DATABASE — {err}")
-                log.error(f"  Token: {token[:30]}...")
-        else:
-            log.warning("No API client — token was NOT saved (api_client not initialised)")
+                if api_client:
+                    save_result = api_client.save_token(token, email=account_email, account_pass=account_password, status=status)
 
-        with LOCK:
-            SESSION_CREATED += 1
-            created_num = SESSION_CREATED
+                    saved_by    = save_result.get("savedBy")
+                    token_id    = save_result.get("tokenId")
+                    today_total = save_result.get("todayTotal")
+                    is_dup      = save_result.get("duplicate", False)
 
-        status_icon = "+" if status == "VALID" else ("!" if status == "LOCKED" else "-")
-        log.success(f"[{status_icon}] Account #{created_num} done — {status}")
-        print(Colorate.Horizontal(Colors.green_to_cyan, f"  Total this session: {created_num}"))
+                    if saved_by:
+                        confirm_msg = f"Saved via {saved_by}"
+                        if token_id:
+                            confirm_msg += f" (DB #{token_id})"
+                        if today_total is not None:
+                            confirm_msg += f" | today: {today_total}"
+                        log.success(confirm_msg)
+                    elif is_dup:
+                        log.warning(f"Duplicate token — already in DB, status refreshed (NOT counted in stats)")
+                    else:
+                        err = save_result.get("error") or save_result.get("detail") or "unknown error"
+                        log.error(f"TOKEN NOT SAVED TO DATABASE — {err}")
+                        log.error(f"  Token: {token[:30]}...")
+                else:
+                    log.warning("No API client — token was NOT saved (api_client not initialised)")
 
-        # ADB rotation after account (for next cycle)
-        if adb_rot:
-            adb_rot.rotate_ip()
+                with LOCK:
+                    SESSION_CREATED += 1
+                    created_num = SESSION_CREATED
+
+                status_icon = "+" if status == "VALID" else ("!" if status == "LOCKED" else "-")
+                log.success(f"[{status_icon}] Account #{created_num} done — {status}")
+                print(Colorate.Horizontal(Colors.green_to_cyan, f"  Total this session: {created_num}"))
+
+                # ADB rotation after account (for next cycle)
+                if adb_rot:
+                    adb_rot.rotate_ip()
+
+            except Exception as e:
+                log.error(f"Account cycle error: {e}")
+                await asyncio.sleep(2)
+
+            finally:
+                # Close only the Discord tab — NoPeCHA popup tab stays alive
+                if discord_tab is not None:
+                    try:
+                        await discord_tab.close()
+                        log.debug("[Tab] Discord tab closed — NoPeCHA tab still active for next account")
+                    except Exception:
+                        pass
+
+                # Cooldown before next account
+                cooldown = int(config.get("cooldownSeconds", 0))
+                if cooldown > 0:
+                    log.info(f"Cooldown: waiting {cooldown}s before next account...")
+                    for remaining in range(cooldown, 0, -1):
+                        print(f"\r  {Fore.CYAN}Next account in {remaining}s...{Fore.RESET}   ", end="", flush=True)
+                        await asyncio.sleep(1)
+                    print()
+                else:
+                    await asyncio.sleep(1.5)
 
     except Exception as e:
-        log.error(f"Worker error: {e}")
+        log.error(f"Worker session error: {e}")
         await asyncio.sleep(2)
 
     finally:
+        # Stop the browser only when the entire worker session ends
         if browser:
             try:
                 await browser.stop()
             except Exception:
                 pass
-
-        # (No per-worker profile copy to clean up — key is injected directly)
-
-        cooldown = int(config.get("cooldownSeconds", 0))
-        if cooldown > 0:
-            log.info(f"Cooldown: waiting {cooldown}s before next account...")
-            for remaining in range(cooldown, 0, -1):
-                print(f"\r  {Fore.CYAN}Next account in {remaining}s...{Fore.RESET}   ", end="", flush=True)
-                await asyncio.sleep(1)
-            print()
-        else:
-            await asyncio.sleep(1.5)
 
 # ============================================================================
 # MAIN FUNCTION
