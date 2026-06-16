@@ -2851,48 +2851,81 @@ DISPLAY_NAMES = [
     'Ashton','Bradley','Calvin','Derek','Ethan','Fiona','Graham','Harper','Jackson',
 ]
 
-async def _clear_discord_session(browser) -> None:
-    """
-    Wipe Discord's cookies + localStorage via CDP — equivalent to
-    "Clear site data" in DevTools.
+_JS_CLEAR_DISCORD_SESSION = """
+(function() {
+    try { localStorage.clear(); } catch(e) {}
+    try { sessionStorage.clear(); } catch(e) {}
+    try {
+        document.cookie.split(';').forEach(function(c) {
+            var name = c.split('=')[0].trim();
+            var expire = 'expires=Thu, 01 Jan 1970 00:00:00 UTC;';
+            document.cookie = name + '=;' + expire + 'path=/;domain=.discord.com;';
+            document.cookie = name + '=;' + expire + 'path=/;domain=discord.com;';
+            document.cookie = name + '=;' + expire + 'path=/;';
+        });
+    } catch(e) {}
+    return 'ok';
+})();
+"""
 
-    This is NOT a logout: it never calls Discord's /api/v9/auth/logout
-    endpoint, so the token that was already extracted remains valid.
-    Without this, the old account's session cookie stays in the browser
-    and the next discord.com/register tab redirects straight to the
-    home feed instead of the registration form.
+async def _clear_discord_session(browser, page=None) -> None:
     """
-    # Guard: browser or its CDP connection may be None if the tab closed
-    # in a bad state or the browser was never fully initialised.
-    if browser is None or getattr(browser, "connection", None) is None:
-        log.debug("[Session] Browser/connection unavailable — skipping session clear")
-        return
+    Wipe Discord's cookies + localStorage so the next tab opens fresh
+    on the register page instead of redirecting to the home feed.
 
-    try:
-        from nodriver import cdp as _cdp
-        # Preferred: clear only discord.com origin data (cookies + storage)
-        await browser.connection.send(
-            _cdp.storage.clear_data_for_origin(
-                origin="https://discord.com",
-                storage_types="cookies,local_storage,indexedDB,service_workers,cache_storage",
+    Strategy (in order):
+      1. CDP Storage.clearDataForOrigin via browser.connection  (best)
+      2. CDP Network.clearBrowserCookies via browser.connection (fallback)
+      3. JS execution on the discord tab to wipe localStorage +
+         sessionStorage + non-httpOnly cookies              (JS fallback)
+
+    This does NOT call Discord's logout API — the token already
+    extracted remains valid on Discord's servers.
+
+    IMPORTANT: call this BEFORE closing the discord tab so that
+    browser.connection is still alive and the JS fallback can run.
+    """
+    cdp_ok = False
+
+    # ── 1 & 2: CDP path (requires live browser.connection) ────────────────
+    if browser is not None and getattr(browser, "connection", None) is not None:
+        try:
+            from nodriver import cdp as _cdp
+            await browser.connection.send(
+                _cdp.storage.clear_data_for_origin(
+                    origin="https://discord.com",
+                    storage_types="cookies,local_storage,indexedDB,service_workers,cache_storage",
+                )
             )
-        )
-        log.debug("[Session] discord.com site data cleared — next tab will start fresh")
-        return
-    except Exception as e:
-        log.debug(f"[Session] clear_data_for_origin failed ({e}), falling back to clear_browser_cookies")
+            log.debug("[Session] discord.com site data cleared via CDP ✓")
+            cdp_ok = True
+        except Exception as e:
+            log.debug(f"[Session] clearDataForOrigin failed ({e}), trying clearBrowserCookies...")
 
-    # Fallback: clear all cookies in the browser profile (broader but reliable)
-    # Re-check connection — it may have dropped between the two attempts.
-    if getattr(browser, "connection", None) is None:
-        log.debug("[Session] Browser connection dropped before cookie fallback — skipping")
-        return
-    try:
-        from nodriver import cdp as _cdp
-        await browser.connection.send(_cdp.network.clear_browser_cookies())
-        log.debug("[Session] All browser cookies cleared (fallback)")
-    except Exception as e:
-        log.debug(f"[Session] Cookie clear fallback also failed: {e}")
+        if not cdp_ok and getattr(browser, "connection", None) is not None:
+            try:
+                from nodriver import cdp as _cdp
+                await browser.connection.send(_cdp.network.clear_browser_cookies())
+                log.debug("[Session] All browser cookies cleared via CDP ✓")
+                cdp_ok = True
+            except Exception as e:
+                log.debug(f"[Session] clearBrowserCookies also failed ({e})")
+    else:
+        log.debug("[Session] browser.connection unavailable — skipping CDP clear")
+
+    # ── 3: JS fallback — wipes localStorage, sessionStorage, JS-accessible cookies ──
+    # Runs on the discord tab while it is still open.  httpOnly cookies
+    # are NOT cleared here (CDP handles those above), but localStorage
+    # and sessionStorage alone prevent the "already logged in" redirect.
+    if page is not None:
+        try:
+            await page.evaluate(_JS_CLEAR_DISCORD_SESSION)
+            log.debug("[Session] localStorage / sessionStorage / JS cookies cleared via JS ✓")
+        except Exception as e:
+            log.debug(f"[Session] JS clear failed ({e})")
+
+    if not cdp_ok:
+        log.debug("[Session] CDP clear skipped/failed — JS fallback was the only cleanup")
 
 
 async def worker():
@@ -3314,20 +3347,19 @@ async def worker():
                 await asyncio.sleep(2)
 
             finally:
-                # Close only the Discord tab — NoPeCHA popup tab stays alive
+                # ── Clear session FIRST — must happen while the tab is still
+                # open so browser.connection is alive and the JS fallback can
+                # run on the discord tab.  Closing the tab BEFORE this call
+                # drops browser.connection in nodriver (see bug: "skipping").
+                await _clear_discord_session(browser, page=discord_tab)
+
+                # ── Now close the Discord tab — NoPeCHA popup tab stays alive
                 if discord_tab is not None:
                     try:
                         await discord_tab.close()
                         log.debug("[Tab] Discord tab closed — NoPeCHA tab still active for next account")
                     except Exception:
                         pass
-
-                # Clear discord.com session data so the next tab opens on
-                # the register page instead of redirecting to the home feed.
-                # This uses CDP (equivalent to browser "Clear site data") —
-                # it does NOT call the Discord logout API, so the token we
-                # already extracted stays valid on Discord's servers.
-                await _clear_discord_session(browser)
 
                 # Cooldown before next account
                 cooldown = int(config.get("cooldownSeconds", 0))
