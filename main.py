@@ -3082,6 +3082,35 @@ async def _clear_discord_session(browser, page=None) -> None:
         log.debug("[Session] CDP clear skipped/failed — JS fallback was the only cleanup")
 
 
+def _refresh_nopecha_key_from_server() -> str:
+    """
+    Fetch the latest NopeCHA API key from the dashboard right now.
+    Returns the key string, or "" if unreachable / not set.
+    The tool config endpoint is open to any valid worker key — no admin needed.
+    """
+    if not api_client:
+        return ""
+    try:
+        resp = requests.get(
+            f"{api_client.base_url}/api/config/worker",
+            headers=api_client._headers(),
+            timeout=10,
+            verify=False,
+        )
+        if resp.ok:
+            cfg = resp.json().get("config", {})
+            key = (cfg.get("nopechaApiKey") or cfg.get("nopechaKey") or "").strip()
+            # Also sync other captcha settings so they are always current
+            for field in ("nopechaEnabled", "captchaSolverEnabled", "openRouterApiKey",
+                          "openRouterModel", "captchaMaxAttempts", "captchaTimeoutSeconds"):
+                if field in cfg:
+                    config[field] = cfg[field]
+            return key
+    except Exception as e:
+        log.debug(f"[NoPeCHA] Key refresh failed: {e}")
+    return ""
+
+
 async def worker():
     """
     Per-account-browser worker.
@@ -3089,30 +3118,31 @@ async def worker():
     A brand-new browser instance is started for EVERY Discord account:
       · 100 % clean session guaranteed — no cookies, localStorage or
         extension state leaks between accounts.
-      · NoPeCHA API key is injected via chrome.storage.local through a
-        tiny silent extension page — the popup UI is never opened.
+      · NoPeCHA API key is fetched FRESH from the dashboard before every
+        browser launch — changing the key on the website takes effect on
+        the very next account without restarting the tool.
+      · Key is injected directly into the extension's background script so
+        it is active the instant the service worker starts.
       · Browser is fully stopped after each account (browser.stop()).
 
-    Captcha solving works exactly as before: NoPeCHA's content script
-    detects hCaptcha on the Discord register page and solves it
-    automatically using the key that was injected into storage.
+    Captcha solving chain (most reliable → manual fallback):
+      1. NoPeCHA extension  — fully automatic, preferred
+      2. Accessibility solver (OpenRouter/AI)  — kicks in if NoPeCHA fails
+      3. Manual  — user solves in the browser window (last resort)
     """
     global SESSION_CREATED, SESSION_STOP
 
-    _nopecha_enabled = bool(config.get("nopechaEnabled"))
-    _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
-    _nopecha_ext_dir = None
-    adb_rot          = config.get("adb_rotator")
+    _nopecha_enabled     = bool(config.get("nopechaEnabled"))
+    _nopecha_api_key     = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+    _nopecha_ext_dir     = None
+    _last_injected_key   = ""   # track what key is currently baked into the extension
+    adb_rot              = config.get("adb_rotator")
 
-    # ── Download extension + inject key into its background script (once) ───────
-    # The key is patched directly into the extension's background JS file.
-    # Chrome picks it up the moment the service worker starts — no browser
-    # tab, no popup UI, and no network call needed at injection time.
-    if _nopecha_enabled and _nopecha_api_key:
+    # ── Ensure extension is downloaded (one-time, background-script patch happens
+    #    inside the loop so the freshest key is always used) ────────────────────
+    if _nopecha_enabled:
         _nopecha_ext_dir = ensure_nopecha_extension()
-        if _nopecha_ext_dir:
-            inject_nopecha_key_into_extension_files(_nopecha_ext_dir, _nopecha_api_key)
-        else:
+        if not _nopecha_ext_dir:
             log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -3131,6 +3161,28 @@ async def worker():
             if adb_rot:
                 log.info("Rotating IP via ADB...")
                 adb_rot.rotate_ip()
+
+            # ── Always fetch the latest NoPeCHA key from the dashboard ─────
+            # This means any key you save on the website is used immediately
+            # on the very next account — no tool restart needed.
+            if _nopecha_enabled:
+                fresh_key = _refresh_nopecha_key_from_server()
+                if fresh_key:
+                    _nopecha_api_key = fresh_key
+                    config["nopechaApiKey"] = fresh_key
+                elif not _nopecha_api_key:
+                    # fall back to whatever was in config at startup
+                    _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+
+            # ── Re-inject key into extension if it changed (or first run) ──
+            # This guarantees the extension always has the correct, current key.
+            if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
+                if _nopecha_api_key != _last_injected_key:
+                    if inject_nopecha_key_into_extension_files(_nopecha_ext_dir, _nopecha_api_key):
+                        _last_injected_key = _nopecha_api_key
+                        log.info(f"[NoPeCHA] Key updated in extension ✓ ({_nopecha_api_key[:8]}...)")
+                    else:
+                        log.warning("[NoPeCHA] Key re-injection failed — captcha may not solve")
 
             # ── Start a FRESH browser for this account ─────────────────────
             # NOTE: do NOT pass --disable-blink-features=AutomationControlled.
@@ -3307,54 +3359,73 @@ async def worker():
                 captcha_gave_up.set()
 
             async def _captcha_loop():
+                # Always read live values — key may have been refreshed this iteration
                 nopecha_enabled = bool(config.get("nopechaEnabled"))
                 nopecha_key     = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
                 solver_enabled  = bool(config.get("captchaSolverEnabled"))
 
-                if nopecha_enabled and nopecha_key:
-                    # NoPeCHA extension mode — key is already in chrome.storage.local,
-                    # extension detects the captcha and solves it automatically.
-                    await asyncio.sleep(2)  # brief pause for captcha to mount
-                    captcha_timeout = int(config.get("captchaTimeoutSeconds", 300))
-                    solved = await wait_for_nopecha_solve(discord_tab, api_key=nopecha_key, timeout=captcha_timeout)
-                    if not solved:
-                        log.warning("[NoPeCHA] Primary timeout hit — extension still active, monitoring...")
-                        _ext_wait = 0
-                        _ext_max  = 300  # up to 5 more minutes
-                        while _ext_wait < _ext_max:
-                            await asyncio.sleep(2)
-                            _ext_wait += 2
-                            try:
-                                url = str(await discord_tab.evaluate("window.location.href") or "")
-                                if url and "register" not in url and "login" not in url:
-                                    log.success("[NoPeCHA] Captcha eventually solved — page redirected ✓")
-                                    return
-                                has_captcha = await discord_tab.evaluate(
-                                    "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
-                                )
-                                if not has_captcha:
-                                    log.success("[NoPeCHA] hCaptcha cleared after extended wait ✓")
-                                    return
-                            except Exception:
-                                return  # page navigated
-                        log.warning("[NoPeCHA] Extended wait exhausted — captcha may still be present")
+                # ── Quick check: is there even a captcha? ──────────────────
+                await asyncio.sleep(2)  # let the page settle after form submit
+                try:
+                    has_captcha_now = await discord_tab.evaluate(
+                        "(()=>{ try{ return !!document.querySelector('iframe[src*=\"hcaptcha.com\"]'); } catch(e){ return false; } })()"
+                    )
+                except Exception:
+                    has_captcha_now = True  # assume yes if JS fails
+
+                if not has_captcha_now:
+                    log.info("[Captcha] No captcha detected — proceeding")
                     return
 
-                elif solver_enabled:
-                    solved = await solve_captcha_accessibility(discord_tab, config)
-                    if not solved:
-                        await _wait_manual_captcha()
+                log.info("[Captcha] hCaptcha detected — starting solve chain...")
 
-                else:
-                    await asyncio.sleep(1.5)
-                    try:
-                        has_captcha = await discord_tab.evaluate(
-                            "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
-                        )
-                    except Exception:
-                        has_captcha = False
-                    if has_captcha:
-                        await _wait_manual_captcha()
+                # ──────────────────────────────────────────────────────────
+                # STEP 1 — NoPeCHA extension (preferred, fully automatic)
+                # ──────────────────────────────────────────────────────────
+                nopecha_solved = False
+                if nopecha_enabled and nopecha_key:
+                    captcha_timeout = int(config.get("captchaTimeoutSeconds", 120))
+                    log.info(f"[Captcha] Step 1/3 — NoPeCHA extension solving (timeout={captcha_timeout}s)...")
+                    nopecha_solved = await wait_for_nopecha_solve(
+                        discord_tab, api_key=nopecha_key, timeout=captcha_timeout
+                    )
+                    if nopecha_solved:
+                        log.success("[Captcha] NoPeCHA solved the captcha ✓")
+                        return
+                    log.warning("[Captcha] NoPeCHA did not solve within timeout — trying next method...")
+
+                # ──────────────────────────────────────────────────────────
+                # STEP 2 — Accessibility / AI solver (fallback)
+                # Runs if NoPeCHA failed OR NoPeCHA is not enabled.
+                # Also runs automatically when captchaSolverEnabled=True.
+                # ──────────────────────────────────────────────────────────
+                # Re-check: captcha may already be gone after NoPeCHA's attempt
+                try:
+                    still_has_captcha = await discord_tab.evaluate(
+                        "(()=>{ try{ return !!document.querySelector('iframe[src*=\"hcaptcha.com\"]'); } catch(e){ return false; } })()"
+                    )
+                except Exception:
+                    still_has_captcha = False
+
+                if not still_has_captcha:
+                    log.success("[Captcha] Captcha cleared (detected via NoPeCHA late-solve) ✓")
+                    return
+
+                if solver_enabled or nopecha_enabled:
+                    # Use accessibility solver as fallback regardless of captchaSolverEnabled
+                    # flag — if NoPeCHA was enabled but failed we still want to try
+                    log.info("[Captcha] Step 2/3 — Accessibility solver (AI)...")
+                    accessibility_solved = await solve_captcha_accessibility(discord_tab, config)
+                    if accessibility_solved:
+                        log.success("[Captcha] Accessibility solver solved the captcha ✓")
+                        return
+                    log.warning("[Captcha] Accessibility solver could not solve — falling back to manual")
+
+                # ──────────────────────────────────────────────────────────
+                # STEP 3 — Manual fallback (last resort)
+                # ──────────────────────────────────────────────────────────
+                log.info("[Captcha] Step 3/3 — Waiting for manual solve (120s)...")
+                await _wait_manual_captcha()
 
             asyncio.ensure_future(_captcha_loop())
 
