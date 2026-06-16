@@ -2737,19 +2737,49 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
     # Always include the well-known fields regardless of version
     key_names.update(["key", "api_key", "apiKey", "nopechaKey", "nopecha_key"])
 
-    # Build the individual set() calls
-    set_stmts = "".join(
-        f'chrome.storage.local.set({{"{k}":K}});'
-        for k in sorted(key_names)
-    )
-    # Also set a combined object for versions that read multiple fields at once
+    # Build combined storage object for all discovered + well-known key names
     combined = "{" + ",".join(f'"{k}":K' for k in sorted(key_names)) + "}"
 
+    # ── Two-layer injection ────────────────────────────────────────────────────
+    # Layer 1 (async, for persistence): chrome.storage.local.set() — stores the
+    #   key so it survives service-worker restarts.
+    # Layer 2 (synchronous guarantee): override chrome.storage.local.get so that
+    #   every call the extension makes to read its API key returns our value
+    #   immediately — this eliminates the race where NopeCHA reads storage before
+    #   the async set() has finished writing, causing it to silently get an empty
+    #   key and skip solving the captcha.
+    # Both layers together mean the key is available the instant the service
+    # worker starts, and also persisted for subsequent restarts.
     inject_block = (
         f'{_NOPECHA_INJECT_MARKER}\n'
-        f'(function(){{try{{var K="{safe_key}";'
-        f'{set_stmts}'
-        f'chrome.storage.local.set({combined});'
+        f'(function(){{try{{\n'
+        f'  var K="{safe_key}";\n'
+        f'  var _KS={combined};\n'
+        # Layer 1: persist to storage (async)
+        f'  try{{chrome.storage.local.set(_KS);}}catch(e){{}}\n'
+        f'  try{{chrome.storage.sync.set(_KS);}}catch(e){{}}\n'
+        # Layer 2: override get() so reads return our key synchronously
+        f'  var _olg=chrome.storage.local.get.bind(chrome.storage.local);\n'
+        f'  chrome.storage.local.get=function(q,cb){{\n'
+        f'    _olg(q,function(r){{\n'
+        f'      r=r||{{}};\n'
+        f'      var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
+        f'      if(ks.length===0){{Object.assign(r,_KS);}}\n'
+        f'      else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
+        f'      if(cb)cb(r);\n'
+        f'    }});\n'
+        f'  }};\n'
+        # Mirror override for chrome.storage.sync.get (some NopeCHA versions use sync)
+        f'  var _osg=chrome.storage.sync.get.bind(chrome.storage.sync);\n'
+        f'  chrome.storage.sync.get=function(q,cb){{\n'
+        f'    _osg(q,function(r){{\n'
+        f'      r=r||{{}};\n'
+        f'      var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
+        f'      if(ks.length===0){{Object.assign(r,_KS);}}\n'
+        f'      else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
+        f'      if(cb)cb(r);\n'
+        f'    }});\n'
+        f'  }};\n'
         f'}}catch(e){{}}}}());\n'
         f'{_NOPECHA_INJECT_END}\n'
     )
@@ -3119,6 +3149,12 @@ async def worker():
 
             if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
                 start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
+                # Required for Brave/Chrome to load unpacked extensions from disk.
+                # Without this flag newer Brave versions silently block the extension's
+                # content scripts from injecting into pages, so NopeCHA loads but never
+                # interacts with hCaptcha iframes.
+                start_kw["browser_args"].append(f"--disable-extensions-except={_nopecha_ext_dir}")
+                start_kw["browser_args"].append("--allow-extensions-from-unpacked-dirs")
 
             browser = await uc.start(**start_kw)
             log.debug("[Browser] Fresh instance started")
