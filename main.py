@@ -2862,6 +2862,12 @@ async def _clear_discord_session(browser) -> None:
     and the next discord.com/register tab redirects straight to the
     home feed instead of the registration form.
     """
+    # Guard: browser or its CDP connection may be None if the tab closed
+    # in a bad state or the browser was never fully initialised.
+    if browser is None or getattr(browser, "connection", None) is None:
+        log.debug("[Session] Browser/connection unavailable — skipping session clear")
+        return
+
     try:
         from nodriver import cdp as _cdp
         # Preferred: clear only discord.com origin data (cookies + storage)
@@ -2877,6 +2883,10 @@ async def _clear_discord_session(browser) -> None:
         log.debug(f"[Session] clear_data_for_origin failed ({e}), falling back to clear_browser_cookies")
 
     # Fallback: clear all cookies in the browser profile (broader but reliable)
+    # Re-check connection — it may have dropped between the two attempts.
+    if getattr(browser, "connection", None) is None:
+        log.debug("[Session] Browser connection dropped before cookie fallback — skipping")
+        return
     try:
         from nodriver import cdp as _cdp
         await browser.connection.send(_cdp.network.clear_browser_cookies())
