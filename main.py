@@ -2404,10 +2404,28 @@ def _get_tool_base_dir() -> str:
     if argv0 and argv0 not in ("<secure-memory>", "", "-c"):
         abs_path = os.path.abspath(argv0)
         if os.path.isfile(abs_path):
-            return os.path.dirname(abs_path)
+            candidate = os.path.dirname(abs_path)
+            # Reject the path if it is inside a zip temp-extraction dir.
+            # When a user runs an exe directly from inside a .zip file in Windows
+            # Explorer, Windows extracts to a temp folder whose name contains the
+            # zip filename (e.g. "..._skyhighgen.zip\").  nopecha_ext must NOT go
+            # there — it would be deleted when the temp dir is cleaned up.
+            if ".zip" not in candidate:
+                return candidate
 
-    # Last resort: current working directory (where the user ran the tool from)
-    return os.getcwd()
+    # Current working directory is reliable: Windows sets CWD to the exe's
+    # folder when launched via Explorer (even from a zip temp-extraction).
+    cwd = os.getcwd()
+    # Prefer cwd over temp paths
+    temp_dir = os.environ.get("TEMP", os.environ.get("TMP", "")).lower()
+    if temp_dir and cwd.lower().startswith(temp_dir):
+        # cwd is also inside temp — fall back to the parent of argv0 anyway
+        argv0 = (sys.argv or [""])[0]
+        if argv0 and argv0 not in ("<secure-memory>", "", "-c"):
+            abs_path = os.path.abspath(argv0)
+            if os.path.isfile(abs_path):
+                return os.path.dirname(abs_path)
+    return cwd
 
 
 def ensure_nopecha_extension() -> Optional[str]:
@@ -2781,27 +2799,29 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
         # Layer 3a: persist to storage (async, for subsequent restarts)
         f'  try{{chrome.storage.local.set(_KS);}}catch(e){{}}\n'
         f'  try{{chrome.storage.sync.set(_KS);}}catch(e){{}}\n'
-        # Layer 3b: override get() so reads return our key synchronously
-        f'  var _olg=chrome.storage.local.get.bind(chrome.storage.local);\n'
-        f'  chrome.storage.local.get=function(q,cb){{\n'
-        f'    _olg(q,function(r){{\n'
-        f'      r=r||{{}};\n'
-        f'      var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
-        f'      if(ks.length===0){{Object.assign(r,_KS);}}\n'
-        f'      else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
-        f'      if(cb)cb(r);\n'
-        f'    }});\n'
-        f'  }};\n'
-        f'  var _osg=chrome.storage.sync.get.bind(chrome.storage.sync);\n'
-        f'  chrome.storage.sync.get=function(q,cb){{\n'
-        f'    _osg(q,function(r){{\n'
-        f'      r=r||{{}};\n'
-        f'      var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
-        f'      if(ks.length===0){{Object.assign(r,_KS);}}\n'
-        f'      else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
-        f'      if(cb)cb(r);\n'
-        f'    }});\n'
-        f'  }};\n'
+        # Layer 3b: override get() — supports BOTH callback API and Promise API.
+        # NopeCHA MV3 service workers use the Promise form:
+        #   const r = await chrome.storage.local.get("key");
+        # The old callback-only override returned undefined for these calls, meaning
+        # NopeCHA received no key and silently skipped solving.  We now always
+        # return a real Promise AND call the callback when provided.
+        f'  function _mkGet(orig){{\n'
+        f'    return function(q,cb){{\n'
+        f'      var p=new Promise(function(resolve){{\n'
+        f'        orig(q,function(r){{\n'
+        f'          r=r||{{}};\n'
+        f'          var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
+        f'          if(ks.length===0){{Object.assign(r,_KS);}}\n'
+        f'          else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
+        f'          resolve(r);\n'
+        f'        }});\n'
+        f'      }});\n'
+        f'      if(typeof cb==="function")p.then(cb);\n'
+        f'      return p;\n'
+        f'    }};\n'
+        f'  }}\n'
+        f'  chrome.storage.local.get=_mkGet(chrome.storage.local.get.bind(chrome.storage.local));\n'
+        f'  chrome.storage.sync.get=_mkGet(chrome.storage.sync.get.bind(chrome.storage.sync));\n'
         f'}}catch(e){{}}}}());\n'
         f'{_NOPECHA_INJECT_END}\n'
     )
