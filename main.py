@@ -2386,10 +2386,28 @@ def _get_nopecha_popup_path(ext_dir: str) -> str:
 
 
 def _get_tool_base_dir() -> str:
-    """Return the directory containing the tool (exe or script)."""
+    """
+    Return the directory where the tool lives on disk.
+
+    launcher.py executes main.py in-memory via exec(), so __file__ is set to
+    '<secure-memory>' — a non-path string that gives a wrong base dir.
+    sys.argv[0] is always the actual launcher script/exe path on disk, so we
+    use that instead.  This ensures nopecha_ext/ is created next to the tool,
+    not in some temp extraction directory.
+    """
     if getattr(sys, "frozen", False):
+        # PyInstaller frozen exe — sys.executable is the .exe path on disk
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+
+    # Script / in-memory execution: use sys.argv[0] (the launcher file on disk)
+    argv0 = (sys.argv or [""])[0]
+    if argv0 and argv0 not in ("<secure-memory>", "", "-c"):
+        abs_path = os.path.abspath(argv0)
+        if os.path.isfile(abs_path):
+            return os.path.dirname(abs_path)
+
+    # Last resort: current working directory (where the user ran the tool from)
+    return os.getcwd()
 
 
 def ensure_nopecha_extension() -> Optional[str]:
@@ -2740,25 +2758,30 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
     # Build combined storage object for all discovered + well-known key names
     combined = "{" + ",".join(f'"{k}":K' for k in sorted(key_names)) + "}"
 
-    # ── Two-layer injection ────────────────────────────────────────────────────
-    # Layer 1 (async, for persistence): chrome.storage.local.set() — stores the
-    #   key so it survives service-worker restarts.
-    # Layer 2 (synchronous guarantee): override chrome.storage.local.get so that
-    #   every call the extension makes to read its API key returns our value
-    #   immediately — this eliminates the race where NopeCHA reads storage before
-    #   the async set() has finished writing, causing it to silently get an empty
-    #   key and skip solving the captcha.
-    # Both layers together mean the key is available the instant the service
-    # worker starts, and also persisted for subsequent restarts.
+    # ── Three-layer injection (most reliable first) ────────────────────────────
+    # Layer 1 — manifest read (synchronous, zero race-condition risk):
+    #   chrome.runtime.getManifest() is available synchronously the instant the
+    #   service worker runs.  inject_nopecha_key_into_manifest() writes the key
+    #   into manifest.json BEFORE Chrome even loads the extension, so the key
+    #   is already there when this line executes.  If for some reason the
+    #   manifest field is empty, we fall back to the hardcoded value below.
+    # Layer 2 — hardcoded key (synchronous, belt-and-suspenders):
+    #   The key is embedded verbatim in the script — always available.
+    # Layer 3 — storage set + get override (async persistence + future restarts):
+    #   Persists the key to chrome.storage so it survives service-worker restarts,
+    #   and overrides get() so any code that reads storage also gets the right key.
     inject_block = (
         f'{_NOPECHA_INJECT_MARKER}\n'
         f'(function(){{try{{\n'
-        f'  var K="{safe_key}";\n'
+        # Layer 1 + 2: read key from manifest first, fall back to hardcoded
+        f'  var _m=(typeof chrome!=="undefined"&&chrome.runtime&&chrome.runtime.getManifest)?chrome.runtime.getManifest():{{}};\n'
+        f'  var K=(_m.nopecha_key||_m.key||"{safe_key}");\n'
+        f'  if(!K)K="{safe_key}";\n'
         f'  var _KS={combined};\n'
-        # Layer 1: persist to storage (async)
+        # Layer 3a: persist to storage (async, for subsequent restarts)
         f'  try{{chrome.storage.local.set(_KS);}}catch(e){{}}\n'
         f'  try{{chrome.storage.sync.set(_KS);}}catch(e){{}}\n'
-        # Layer 2: override get() so reads return our key synchronously
+        # Layer 3b: override get() so reads return our key synchronously
         f'  var _olg=chrome.storage.local.get.bind(chrome.storage.local);\n'
         f'  chrome.storage.local.get=function(q,cb){{\n'
         f'    _olg(q,function(r){{\n'
@@ -2769,7 +2792,6 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
         f'      if(cb)cb(r);\n'
         f'    }});\n'
         f'  }};\n'
-        # Mirror override for chrome.storage.sync.get (some NopeCHA versions use sync)
         f'  var _osg=chrome.storage.sync.get.bind(chrome.storage.sync);\n'
         f'  chrome.storage.sync.get=function(q,cb){{\n'
         f'    _osg(q,function(r){{\n'
@@ -2807,6 +2829,40 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
 
     except Exception as e:
         log.warning(f"[NoPeCHA] File injection failed ({bg_filename}): {e}")
+        return False
+
+
+def inject_nopecha_key_into_manifest(ext_dir: str, api_key: str) -> bool:
+    """
+    Write the NoPeCHA API key directly into the extension's manifest.json.
+
+    This is the approach used by other generators (e.g. Moon Gen):
+      • The key is written into manifest.json BEFORE Chrome loads the extension.
+      • The background script can then read it synchronously via
+        chrome.runtime.getManifest().nopecha_key  (or .key) — zero async race.
+      • No popup, no chrome.storage, no timing dependency.
+
+    We write the key under both "nopecha_key" and "key" field names so the
+    extension finds it regardless of which field name its version uses.
+    """
+    import json as _json
+
+    manifest_path = os.path.join(ext_dir, "manifest.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = _json.load(f)
+
+        manifest["nopecha_key"] = api_key
+        manifest["key"]         = api_key
+
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            _json.dump(manifest, f, indent=2)
+
+        log.success(f"[NoPeCHA] Key injected into manifest.json ✓")
+        return True
+
+    except Exception as e:
+        log.warning(f"[NoPeCHA] manifest.json injection failed: {e}")
         return False
 
 
@@ -3125,10 +3181,9 @@ async def worker():
         it is active the instant the service worker starts.
       · Browser is fully stopped after each account (browser.stop()).
 
-    Captcha solving chain (most reliable → manual fallback):
-      1. NoPeCHA extension  — fully automatic, preferred
-      2. Accessibility solver (OpenRouter/AI)  — kicks in if NoPeCHA fails
-      3. Manual  — user solves in the browser window (last resort)
+    Captcha solving:
+      1. NoPeCHA extension  — automatic (key injected into manifest.json + background script)
+      2. Manual  — user solves in the browser window (if NoPeCHA times out)
     """
     global SESSION_CREATED, SESSION_STOP
 
@@ -3175,14 +3230,18 @@ async def worker():
                     _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
 
             # ── Re-inject key into extension if it changed (or first run) ──
-            # This guarantees the extension always has the correct, current key.
+            # Uses the Moon Gen approach: key goes into manifest.json first so
+            # chrome.runtime.getManifest() returns it synchronously — zero race.
+            # Also patches the background script for belt-and-suspenders coverage.
             if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
                 if _nopecha_api_key != _last_injected_key:
+                    # PRIMARY: inject key into manifest.json (synchronous, reliable)
+                    inject_nopecha_key_into_manifest(_nopecha_ext_dir, _nopecha_api_key)
+                    # SECONDARY: also patch background script (belt-and-suspenders)
                     if inject_nopecha_key_into_extension_files(_nopecha_ext_dir, _nopecha_api_key):
                         _last_injected_key = _nopecha_api_key
-                        log.info(f"[NoPeCHA] Key updated in extension ✓ ({_nopecha_api_key[:8]}...)")
                     else:
-                        log.warning("[NoPeCHA] Key re-injection failed — captcha may not solve")
+                        log.warning("[NoPeCHA] Background script patch failed (manifest.json still injected)")
 
             # ── Start a FRESH browser for this account ─────────────────────
             # NOTE: do NOT pass --disable-blink-features=AutomationControlled.
@@ -3377,54 +3436,33 @@ async def worker():
                     log.info("[Captcha] No captcha detected — proceeding")
                     return
 
-                log.info("[Captcha] hCaptcha detected — starting solve chain...")
+                log.info("[Captcha] hCaptcha detected — NoPeCHA solving...")
 
                 # ──────────────────────────────────────────────────────────
-                # STEP 1 — NoPeCHA extension (preferred, fully automatic)
+                # STEP 1 — NoPeCHA extension (automatic)
                 # ──────────────────────────────────────────────────────────
-                nopecha_solved = False
                 if nopecha_enabled and nopecha_key:
                     captcha_timeout = int(config.get("captchaTimeoutSeconds", 120))
-                    log.info(f"[Captcha] Step 1/3 — NoPeCHA extension solving (timeout={captcha_timeout}s)...")
+                    log.info(f"[Captcha] Step 1/2 — NoPeCHA solving (timeout={captcha_timeout}s)...")
                     nopecha_solved = await wait_for_nopecha_solve(
                         discord_tab, api_key=nopecha_key, timeout=captcha_timeout
                     )
                     if nopecha_solved:
                         log.success("[Captcha] NoPeCHA solved the captcha ✓")
                         return
-                    log.warning("[Captcha] NoPeCHA did not solve within timeout — trying next method...")
-
-                # ──────────────────────────────────────────────────────────
-                # STEP 2 — Accessibility / AI solver (fallback)
-                # Runs if NoPeCHA failed OR NoPeCHA is not enabled.
-                # Also runs automatically when captchaSolverEnabled=True.
-                # ──────────────────────────────────────────────────────────
-                # Re-check: captcha may already be gone after NoPeCHA's attempt
-                try:
-                    still_has_captcha = await discord_tab.evaluate(
-                        "(()=>{ try{ return !!document.querySelector('iframe[src*=\"hcaptcha.com\"]'); } catch(e){ return false; } })()"
-                    )
-                except Exception:
-                    still_has_captcha = False
-
-                if not still_has_captcha:
-                    log.success("[Captcha] Captcha cleared (detected via NoPeCHA late-solve) ✓")
-                    return
-
-                if solver_enabled or nopecha_enabled:
-                    # Use accessibility solver as fallback regardless of captchaSolverEnabled
-                    # flag — if NoPeCHA was enabled but failed we still want to try
-                    log.info("[Captcha] Step 2/3 — Accessibility solver (AI)...")
+                    log.warning("[Captcha] NoPeCHA did not solve within timeout — waiting for manual solve...")
+                elif solver_enabled:
+                    log.info("[Captcha] Step 1/2 — Accessibility solver...")
                     accessibility_solved = await solve_captcha_accessibility(discord_tab, config)
                     if accessibility_solved:
                         log.success("[Captcha] Accessibility solver solved the captcha ✓")
                         return
-                    log.warning("[Captcha] Accessibility solver could not solve — falling back to manual")
+                    log.warning("[Captcha] Accessibility solver could not solve — waiting for manual...")
 
                 # ──────────────────────────────────────────────────────────
-                # STEP 3 — Manual fallback (last resort)
+                # STEP 2 — Manual fallback
                 # ──────────────────────────────────────────────────────────
-                log.info("[Captcha] Step 3/3 — Waiting for manual solve (120s)...")
+                log.info("[Captcha] Step 2/2 — Waiting for manual solve (120s)...")
                 await _wait_manual_captcha()
 
             asyncio.ensure_future(_captcha_loop())
