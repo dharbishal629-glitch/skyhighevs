@@ -2656,29 +2656,73 @@ async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
 inject_nopecha_key = inject_nopecha_key_auto
 
 
-# ── NoPeCHA storage-based injection (no popup UI) ────────────────────────────
+# ── NoPeCHA direct file injection (no browser tab, no popup UI) ──────────────
 
-_NOPECHA_INJECT_PAGE = "_nopecha_inject.html"
+_NOPECHA_INJECT_MARKER = "// __SKYHIGHEV_NOPECHA_INJECT_START__"
+_NOPECHA_INJECT_END    = "// __SKYHIGHEV_NOPECHA_INJECT_END__"
 
 
-def _write_nopecha_inject_page(ext_dir: str, api_key: str) -> bool:
+def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
     """
-    Write a silent HTML page into the NoPeCHA extension directory that sets
-    the API key in chrome.storage.local WITHOUT showing any UI.
+    Inject the NoPeCHA API key directly into the extension's background
+    script (service worker for MV3, background page script for MV2).
 
-    The page is opened as a hidden tab, runs its script, and is immediately
-    closed — the user never sees anything.
+    This approach:
+      • Does NOT open any browser tab or popup UI
+      • Does NOT require a running browser
+      • Requires NO network call
+      • Key is active the instant Chrome loads the extension — before any
+        captcha is even shown
 
-    We scan the extension's own JS files to discover which storage key names
-    this exact version uses, then set ALL of them so the key is picked up
-    regardless of version differences.
+    Method:
+      1. Read manifest.json to find the background script filename
+      2. Strip any previous injection block (idempotent across runs)
+      3. Prepend a self-contained chrome.storage.local.set() IIFE that sets
+         the key under every common field name used by different NoPeCHA
+         versions, then also scans the extension's own JS files to pick up
+         any version-specific key names
+      4. Write the file back — Chrome picks up the change on next start
     """
-    import glob as _glob
+    import json as _json, glob as _glob
 
-    safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
+    safe_key = api_key.replace("\\", "\\\\").replace('"', '\\"')
 
-    # ── Discover storage key names from the extension source ─────────────────
-    discovered: set = set()
+    # ── Find the background script from manifest.json ─────────────────────────
+    manifest_path = os.path.join(ext_dir, "manifest.json")
+    bg_script_rel = None
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = _json.load(f)
+        bg = manifest.get("background", {})
+        # MV3 — service_worker field
+        bg_script_rel = bg.get("service_worker") or bg.get("scripts", [None])[0]
+    except Exception as e:
+        log.debug(f"[NoPeCHA] manifest.json read error: {e}")
+
+    bg_script_path = None
+    if bg_script_rel:
+        candidate = os.path.join(ext_dir, bg_script_rel.lstrip("/\\"))
+        if os.path.isfile(candidate):
+            bg_script_path = candidate
+
+    # ── Fallback: try common background script names ───────────────────────────
+    if not bg_script_path:
+        for name in ("background.js", "background-script.js", "worker.js",
+                     "sw.js", "service-worker.js", "service_worker.js",
+                     "background.min.js", "bg.js"):
+            candidate = os.path.join(ext_dir, name)
+            if os.path.isfile(candidate):
+                bg_script_path = candidate
+                break
+
+    if not bg_script_path:
+        log.warning("[NoPeCHA] Could not locate background script — injection skipped")
+        return False
+
+    bg_filename = os.path.basename(bg_script_path)
+
+    # ── Discover every storage key name this extension version uses ───────────
+    key_names: set = set()
     for js_path in _glob.glob(os.path.join(ext_dir, "**", "*.js"), recursive=True):
         try:
             with open(js_path, encoding="utf-8", errors="ignore") as f:
@@ -2687,82 +2731,53 @@ def _write_nopecha_inject_page(ext_dir: str, api_key: str) -> bool:
                 r'chrome\.storage\.local\.(?:set|get)\s*\(\s*[{"\']([a-zA-Z_][a-zA-Z0-9_]{1,29})',
                 src
             ):
-                discovered.add(m.group(1))
+                key_names.add(m.group(1))
         except Exception:
             pass
+    # Always include the well-known fields regardless of version
+    key_names.update(["key", "api_key", "apiKey", "nopechaKey", "nopecha_key"])
 
-    # Always include the well-known fallbacks
-    discovered.update(["key", "api_key", "apiKey", "nopechaKey", "nopecha_key"])
+    # Build the individual set() calls
+    set_stmts = "".join(
+        f'chrome.storage.local.set({{"{k}":K}});'
+        for k in sorted(key_names)
+    )
+    # Also set a combined object for versions that read multiple fields at once
+    combined = "{" + ",".join(f'"{k}":K' for k in sorted(key_names)) + "}"
 
-    set_lines = "\n".join(
-        f"        chrome.storage.local.set({{'{k}': KEY}});"
-        for k in sorted(discovered)
+    inject_block = (
+        f'{_NOPECHA_INJECT_MARKER}\n'
+        f'(function(){{try{{var K="{safe_key}";'
+        f'{set_stmts}'
+        f'chrome.storage.local.set({combined});'
+        f'}}catch(e){{}}}}());\n'
+        f'{_NOPECHA_INJECT_END}\n'
     )
 
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>nopecha_inject</title></head>
-<body>
-<script>
-(function() {{
-    var KEY = '{safe_key}';
-    try {{
-{set_lines}
-        // Combined object for versions that read multiple fields at once
-        chrome.storage.local.set({{key: KEY, api_key: KEY, apiKey: KEY, nopechaKey: KEY}});
-    }} catch(e) {{}}
-    document.title = 'nopecha_inject_done';
-}})();
-</script>
-</body></html>"""
-
-    inject_path = os.path.join(ext_dir, _NOPECHA_INJECT_PAGE)
+    # ── Read existing file, strip old injection, prepend new one ─────────────
     try:
-        with open(inject_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        log.debug(f"[NoPeCHA] Silent inject page written → {inject_path}")
+        with open(bg_script_path, encoding="utf-8", errors="ignore") as f:
+            original = f.read()
+
+        # Remove any previous injection block (idempotent across runs)
+        if _NOPECHA_INJECT_MARKER in original:
+            start_idx = original.find(_NOPECHA_INJECT_MARKER)
+            end_idx   = original.find(_NOPECHA_INJECT_END, start_idx)
+            if end_idx != -1:
+                original = (original[:start_idx] +
+                            original[end_idx + len(_NOPECHA_INJECT_END):].lstrip("\n"))
+
+        new_content = inject_block + original
+
+        with open(bg_script_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        log.success(f"[NoPeCHA] Key injected into {bg_filename} ✓")
         return True
+
     except Exception as e:
-        log.warning(f"[NoPeCHA] Could not write inject page: {e}")
+        log.warning(f"[NoPeCHA] File injection failed ({bg_filename}): {e}")
         return False
-
-
-async def inject_nopecha_via_storage(browser, ext_id: str, ext_dir: str) -> bool:
-    """
-    Inject the NoPeCHA API key into chrome.storage.local by opening a tiny
-    silent extension page — NO popup UI, NO NoPeCHA website loaded.
-
-    The inject page lives inside the extension directory (same origin as the
-    extension) so it has full access to chrome.storage.local.  It is opened
-    as a background tab, runs its script, then is immediately closed.
-
-    NoPeCHA's content script reads storage whenever it detects a captcha, so
-    the key set here is active for every page the browser visits afterwards.
-    """
-    inject_url = f"chrome-extension://{ext_id}/{_NOPECHA_INJECT_PAGE}"
-    inject_tab = None
-    try:
-        inject_tab = await browser.get(inject_url)
-        # Poll up to 5 s for the page title to flip to 'done'
-        for _ in range(20):
-            await asyncio.sleep(0.25)
-            try:
-                title = await inject_tab.evaluate("document.title")
-                if "done" in str(title).lower():
-                    break
-            except Exception:
-                break
-        await asyncio.sleep(0.3)  # extra buffer for storage flush to disk
-        log.success("[NoPeCHA] API key injected into chrome.storage.local ✓")
-        return True
-    except Exception as e:
-        log.warning(f"[NoPeCHA] Storage inject failed ({e}) — captcha may not auto-solve")
-        return False
-    finally:
-        if inject_tab is not None:
-            try:
-                await inject_tab.close()
-            except Exception:
-                pass
 
 
 async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 300) -> bool:
@@ -3059,12 +3074,14 @@ async def worker():
     _nopecha_ext_dir = None
     adb_rot          = config.get("adb_rotator")
 
-    # ── Download / verify NoPeCHA extension ONCE (not per account) ───────────
+    # ── Download extension + inject key into its background script (once) ───────
+    # The key is patched directly into the extension's background JS file.
+    # Chrome picks it up the moment the service worker starts — no browser
+    # tab, no popup UI, and no network call needed at injection time.
     if _nopecha_enabled and _nopecha_api_key:
         _nopecha_ext_dir = ensure_nopecha_extension()
         if _nopecha_ext_dir:
-            _write_nopecha_inject_page(_nopecha_ext_dir, _nopecha_api_key)
-            log.info("[NoPeCHA] Extension ready — key will be injected via storage each browser start")
+            inject_nopecha_key_into_extension_files(_nopecha_ext_dir, _nopecha_api_key)
         else:
             log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
 
@@ -3105,11 +3122,6 @@ async def worker():
 
             browser = await uc.start(**start_kw)
             log.debug("[Browser] Fresh instance started")
-
-            # ── Inject NoPeCHA key via chrome.storage (no popup UI) ────────
-            if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
-                log.info("[NoPeCHA] Injecting API key via storage (no popup)...")
-                await inject_nopecha_via_storage(browser, NOPECHA_EXT_ID, _nopecha_ext_dir)
 
             # ── Fingerprint (set up once per browser instance) ─────────────
             if config.get("fingerprintEnabled"):
