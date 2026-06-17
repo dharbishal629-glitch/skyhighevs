@@ -87,4 +87,70 @@ router.get("/worker/my-stats", requireWorkerKey, async (req: Request, res: Respo
   }
 });
 
+/**
+ * GET /api/worker/my-settings
+ * Worker fetches their own saved personal settings + whether edits are enabled.
+ * main.py calls this after fetching admin config to decide which config to use.
+ */
+router.get("/worker/my-settings", requireWorkerKey, async (req: Request, res: Response) => {
+  try {
+    const worker = (req as any).worker;
+    res.json({
+      workerEditsEnabled: Boolean(worker.workerEditsEnabled),
+      settings: {
+        proxy: {
+          enabled: Boolean(worker.workerProxyEnabled),
+          url: worker.workerProxy || "",
+        },
+        fingerprint: {
+          enabled: Boolean(worker.workerFingerprintEnabled),
+        },
+        adb: {
+          enabled: Boolean(worker.workerAdbEnabled),
+        },
+        nopecha: {
+          enabled: Boolean(worker.workerNopechaEnabled),
+          key: worker.workerNopechaKey || "",
+        },
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch settings", detail: err?.message });
+  }
+});
+
+/**
+ * PUT /api/worker/my-settings
+ * Worker saves their personal proxy / fingerprint / adb / nopecha config.
+ * Body: { proxy?: { enabled, url }, fingerprint?: { enabled }, adb?: { enabled }, nopecha?: { enabled, key } }
+ */
+router.put("/worker/my-settings", requireWorkerKey, async (req: Request, res: Response) => {
+  try {
+    const worker = (req as any).worker;
+    const { proxy, fingerprint, adb, nopecha } = req.body as {
+      proxy?:       { enabled?: boolean; url?: string };
+      fingerprint?: { enabled?: boolean };
+      adb?:         { enabled?: boolean };
+      nopecha?:     { enabled?: boolean; key?: string };
+    };
+
+    await db
+      .update(workersTable)
+      .set({
+        workerProxyEnabled:       proxy?.enabled        !== undefined ? Boolean(proxy.enabled)        : undefined,
+        workerProxy:              proxy?.url             !== undefined ? (proxy.url || null)           : undefined,
+        workerFingerprintEnabled: fingerprint?.enabled  !== undefined ? Boolean(fingerprint.enabled)  : undefined,
+        workerAdbEnabled:         adb?.enabled           !== undefined ? Boolean(adb.enabled)          : undefined,
+        workerNopechaEnabled:     nopecha?.enabled       !== undefined ? Boolean(nopecha.enabled)      : undefined,
+        workerNopechaKey:         nopecha?.key           !== undefined ? (nopecha.key || null)         : undefined,
+        updatedAt: new Date(),
+      })
+      .where(eq(workersTable.id, worker.id));
+
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to save settings", detail: err?.message });
+  }
+});
+
 export default router;
