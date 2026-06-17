@@ -1958,7 +1958,6 @@ async def _send_keys_robust(page, selector: str, value: str, timeout: int = 1000
 async def fill_registration_form(page, email: str, display_name: str, username: str, password: str) -> bool:
     """Fill Discord registration form using native send_keys so React tracks the input."""
     try:
-        log.info("Waiting for registration form...")
 
         # Email
         try:
@@ -3325,7 +3324,6 @@ async def worker():
                 start_kw["browser_args"].append("--allow-extensions-from-unpacked-dirs")
 
             browser = await uc.start(**start_kw)
-            log.debug("[Browser] Fresh instance started")
 
             # ── Fingerprint (set up once per browser instance) ─────────────
             if config.get("fingerprintEnabled"):
@@ -3387,7 +3385,6 @@ async def worker():
                 result = DraxonAPI(api_key=dx_api_key, domain_secret=dx_secret, custom_domains=dx_domains).get_email()
                 if result.get("success"):
                     email_obj = result
-                    log.success(f"Draxono email: {result['email']}")
                 else:
                     log.warning(f"Draxono failed: {result.get('error')} — trying CyberTemp fallback...")
 
@@ -3399,7 +3396,6 @@ async def worker():
                 if result.get("success"):
                     email_obj = result
                     email_provider = "cybertemp"
-                    log.success(f"CyberTemp email: {result['email']}")
                 else:
                     log.warning(f"CyberTemp failed: {result.get('error')}")
 
@@ -3413,12 +3409,8 @@ async def worker():
             account_username = generate_username()
             display_name     = random.choice(DISPLAY_NAMES)
 
-            log.info(f"Worker starting | email={account_email} | provider={email_provider}")
-
             # ── 2. Open Discord register tab ───────────────────────────────
-            log.info("[Tab] Opening discord.com/register...")
             discord_tab = await browser.get("https://discord.com/register", new_tab=True)
-            log.info("New tab opened — navigated to Discord register page.")
 
             # Apply fingerprint fallback if CDP inject wasn't available
             if config.get("_fp_js_fallback"):
@@ -3449,12 +3441,11 @@ async def worker():
                 continue
 
             # ── 4. Captcha solver + wait for account creation ──────────────
-            log.info("Waiting for captcha solve + account creation...")
             captcha_gave_up = asyncio.Event()
 
             async def _wait_manual_captcha():
                 """Poll until hCaptcha iframe disappears (user solved it manually)."""
-                log.info("Manual captcha mode — waiting up to 120s...")
+                _confirmed_absent = 0  # require 3 consecutive absent checks before declaring solved
                 for _ in range(240):  # 240 × 0.5s = 120s
                     await asyncio.sleep(0.5)
                     try:
@@ -3462,10 +3453,13 @@ async def worker():
                             "() => !!document.querySelector('iframe[src*=\"hcaptcha.com\"]')"
                         )
                         if not has_captcha:
-                            log.success("Captcha cleared — continuing!")
-                            return
+                            _confirmed_absent += 1
+                            if _confirmed_absent >= 3:
+                                return  # confirmed gone across 3 checks
+                        else:
+                            _confirmed_absent = 0
                     except Exception:
-                        return
+                        _confirmed_absent = 0  # JS error = page transitioning, keep waiting
                 log.warning("Manual captcha wait timed out (120s)")
                 captcha_gave_up.set()
 
@@ -3488,33 +3482,28 @@ async def worker():
                     log.info("[Captcha] No captcha detected — proceeding")
                     return
 
-                log.info("[Captcha] hCaptcha detected — NoPeCHA solving...")
-
                 # ──────────────────────────────────────────────────────────
                 # STEP 1 — NoPeCHA extension (automatic)
                 # ──────────────────────────────────────────────────────────
                 if nopecha_enabled and nopecha_key:
                     captcha_timeout = int(config.get("captchaTimeoutSeconds", 120))
-                    log.info(f"[Captcha] Step 1/2 — NoPeCHA solving (timeout={captcha_timeout}s)...")
                     nopecha_solved = await wait_for_nopecha_solve(
                         discord_tab, api_key=nopecha_key, timeout=captcha_timeout
                     )
                     if nopecha_solved:
                         log.success("[Captcha] NoPeCHA solved the captcha ✓")
                         return
-                    log.warning("[Captcha] NoPeCHA did not solve within timeout — waiting for manual solve...")
+                    log.warning("[Captcha] NoPeCHA timed out — waiting for manual solve...")
                 elif solver_enabled:
-                    log.info("[Captcha] Step 1/2 — Accessibility solver...")
                     accessibility_solved = await solve_captcha_accessibility(discord_tab, config)
                     if accessibility_solved:
                         log.success("[Captcha] Accessibility solver solved the captcha ✓")
                         return
-                    log.warning("[Captcha] Accessibility solver could not solve — waiting for manual...")
+                    log.warning("[Captcha] Accessibility solver failed — waiting for manual solve...")
 
                 # ──────────────────────────────────────────────────────────
                 # STEP 2 — Manual fallback
                 # ──────────────────────────────────────────────────────────
-                log.info("[Captcha] Step 2/2 — Waiting for manual solve (120s)...")
                 await _wait_manual_captcha()
 
             asyncio.ensure_future(_captcha_loop())
@@ -3781,25 +3770,21 @@ async def main():
             _ws = _ws_resp.json()
             if _ws.get("workerEditsEnabled"):
                 _s = _ws.get("settings", {})
-                # Proxy
+                # Each setting only overrides admin config when the worker has it
+                # explicitly enabled — never force-disables what admin configured.
                 _prx = _s.get("proxy", {})
                 if _prx.get("enabled") and _prx.get("url"):
                     config["proxyEnabled"] = True
                     config["proxyUrl"]     = _prx["url"]
-                else:
-                    config["proxyEnabled"] = False
-                # Fingerprint
-                config["fingerprintEnabled"] = bool(_s.get("fingerprint", {}).get("enabled"))
-                # ADB
-                config["adbEnabled"] = bool(_s.get("adb", {}).get("enabled"))
-                # NoPeCHA
+                if _s.get("fingerprint", {}).get("enabled"):
+                    config["fingerprintEnabled"] = True
+                if _s.get("adb", {}).get("enabled"):
+                    config["adbEnabled"] = True
                 _npc = _s.get("nopecha", {})
                 if _npc.get("enabled") and _npc.get("key"):
                     config["nopechaEnabled"] = True
                     config["nopechaApiKey"]  = _npc["key"]
-                else:
-                    config["nopechaEnabled"] = False
-                log.success("Worker Edits applied.")
+                log.success("Worker Edits active.")
     except Exception as e:
         log.debug(f"Worker settings fetch skipped: {e}")
 
@@ -3871,7 +3856,7 @@ async def main():
         brave_path = find_brave_executable()
         if brave_path:
             config["brave_executable"] = brave_path
-            log.success(f"Brave browser: {brave_path}")
+            log.debug(f"Brave browser: {brave_path}")
         else:
             log.warning("Brave not found — falling back to Chrome.")
 
