@@ -184,7 +184,6 @@ async def fetch_discord_token(email: str, password: str, x_fingerprint: str = No
     session = tls_client.Session(client_identifier="chrome_131", random_tls_extension_order=True)
     try:
         response = session.post(url, headers=headers, json=payload)
-        print(f"Succesfully Fetched Token -> {email}")
         if response.status_code != 200:
             return ""
         response_data = response.json()
@@ -2879,7 +2878,7 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
         with open(bg_script_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        log.success(f"[NoPeCHA] Key injected into {bg_filename} ✓")
+        log.debug(f"[NoPeCHA] Key injected into {bg_filename}")
         return True
 
     except Exception as e:
@@ -2897,8 +2896,10 @@ def inject_nopecha_key_into_manifest(ext_dir: str, api_key: str) -> bool:
         chrome.runtime.getManifest().nopecha_key  (or .key) — zero async race.
       • No popup, no chrome.storage, no timing dependency.
 
-    We write the key under both "nopecha_key" and "key" field names so the
-    extension finds it regardless of which field name its version uses.
+    We write the key under all 3 field names the extension may read:
+      1. manifest["nopecha_key"]       — custom top-level field
+      2. manifest["key"]               — fallback read by some builds
+      3. manifest["nopecha"]["key"]    — nested config object (v6+)
     """
     import json as _json
 
@@ -2909,11 +2910,14 @@ def inject_nopecha_key_into_manifest(ext_dir: str, api_key: str) -> bool:
 
         manifest["nopecha_key"] = api_key
         manifest["key"]         = api_key
+        # Third injection point: the nested nopecha config object (v6+)
+        if isinstance(manifest.get("nopecha"), dict):
+            manifest["nopecha"]["key"] = api_key
 
         with open(manifest_path, "w", encoding="utf-8") as f:
             _json.dump(manifest, f, indent=2)
 
-        log.success(f"[NoPeCHA] Key injected into manifest.json ✓")
+        log.debug(f"[NoPeCHA] Key injected into manifest.json")
         return True
 
     except Exception as e:
@@ -3269,7 +3273,6 @@ async def worker():
         try:
             # ── ADB IP rotation ────────────────────────────────────────────
             if adb_rot:
-                log.info("Rotating IP via ADB...")
                 adb_rot.rotate_ip()
 
             # ── Always fetch the latest NoPeCHA key from the dashboard ─────
@@ -3311,7 +3314,6 @@ async def worker():
             ]}
             if brave_path:
                 start_kw["browser_executable_path"] = brave_path
-                log.info(f"Launching Brave: {brave_path}")
 
             if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
                 start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
@@ -3333,9 +3335,8 @@ async def worker():
                 _discord_xfp = _fp_entry.get("fingerprint")
                 if _discord_xfp:
                     config["_discord_xfp"] = _discord_xfp
-                    log.info(f"[Fingerprint] x-fingerprint ready (id={_fp_entry['id']})")
                 else:
-                    log.warning("[Fingerprint] No x-fingerprint available — proceeding without it")
+                    log.debug("[Fingerprint] No x-fingerprint available — proceeding without it")
 
                 _cdp_profile = _generate_cdp_profile()
                 fp_js = make_fingerprint_js(_cdp_profile)
@@ -3345,15 +3346,11 @@ async def worker():
                     await browser.connection.send(
                         _cdp.page.add_script_to_evaluate_on_new_document(source=fp_js)
                     )
-                    log.info(f"[Fingerprint] CDP inject OK (id={_cdp_profile['id']}, "
-                             f"tz={_cdp_profile['timezone']}, "
-                             f"screen={_cdp_profile['screen_width']}x{_cdp_profile['screen_height']})")
                     _fp_injected = True
                 except Exception as e:
                     log.debug(f"[Fingerprint] CDP inject failed: {e}")
                 if not _fp_injected:
                     config["_fp_js_fallback"] = fp_js
-                    log.info(f"[Fingerprint] Will inject per-page (id={_cdp_profile['id']})")
 
             # ── 1. Get email from configured provider ──────────────────────
             email_provider = config.get("emailProvider", "cybertemp")
@@ -3755,7 +3752,6 @@ async def main():
     print(f"\n{divider}")
 
     # ── Fetch tool config from server (worker-auth endpoint) ──────
-    log.info("Fetching tool config from server...")
     try:
         _cfg_resp = requests.get(
             f"{api_base.rstrip('/')}/api/config/worker",
@@ -3768,13 +3764,44 @@ async def main():
             remote_cfg = _cfg_data.get("config", {})
             if isinstance(remote_cfg, dict) and remote_cfg:
                 config.update(remote_cfg)
-                log.success("Config loaded from server.")
-            else:
-                log.debug("Server returned empty config — using defaults.")
         else:
             log.debug(f"Config fetch HTTP {_cfg_resp.status_code} — using defaults.")
     except Exception as e:
         log.debug(f"Config fetch skipped: {e} — using defaults.")
+
+    # ── Fetch worker personal settings (Worker Edits) ─────────────
+    try:
+        _ws_resp = requests.get(
+            f"{api_base.rstrip('/')}/api/worker/my-settings",
+            headers={"x-api-key": api_client.worker_key},
+            timeout=10,
+            verify=False,
+        )
+        if _ws_resp.ok:
+            _ws = _ws_resp.json()
+            if _ws.get("workerEditsEnabled"):
+                _s = _ws.get("settings", {})
+                # Proxy
+                _prx = _s.get("proxy", {})
+                if _prx.get("enabled") and _prx.get("url"):
+                    config["proxyEnabled"] = True
+                    config["proxyUrl"]     = _prx["url"]
+                else:
+                    config["proxyEnabled"] = False
+                # Fingerprint
+                config["fingerprintEnabled"] = bool(_s.get("fingerprint", {}).get("enabled"))
+                # ADB
+                config["adbEnabled"] = bool(_s.get("adb", {}).get("enabled"))
+                # NoPeCHA
+                _npc = _s.get("nopecha", {})
+                if _npc.get("enabled") and _npc.get("key"):
+                    config["nopechaEnabled"] = True
+                    config["nopechaApiKey"]  = _npc["key"]
+                else:
+                    config["nopechaEnabled"] = False
+                log.success("Worker Edits applied.")
+    except Exception as e:
+        log.debug(f"Worker settings fetch skipped: {e}")
 
     # ── Fill in any missing defaults ──────────────────────────────
     config.setdefault("emailProvider",          "cybertemp")
