@@ -2494,7 +2494,7 @@ def download_nopecha_ext() -> Optional[Path]:
     if ext_dir.exists() and (ext_dir / "manifest.json").exists():
         return ext_dir
     log.info("[NoPeCHA] Downloading extension from GitHub...")
-    zip_url = "https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium_automation.zip"
+    zip_url = "https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip"
     try:
         r = requests.get(zip_url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
