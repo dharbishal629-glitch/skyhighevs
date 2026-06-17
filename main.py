@@ -2428,93 +2428,149 @@ def _get_tool_base_dir() -> str:
     return cwd
 
 
-def ensure_nopecha_extension() -> Optional[str]:
-    """
-    Download and extract the NoPeCHA v6 browser extension to nopecha_ext/.
-    Downloads a pre-packaged zip from GitHub — all files guaranteed complete.
-    Called automatically on first run — workers need no manual setup.
-    Returns the path to the extracted extension dir, or None on failure.
-    """
+def _nopecha_extract_zip(zip_data: bytes, ext_dir: str) -> bool:
+    """Extract nopecha_ext zip bytes into ext_dir, stripping the top-level folder."""
     import io, zipfile as _zipfile
-
-    base     = _get_tool_base_dir()
-    ext_dir  = os.path.join(base, "nopecha_ext")
-    manifest = os.path.join(ext_dir, "manifest.json")
-
-    if os.path.isfile(manifest):
-        return ext_dir   # already extracted on a previous run
-
-    print(Colorate.Horizontal(Colors.cyan_to_blue,
-        "  [NoPeCHA] Downloading extension v6 (first-time auto-setup)..."))
-
-    # Download the complete nopecha_ext v6 zip from GitHub.
-    # This avoids the incomplete CRX extraction issue — the zip contains every file.
-    _zip_url = (
-        "https://raw.githubusercontent.com/dharbishal629-glitch/skyhighevs/main/nopecha_ext.zip"
-    )
-    _headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.6099.109 Safari/537.36"
-        ),
-        "Accept": "application/octet-stream,*/*",
-    }
-
-    zip_data = None
-    try:
-        resp = requests.get(_zip_url, headers=_headers, timeout=60,
-                            allow_redirects=True, verify=False)
-        resp.raise_for_status()
-        zip_data = resp.content
-        log.debug(f"[NoPeCHA] ZIP downloaded from GitHub ({len(zip_data)//1024} KB)")
-    except Exception as e:
-        log.warning(f"[NoPeCHA] GitHub zip download failed: {e}")
-
-    if not zip_data:
-        log.warning(
-            "[NoPeCHA] Could not download extension zip from GitHub.\n"
-            "          → Check your internet connection and try again.\n"
-            "          → Or manually place the nopecha_ext folder next to main.py"
-        )
-        return None
-
-    os.makedirs(ext_dir, exist_ok=True)
     try:
         with _zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-            # The zip contains a top-level nopecha_ext/ folder — extract its contents
-            # directly into ext_dir so we don't get a double-nested nopecha_ext/nopecha_ext/
             for member in zf.infolist():
-                member_path = member.filename
-                # Strip the leading nopecha_ext/ prefix if present
-                if member_path.startswith("nopecha_ext/"):
-                    member_path = member_path[len("nopecha_ext/"):]
-                elif member_path.startswith("nopecha_ext\\"):
-                    member_path = member_path[len("nopecha_ext\\"):]
-                # Skip __MACOSX metadata entries
-                if member_path.startswith("__MACOSX") or "/._" in member_path or member_path.startswith("._"):
+                mp = member.filename
+                # Strip leading nopecha_ext/ prefix so files land directly in ext_dir
+                for prefix in ("nopecha_ext/", "nopecha_ext\\"):
+                    if mp.startswith(prefix):
+                        mp = mp[len(prefix):]
+                        break
+                # Skip macOS metadata junk
+                if not mp or mp.startswith("__MACOSX") or "/._" in mp or mp.startswith("._"):
                     continue
-                if not member_path:
-                    continue
-                target = os.path.join(ext_dir, member_path)
+                target = os.path.join(ext_dir, mp)
                 if member.is_dir():
                     os.makedirs(target, exist_ok=True)
                 else:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with zf.open(member) as src, open(target, "wb") as dst:
                         dst.write(src.read())
+        return True
     except Exception as e:
         log.warning(f"[NoPeCHA] ZIP extract failed: {e}")
-        shutil.rmtree(ext_dir, ignore_errors=True)
-        return None
+        return False
 
+
+def ensure_nopecha_extension() -> Optional[str]:
+    """
+    Auto-update aware NoPeCHA extension manager.
+
+    On every run:
+      1. Fetches nopecha_ext_version.txt from GitHub (tiny, fast).
+      2. Compares with the version in the local manifest.json.
+      3. If different (or extension missing) → downloads the full zip and
+         replaces the local nopecha_ext/ folder automatically.
+      4. If already up-to-date → skips the download entirely.
+
+    Workers always get the latest extension with zero manual steps.
+    Returns the path to the ready extension dir, or None on failure.
+    """
+    _GITHUB_RAW = "https://raw.githubusercontent.com/dharbishal629-glitch/skyhighevs/main"
+    _VER_URL    = f"{_GITHUB_RAW}/nopecha_ext_version.txt"
+    _ZIP_URL    = f"{_GITHUB_RAW}/nopecha_ext.zip"
+    _HEADERS    = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.6099.109 Safari/537.36"
+        ),
+        "Cache-Control": "no-cache",
+    }
+
+    base     = _get_tool_base_dir()
+    ext_dir  = os.path.join(base, "nopecha_ext")
+    manifest = os.path.join(ext_dir, "manifest.json")
+
+    # ── Step 1: read local version (empty string if not installed) ───────────
+    local_ver = ""
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8") as f:
+                local_ver = json.load(f).get("version", "").strip()
+        except Exception:
+            pass
+
+    # ── Step 2: fetch latest version tag from GitHub ─────────────────────────
+    remote_ver = ""
+    try:
+        vr = requests.get(_VER_URL, headers=_HEADERS, timeout=10, verify=False)
+        if vr.status_code == 200:
+            remote_ver = vr.text.strip()
+    except Exception as e:
+        log.debug(f"[NoPeCHA] Version check failed ({e}) — will use local if present")
+
+    # ── Step 3: decide whether to (re-)download ───────────────────────────────
+    need_download = False
     if not os.path.isfile(manifest):
-        log.warning("[NoPeCHA] Extracted zip has no manifest.json — download may be corrupt")
-        shutil.rmtree(ext_dir, ignore_errors=True)
-        return None
+        need_download = True
+        reason = "first-time install"
+    elif remote_ver and remote_ver != local_ver:
+        need_download = True
+        reason = f"update available ({local_ver} → {remote_ver})"
+    else:
+        reason = "already up-to-date"
+
+    if not need_download:
+        print(Colorate.Horizontal(Colors.green_to_cyan,
+            f"  [NoPeCHA] Extension {local_ver} — {reason}"))
+        return ext_dir
+
+    # ── Step 4: download the full zip ─────────────────────────────────────────
+    label = remote_ver or "latest"
+    print(Colorate.Horizontal(Colors.cyan_to_blue,
+        f"  [NoPeCHA] Downloading extension {label} ({reason})..."))
+
+    zip_data = None
+    try:
+        zr = requests.get(_ZIP_URL, headers=_HEADERS, timeout=60,
+                          allow_redirects=True, verify=False)
+        zr.raise_for_status()
+        zip_data = zr.content
+        log.debug(f"[NoPeCHA] Downloaded {len(zip_data)//1024} KB from GitHub")
+    except Exception as e:
+        log.warning(f"[NoPeCHA] Download failed: {e}")
+
+    if not zip_data:
+        log.warning(
+            "[NoPeCHA] Could not download extension from GitHub.\n"
+            "          → Check your internet connection and try again.\n"
+            "          → Or manually place the nopecha_ext folder next to main.py"
+        )
+        # Fall back to existing local copy if available
+        return ext_dir if os.path.isfile(manifest) else None
+
+    # ── Step 5: extract into a temp dir, then atomically replace ─────────────
+    tmp_dir = ext_dir + "_tmp"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    if not _nopecha_extract_zip(zip_data, tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return ext_dir if os.path.isfile(manifest) else None
+
+    if not os.path.isfile(os.path.join(tmp_dir, "manifest.json")):
+        log.warning("[NoPeCHA] Downloaded zip has no manifest.json — keeping existing copy")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return ext_dir if os.path.isfile(manifest) else None
+
+    # Swap old → new
+    shutil.rmtree(ext_dir, ignore_errors=True)
+    shutil.move(tmp_dir, ext_dir)
+
+    installed_ver = ""
+    try:
+        with open(manifest, "r", encoding="utf-8") as f:
+            installed_ver = json.load(f).get("version", label)
+    except Exception:
+        installed_ver = label
 
     print(Colorate.Horizontal(Colors.green_to_cyan,
-        f"  [NoPeCHA] Extension v6 ready → {ext_dir}"))
+        f"  [NoPeCHA] Extension {installed_ver} ready → {ext_dir}"))
     return ext_dir
 
 
