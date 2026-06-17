@@ -18,6 +18,7 @@ router.get("/workers/list", requireApiKey, requireAdmin, async (_req: Request, r
       status: workersTable.status,
       expiresAt: workersTable.expiresAt,
       createdAt: workersTable.createdAt,
+      workerEditsEnabled: workersTable.workerEditsEnabled,
       tokensGenerated: sql<number>`COALESCE(SUM(${dailyStatsTable.tokensGenerated}), 0)`,
       tokensValid: sql<number>`COALESCE(SUM(${dailyStatsTable.tokensValid}), 0)`,
     })
@@ -31,6 +32,7 @@ router.get("/workers/list", requireApiKey, requireAdmin, async (_req: Request, r
       workersTable.status,
       workersTable.expiresAt,
       workersTable.createdAt,
+      workersTable.workerEditsEnabled,
     );
 
   const result = workers.map((w) => {
