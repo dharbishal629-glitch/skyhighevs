@@ -2886,6 +2886,93 @@ def inject_nopecha_key_into_manifest(ext_dir: str, api_key: str) -> bool:
         return False
 
 
+async def _nopecha_set_key_via_extension_context(browser, api_key: str, ext_dir: str) -> bool:
+    """
+    Set the NopeCHA API key directly into the extension's chrome.storage.local by
+    navigating to the extension's own popup page inside a tab.
+
+    WHY this is necessary
+    ─────────────────────
+    NopeCHA's background script is often declared as an ES-module service worker
+    (manifest "type": "module").  Prepending IIFE code to an ES-module file causes
+    a silent parse failure — the storage.set() call in our injected code never runs,
+    so the extension connects to the NopeCHA API without a key (showing "Unavailable").
+
+    The popup page (chrome-extension://{id}/popup.html) runs in the extension's own
+    security origin and has full chrome.* API access including chrome.storage.local.
+    By opening it in a hidden tab and calling storage.set() from there, the key is
+    written to the extension's persistent storage — the same storage the background
+    service worker reads when solving captchas.
+
+    This is the underlying mechanism that makes tools like Moon Gen reliable: the key
+    is in the extension's storage before any captcha is encountered, so NopeCHA always
+    has it when it calls the solver API.
+    """
+    try:
+        from nodriver import cdp as _cdp
+        import asyncio
+
+        safe_key = api_key.replace("\\", "\\\\").replace('"', '\\"')
+        ext_id   = None
+
+        # ── Step 1: Wait for the extension's service worker to appear in targets ──
+        # Chrome registers the SW target when the extension first loads.
+        for _attempt in range(25):
+            try:
+                targets = await browser.connection.send(_cdp.target.get_targets())
+                for t in (targets or []):
+                    url = getattr(t, "url", "") or ""
+                    if url.startswith("chrome-extension://"):
+                        candidate = url.split("//")[1].split("/")[0]
+                        # Extension IDs are exactly 32 lowercase a-p characters
+                        if len(candidate) == 32 and candidate.replace("a","").replace("b","").replace("c","").replace("d","").replace("e","").replace("f","").replace("g","").replace("h","").replace("i","").replace("j","").replace("k","").replace("l","").replace("m","").replace("n","").replace("o","").replace("p","") == "":
+                            ext_id = candidate
+                            break
+            except Exception:
+                pass
+            if ext_id:
+                break
+            await asyncio.sleep(0.3)
+
+        if not ext_id:
+            log.warning("[NoPeCHA] Extension ID not found in browser targets — file injection only")
+            return False
+
+        # ── Step 2: Open the popup URL as a tab (extension context = full chrome.* access) ──
+        popup_url = f"chrome-extension://{ext_id}/popup.html"
+        try:
+            tab = await browser.get(popup_url, new_tab=True)
+        except Exception:
+            tab = await browser.get(popup_url)
+
+        await asyncio.sleep(1.5)   # let popup.html fully initialize
+
+        # ── Step 3: Set key in extension storage from within extension context ──
+        storage_js = (
+            f'chrome.storage.local.set({{'
+            f'  key:"{safe_key}",'
+            f'  nopecha_key:"{safe_key}",'
+            f'  api_key:"{safe_key}",'
+            f'  apiKey:"{safe_key}"'
+            f'}});'
+        )
+        await tab.evaluate(storage_js)
+        await asyncio.sleep(0.5)   # let storage write complete
+
+        # ── Step 4: Close the popup tab ──────────────────────────────────────────
+        try:
+            await tab.close()
+        except Exception:
+            pass
+
+        log.success(f"[NoPeCHA] Key written to extension storage via popup context ✓  (ext={ext_id[:8]}...)")
+        return True
+
+    except Exception as exc:
+        log.warning(f"[NoPeCHA] Extension-context storage set failed: {exc}")
+        return False
+
+
 async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 300) -> bool:
     """
     Wait for the NoPeCHA browser extension to solve the hCaptcha.
@@ -3289,6 +3376,18 @@ async def worker():
 
             browser = await uc.start(**start_kw)
             log.debug("[Browser] Fresh instance started")
+
+            # ── NoPeCHA: set key in extension storage via popup context ─────
+            # File injection (manifest.json + background.js) alone may not work
+            # when the background is an ES-module service worker — our prepended
+            # IIFE would break the module parse silently.  Opening the extension's
+            # popup URL in a tab gives us full chrome.* access and lets us call
+            # chrome.storage.local.set() directly in the extension's context,
+            # writing the key to persistent storage before any captcha arrives.
+            if _nopecha_enabled and _nopecha_api_key:
+                await _nopecha_set_key_via_extension_context(
+                    browser, _nopecha_api_key, _nopecha_ext_dir or ""
+                )
 
             # ── Fingerprint (set up once per browser instance) ─────────────
             if config.get("fingerprintEnabled"):
