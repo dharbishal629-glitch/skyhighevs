@@ -2700,24 +2700,26 @@ _NOPECHA_INJECT_END    = "// __SKYHIGHEV_NOPECHA_INJECT_END__"
 
 def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
     """
-    Inject the NoPeCHA API key directly into the extension's background
-    script (service worker for MV3, background page script for MV2).
+    Inject the NoPeCHA API key into the extension's background script.
 
-    This approach:
-      • Does NOT open any browser tab or popup UI
-      • Does NOT require a running browser
-      • Requires NO network call
-      • Key is active the instant Chrome loads the extension — before any
-        captcha is even shown
+    ES-MODULE AWARENESS (key fix)
+    ──────────────────────────────
+    NopeCHA MV3 uses a Module Service Worker ("type": "module" in manifest.json).
+    ES modules FORBID code before import declarations — prepending an IIFE to such
+    a file causes a silent parse failure: the background never initialises, nothing
+    runs, and the key is never set.
 
-    Method:
-      1. Read manifest.json to find the background script filename
-      2. Strip any previous injection block (idempotent across runs)
-      3. Prepend a self-contained chrome.storage.local.set() IIFE that sets
-         the key under every common field name used by different NoPeCHA
-         versions, then also scans the extension's own JS files to pick up
-         any version-specific key names
-      4. Write the file back — Chrome picks up the change on next start
+    Detection: we read the manifest background config for "type": "module".
+      • ES module  → inject AFTER the last import statement in the file.
+      • Classic script → prepend at the top (original behaviour, still works).
+
+    In both cases the injected block:
+      1. Reads the API key from chrome.runtime.getManifest() (synchronous, written
+         by inject_nopecha_key_into_manifest() before Chrome even opens the file).
+      2. Falls back to the hardcoded key embedded in the block itself.
+      3. Calls chrome.storage.local.set() for persistence across SW restarts.
+      4. Overrides chrome.storage.local.get() so every subsequent read (callback
+         or Promise) returns the injected key immediately.
     """
     import json as _json, glob as _glob
 
@@ -2726,12 +2728,13 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
     # ── Find the background script from manifest.json ─────────────────────────
     manifest_path = os.path.join(ext_dir, "manifest.json")
     bg_script_rel = None
+    is_module     = False
     try:
         with open(manifest_path, encoding="utf-8") as f:
             manifest = _json.load(f)
         bg = manifest.get("background", {})
-        # MV3 — service_worker field
         bg_script_rel = bg.get("service_worker") or bg.get("scripts", [None])[0]
+        is_module     = (bg.get("type", "").lower() == "module")
     except Exception as e:
         log.debug(f"[NoPeCHA] manifest.json read error: {e}")
 
@@ -2741,7 +2744,6 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
         if os.path.isfile(candidate):
             bg_script_path = candidate
 
-    # ── Fallback: try common background script names ───────────────────────────
     if not bg_script_path:
         for name in ("background.js", "background-script.js", "worker.js",
                      "sw.js", "service-worker.js", "service_worker.js",
@@ -2762,89 +2764,122 @@ def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
     for js_path in _glob.glob(os.path.join(ext_dir, "**", "*.js"), recursive=True):
         try:
             with open(js_path, encoding="utf-8", errors="ignore") as f:
-                src = f.read()
+                src_scan = f.read()
             for m in re.finditer(
-                r'chrome\.storage\.local\.(?:set|get)\s*\(\s*[{"\']([a-zA-Z_][a-zA-Z0-9_]{1,29})',
-                src
+                r'chrome\.storage\.(?:local|sync)\.(?:set|get)\s*\(\s*[{"\']([a-zA-Z_][a-zA-Z0-9_]{1,29})',
+                src_scan
             ):
                 key_names.add(m.group(1))
         except Exception:
             pass
-    # Always include the well-known fields regardless of version
     key_names.update(["key", "api_key", "apiKey", "nopechaKey", "nopecha_key"])
 
-    # Build combined storage object for all discovered + well-known key names
+    # Build combined storage object  e.g. {"api_key":K,"key":K,...}
     combined = "{" + ",".join(f'"{k}":K' for k in sorted(key_names)) + "}"
 
-    # ── Three-layer injection (most reliable first) ────────────────────────────
-    # Layer 1 — manifest read (synchronous, zero race-condition risk):
-    #   chrome.runtime.getManifest() is available synchronously the instant the
-    #   service worker runs.  inject_nopecha_key_into_manifest() writes the key
-    #   into manifest.json BEFORE Chrome even loads the extension, so the key
-    #   is already there when this line executes.  If for some reason the
-    #   manifest field is empty, we fall back to the hardcoded value below.
-    # Layer 2 — hardcoded key (synchronous, belt-and-suspenders):
-    #   The key is embedded verbatim in the script — always available.
-    # Layer 3 — storage set + get override (async persistence + future restarts):
-    #   Persists the key to chrome.storage so it survives service-worker restarts,
-    #   and overrides get() so any code that reads storage also gets the right key.
-    inject_block = (
-        f'{_NOPECHA_INJECT_MARKER}\n'
-        f'(function(){{try{{\n'
-        # Layer 1 + 2: read key from manifest first, fall back to hardcoded
-        f'  var _m=(typeof chrome!=="undefined"&&chrome.runtime&&chrome.runtime.getManifest)?chrome.runtime.getManifest():{{}};\n'
-        f'  var K=(_m.nopecha_key||_m.key||"{safe_key}");\n'
-        f'  if(!K)K="{safe_key}";\n'
-        f'  var _KS={combined};\n'
-        # Layer 3a: persist to storage (async, for subsequent restarts)
-        f'  try{{chrome.storage.local.set(_KS);}}catch(e){{}}\n'
-        f'  try{{chrome.storage.sync.set(_KS);}}catch(e){{}}\n'
-        # Layer 3b: override get() — supports BOTH callback API and Promise API.
-        # NopeCHA MV3 service workers use the Promise form:
-        #   const r = await chrome.storage.local.get("key");
-        # The old callback-only override returned undefined for these calls, meaning
-        # NopeCHA received no key and silently skipped solving.  We now always
-        # return a real Promise AND call the callback when provided.
-        f'  function _mkGet(orig){{\n'
-        f'    return function(q,cb){{\n'
-        f'      var p=new Promise(function(resolve){{\n'
-        f'        orig(q,function(r){{\n'
-        f'          r=r||{{}};\n'
-        f'          var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
-        f'          if(ks.length===0){{Object.assign(r,_KS);}}\n'
-        f'          else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
-        f'          resolve(r);\n'
-        f'        }});\n'
-        f'      }});\n'
-        f'      if(typeof cb==="function")p.then(cb);\n'
-        f'      return p;\n'
-        f'    }};\n'
-        f'  }}\n'
-        f'  chrome.storage.local.get=_mkGet(chrome.storage.local.get.bind(chrome.storage.local));\n'
-        f'  chrome.storage.sync.get=_mkGet(chrome.storage.sync.get.bind(chrome.storage.sync));\n'
-        f'}}catch(e){{}}}}());\n'
-        f'{_NOPECHA_INJECT_END}\n'
-    )
+    # ── Build injection block ─────────────────────────────────────────────────
+    # For ES modules we use const/arrow-functions and call storage.get() as a
+    # Promise (not with a callback).  For classic scripts we use var/function and
+    # the callback form for maximum compatibility.
+    if is_module:
+        inject_block = (
+            f'\n{_NOPECHA_INJECT_MARKER}\n'
+            f';(()=>{{try{{\n'
+            f'  const _m=(typeof chrome!=="undefined"&&chrome.runtime&&chrome.runtime.getManifest)?chrome.runtime.getManifest():{{}};\n'
+            f'  const K=(_m.nopecha_key||_m.key||"{safe_key}")||"{safe_key}";\n'
+            f'  const _KS={combined};\n'
+            f'  chrome.storage.local.set(_KS).catch(()=>{{}});\n'
+            f'  chrome.storage.sync .set(_KS).catch(()=>{{}});\n'
+            f'  const _mkGet=orig=>(q,cb)=>{{\n'
+            f'    const p=orig(q).then(r=>{{\n'
+            f'      r=r||{{}};\n'
+            f'      const ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
+            f'      if(ks.length===0)Object.assign(r,_KS);\n'
+            f'      else ks.forEach(k=>{{if(_KS[k]!==undefined)r[k]=_KS[k];}});\n'
+            f'      return r;\n'
+            f'    }});\n'
+            f'    if(typeof cb==="function")p.then(cb);\n'
+            f'    return p;\n'
+            f'  }};\n'
+            f'  chrome.storage.local.get=_mkGet(chrome.storage.local.get.bind(chrome.storage.local));\n'
+            f'  chrome.storage.sync .get=_mkGet(chrome.storage.sync .get.bind(chrome.storage.sync ));\n'
+            f'}}catch(e){{}}}})()\n'
+            f'{_NOPECHA_INJECT_END}\n'
+        )
+    else:
+        inject_block = (
+            f'{_NOPECHA_INJECT_MARKER}\n'
+            f'(function(){{try{{\n'
+            f'  var _m=(typeof chrome!=="undefined"&&chrome.runtime&&chrome.runtime.getManifest)?chrome.runtime.getManifest():{{}};\n'
+            f'  var K=(_m.nopecha_key||_m.key||"{safe_key}")||"{safe_key}";\n'
+            f'  var _KS={combined};\n'
+            f'  try{{chrome.storage.local.set(_KS);}}catch(e){{}}\n'
+            f'  try{{chrome.storage.sync .set(_KS);}}catch(e){{}}\n'
+            f'  function _mkGet(orig){{\n'
+            f'    return function(q,cb){{\n'
+            f'      var p=new Promise(function(resolve){{\n'
+            f'        orig(q,function(r){{\n'
+            f'          r=r||{{}};\n'
+            f'          var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
+            f'          if(ks.length===0){{Object.assign(r,_KS);}}\n'
+            f'          else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
+            f'          resolve(r);\n'
+            f'        }});\n'
+            f'      }});\n'
+            f'      if(typeof cb==="function")p.then(cb);\n'
+            f'      return p;\n'
+            f'    }};\n'
+            f'  }}\n'
+            f'  chrome.storage.local.get=_mkGet(chrome.storage.local.get.bind(chrome.storage.local));\n'
+            f'  chrome.storage.sync .get=_mkGet(chrome.storage.sync .get.bind(chrome.storage.sync ));\n'
+            f'}}catch(e){{}}}}());\n'
+            f'{_NOPECHA_INJECT_END}\n'
+        )
 
-    # ── Read existing file, strip old injection, prepend new one ─────────────
+    # ── Read file, strip old injection, insert at the right position ──────────
     try:
         with open(bg_script_path, encoding="utf-8", errors="ignore") as f:
             original = f.read()
 
-        # Remove any previous injection block (idempotent across runs)
+        # Remove any previous injection block (idempotent)
         if _NOPECHA_INJECT_MARKER in original:
-            start_idx = original.find(_NOPECHA_INJECT_MARKER)
-            end_idx   = original.find(_NOPECHA_INJECT_END, start_idx)
-            if end_idx != -1:
-                original = (original[:start_idx] +
-                            original[end_idx + len(_NOPECHA_INJECT_END):].lstrip("\n"))
+            si = original.find(_NOPECHA_INJECT_MARKER)
+            ei = original.find(_NOPECHA_INJECT_END, si)
+            if ei != -1:
+                original = (original[:si] +
+                            original[ei + len(_NOPECHA_INJECT_END):].lstrip("\n"))
 
-        new_content = inject_block + original
+        if is_module:
+            # ── ES MODULE: inject AFTER the last import statement ─────────────
+            # Prepending to an ES module breaks parsing (imports must come first).
+            # We find the position just after the last top-level import and insert
+            # there — valid module-level code, no syntax error.
+            last_import_end = 0
+            # Regex: top-level import statements (handles side-effect, named,
+            # default, namespace, and dynamic-import-in-string-literal forms).
+            for m in re.finditer(
+                r'^[ \t]*import\s+(?:[^;\'"`]|\'[^\']*\'|"[^"]*")*;',
+                original, re.MULTILINE
+            ):
+                last_import_end = m.end()
+
+            if last_import_end:
+                new_content = (original[:last_import_end]
+                               + "\n" + inject_block
+                               + original[last_import_end:])
+                log.debug("[NoPeCHA] ES-module detected — injecting after import block")
+            else:
+                # No imports found; safe to prepend
+                new_content = inject_block + original
+        else:
+            # ── CLASSIC SCRIPT: prepend at top ────────────────────────────────
+            new_content = inject_block + original
 
         with open(bg_script_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        log.success(f"[NoPeCHA] Key injected into {bg_filename} ✓")
+        mode_tag = "ES-module" if is_module else "classic"
+        log.success(f"[NoPeCHA] Key injected into {bg_filename} ({mode_tag}) ✓")
         return True
 
     except Exception as e:
