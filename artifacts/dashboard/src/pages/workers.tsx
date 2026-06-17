@@ -3,13 +3,16 @@ import { useAuth } from "@/lib/auth-context";
 import { GlassCard, GlassButton, Badge, GlassInput, ProgressBar, SectionHeader } from "@/components/ui/cyber-components";
 import { useListWorkers, useCreateWorkerKey, useDeleteWorkerKey } from "@/lib/api-client";
 import { useQueryClient } from "@tanstack/react-query";
-import { Users, Plus, ShieldOff, Copy, Check, Download, Search, RefreshCw, ChevronDown, ChevronUp, CheckSquare, Square, Trash2, ArrowUpDown } from "lucide-react";
+import { Users, Plus, ShieldOff, Copy, Check, Download, Search, RefreshCw, ChevronDown, ChevronUp, CheckSquare, Square, Trash2, ArrowUpDown, ToggleLeft, ToggleRight } from "lucide-react";
 import { format } from "date-fns";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { cn } from "@/components/ui/cyber-components";
+import { CONFIG } from "../lib/config";
+
+const API_BASE = CONFIG.API_BASE_URL.replace(/\/$/, "");
 
 const schema = z.object({
   discordId: z.string().min(1, "Required"),
@@ -29,6 +32,7 @@ export default function Workers() {
   const [sort, setSort] = useState<{ field: SortField; dir: "asc" | "desc" }>({ field: "tokensGenerated", dir: "desc" });
   const [expanded, setExpanded] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [togglingEdits, setTogglingEdits] = useState<string | null>(null);
 
   const { data, isLoading, isError, refetch } = useListWorkers({ request: { headers: getHeaders() } });
 
@@ -47,7 +51,7 @@ export default function Workers() {
   });
 
   const workers = useMemo(() => {
-    let list = data?.workers || [];
+    let list = (data?.workers as any[]) || [];
     if (statusFilter !== "ALL") list = list.filter(w => w.status === statusFilter);
     if (search) list = list.filter(w => w.discordUsername.toLowerCase().includes(search.toLowerCase()) || w.discordId.includes(search));
     return [...list].sort((a, b) => {
@@ -77,6 +81,19 @@ export default function Workers() {
   };
 
   const toggleSort = (field: SortField) => setSort(s => s.field === field ? { field, dir: s.dir === "asc" ? "desc" : "asc" } : { field, dir: "desc" });
+
+  const toggleWorkerEdits = async (discordId: string, currentEnabled: boolean) => {
+    setTogglingEdits(discordId);
+    try {
+      await fetch(`${API_BASE}/api/workers/worker-edits/${discordId}`, {
+        method: "PUT",
+        headers: { ...getHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !currentEnabled }),
+      });
+      qc.invalidateQueries({ queryKey: ["/api/workers/list"] });
+    } catch { /* silent */ }
+    finally { setTogglingEdits(null); }
+  };
 
   return (
     <div className="space-y-5">
@@ -170,6 +187,7 @@ export default function Workers() {
                 { label: "Generated", field: "tokensGenerated" as SortField },
                 { label: "Rate", field: "unlockRate" as SortField },
                 { label: "Expires", field: null },
+                { label: "W.Edits", field: null },
                 { label: "", field: null },
               ].map(({ label, field }) => (
                 <th key={label} className="p-3 text-slate-600 font-medium">
@@ -184,12 +202,14 @@ export default function Workers() {
           </thead>
           <tbody>
             {isLoading ? (
-              <tr><td colSpan={8} className="p-8 text-center text-slate-600 animate-pulse">Loading workers...</td></tr>
+              <tr><td colSpan={9} className="p-8 text-center text-slate-600 animate-pulse">Loading workers...</td></tr>
             ) : workers.length === 0 ? (
-              <tr><td colSpan={8} className="p-8 text-center text-slate-600">No workers match the current filter.</td></tr>
+              <tr><td colSpan={9} className="p-8 text-center text-slate-600">No workers match the current filter.</td></tr>
             ) : workers.map(worker => {
               const isSelected = selected.has(worker.discordId);
               const isExpanded = expanded === worker.discordId;
+              const editsOn = Boolean((worker as any).workerEditsEnabled);
+              const isToggling = togglingEdits === worker.discordId;
               return (
                 <React.Fragment key={worker.id}>
                   <tr className={cn("transition-colors group", isSelected ? "bg-violet-500/5" : "hover:bg-white/2")} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
@@ -219,6 +239,26 @@ export default function Workers() {
                       <div className="w-14 mt-1"><ProgressBar value={worker.unlockRate} color={worker.unlockRate >= 50 ? "green" : "red"} /></div>
                     </td>
                     <td className="p-3 text-slate-600 text-[11px]">{worker.expiresAt ? format(new Date(worker.expiresAt), "MMM dd, yy") : "Never"}</td>
+                    {/* Worker Edits toggle */}
+                    <td className="p-3">
+                      <button
+                        onClick={() => toggleWorkerEdits(worker.discordId, editsOn)}
+                        disabled={isToggling}
+                        title={editsOn ? "Worker Edits ON — click to disable" : "Worker Edits OFF — click to enable"}
+                        className={cn(
+                          "flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium transition-all",
+                          editsOn
+                            ? "bg-violet-500/20 text-violet-300 border border-violet-500/30 hover:bg-violet-500/30"
+                            : "bg-white/4 text-slate-600 border border-white/8 hover:text-slate-400",
+                          isToggling && "opacity-50 cursor-wait"
+                        )}
+                      >
+                        {editsOn
+                          ? <><ToggleRight className="w-3 h-3" />ON</>
+                          : <><ToggleLeft className="w-3 h-3" />OFF</>
+                        }
+                      </button>
+                    </td>
                     <td className="p-3">
                       <div className="flex items-center gap-1">
                         <button onClick={() => setExpanded(isExpanded ? null : worker.discordId)} className="p-1.5 rounded-lg text-slate-600 hover:text-slate-300 hover:bg-white/5 transition-colors">
@@ -235,7 +275,7 @@ export default function Workers() {
                   </tr>
                   {isExpanded && (
                     <tr style={{ background: 'rgba(139,92,246,0.04)', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-                      <td colSpan={8} className="px-6 py-4">
+                      <td colSpan={9} className="px-6 py-4">
                         <div className="grid grid-cols-3 gap-4 text-xs font-mono">
                           <div>
                             <p className="text-slate-600 text-[10px] uppercase tracking-wider mb-1">Full Worker Key</p>
@@ -250,6 +290,14 @@ export default function Workers() {
                             <p className={cn("text-2xl font-display font-bold", worker.unlockRate >= 50 ? "text-emerald-400" : "text-red-400")}>{worker.unlockRate}%</p>
                             <div className="mt-2"><ProgressBar value={worker.unlockRate} color={worker.unlockRate >= 50 ? "green" : "red"} /></div>
                           </div>
+                        </div>
+                        <div className="mt-3 pt-3 border-t border-white/5">
+                          <p className="text-[10px] uppercase tracking-wider text-slate-600 mb-1">Worker Edits</p>
+                          <p className="text-xs text-slate-500">
+                            {editsOn
+                              ? "Worker can use their own proxy, fingerprint, ADB, and NoPeCHA settings instead of global config."
+                              : "Worker uses global admin config. Enable Worker Edits to let them override with personal settings."}
+                          </p>
                         </div>
                       </td>
                     </tr>
