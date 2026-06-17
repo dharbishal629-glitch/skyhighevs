@@ -11,6 +11,14 @@ export const workersTable = pgTable("workers", {
   expiresAt: timestamp("expires_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  // Worker Edits — per-worker custom config
+  workerEditsEnabled: boolean("worker_edits_enabled").notNull().default(false),
+  workerProxy: text("worker_proxy"),
+  workerProxyEnabled: boolean("worker_proxy_enabled").notNull().default(false),
+  workerFingerprintEnabled: boolean("worker_fingerprint_enabled").notNull().default(false),
+  workerAdbEnabled: boolean("worker_adb_enabled").notNull().default(false),
+  workerNopechaKey: text("worker_nopecha_key"),
+  workerNopechaEnabled: boolean("worker_nopecha_enabled").notNull().default(false),
 });
 
 export const tokensTable = pgTable("tokens", {
