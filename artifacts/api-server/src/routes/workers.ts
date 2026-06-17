@@ -213,4 +213,33 @@ router.get("/workers/profile/:discordId", requireApiKey, async (req: Request, re
   });
 });
 
+/**
+ * PUT /api/workers/worker-edits/:discordId
+ * Admin toggles Worker Edits on/off for a specific worker.
+ * Body: { enabled: boolean }
+ */
+router.put("/workers/worker-edits/:discordId", requireApiKey, requireAdmin, async (req: Request, res: Response) => {
+  const discordId = req.params.discordId as string;
+  const { enabled } = req.body as { enabled: boolean };
+
+  if (typeof enabled !== "boolean") {
+    res.status(400).json({ error: "enabled (boolean) is required" });
+    return;
+  }
+
+  const [updated] = await db
+    .update(workersTable)
+    .set({ workerEditsEnabled: enabled, updatedAt: new Date() })
+    .where(eq(workersTable.discordId, discordId))
+    .returning();
+
+  if (!updated) {
+    res.status(404).json({ error: "Worker not found" });
+    return;
+  }
+
+  logBus.info(`Worker Edits ${enabled ? "enabled" : "disabled"} for ${updated.discordUsername} (${discordId})`);
+  res.json({ success: true, workerEditsEnabled: updated.workerEditsEnabled });
+});
+
 export default router;
