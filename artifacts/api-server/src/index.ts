@@ -74,6 +74,15 @@ async function initDb() {
         enabled    BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
+
+      -- Worker Edits columns (added incrementally, safe to run on existing DB)
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_edits_enabled    BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_proxy             TEXT;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_proxy_enabled     BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_fingerprint_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_adb_enabled       BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_nopecha_key       TEXT;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_nopecha_enabled   BOOLEAN NOT NULL DEFAULT FALSE;
     `);
     logger.info("Database tables verified/created");
   } catch (err) {
