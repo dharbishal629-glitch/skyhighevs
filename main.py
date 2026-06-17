@@ -2353,36 +2353,6 @@ async def solve_captcha_accessibility(page, cfg: dict) -> bool:
     return False
 
 
-NOPECHA_EXT_ID      = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
-_nopecha_key_lock   = threading.Lock()
-_nopecha_key_ready  = False   # True once the setup browser has saved the key this session
-
-
-def _get_nopecha_popup_path(ext_dir: str) -> str:
-    """
-    Read the extension manifest.json to find the actual popup HTML file.
-
-    Different NoPeCHA versions/releases use different filenames:
-      Manifest V2: browser_action.default_popup
-      Manifest V3: action.default_popup
-    Falls back to common names if the manifest can't be read.
-    """
-    import json as _json
-
-    manifest_path = os.path.join(ext_dir, "manifest.json")
-    try:
-        with open(manifest_path, encoding="utf-8") as f:
-            manifest = _json.load(f)
-        for key in ("action", "browser_action", "page_action"):
-            popup = manifest.get(key, {}).get("default_popup", "")
-            if popup:
-                log.debug(f"[NoPeCHA] manifest popup path: {popup}")
-                return popup.lstrip("/")
-    except Exception as e:
-        log.debug(f"[NoPeCHA] Could not read manifest: {e}")
-
-    # Fallback: try common filenames (checked in order by inject_nopecha_key_auto)
-    return "popup.html"
 
 
 def _get_tool_base_dir() -> str:
@@ -2428,859 +2398,238 @@ def _get_tool_base_dir() -> str:
     return cwd
 
 
-def ensure_nopecha_extension() -> Optional[str]:
+# ══════════════════════════════════════════════════════════════════════════════
+# NoPeCHA REST API  — NO browser extension required
+# ══════════════════════════════════════════════════════════════════════════════
+# Everything below replaces the old extension-based approach.
+#
+# WHY we dropped the extension
+# ──────────────────────────────────────────────────────────────────────────────
+# • Brave Browser's tamper detection: when ANY file inside an unpacked extension
+#   is modified at runtime, Brave disables the extension, removes its icon from
+#   the toolbar and turns off Developer Mode automatically.  There is no flag to
+#   suppress this — it is a browser-level security policy.
+# • NopeCHA's background script is an ES module ("type":"module").  Prepending
+#   IIFE code before import declarations is a parse error; the script never runs.
+#   Injecting after imports works, but Brave still kills the extension on next
+#   launch because the on-disk files differ from what was originally loaded.
+# • Moon Gen ships a PRE-MODIFIED NopeCHA extension where the key is already
+#   baked in before distribution.  We are not distributing a pre-modified copy.
+#
+# HOW the REST API approach works
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. After the registration form is submitted, we detect the hCaptcha iframe.
+# 2. We POST to api.nopecha.com with the page URL and sitekey.
+# 3. We poll until we get back a complete h-captcha-response token.
+# 4. We inject the token into the page and fire Discord's captcha callback.
+# 5. Discord submits the registration with the token — account created.
+#
+# No extension → nothing for Brave to detect or disable.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DISCORD_HCAPTCHA_SITEKEY = "4c64baad-35ee-4ad2-a60e-33621f2d5699"
+_NOPECHA_API              = "https://api.nopecha.com/"
+_NOPECHA_ERROR_MSGS       = {
+    1:  "Invalid API key — check your key on the dashboard",
+    2:  "Rate limited — too many requests",
+    3:  "No active plan / insufficient credits",
+    4:  "Invalid request body",
+    9:  "Not ready yet (keep polling)",
+    10: "Browser error on NopeCHA servers",
+    11: "Site not supported by NopeCHA",
+    12: "Your IP region is blocked by NopeCHA",
+}
+
+
+async def nopecha_solve_hcaptcha(
+    api_key:  str,
+    page_url: str = "https://discord.com/register",
+    sitekey:  str = _DISCORD_HCAPTCHA_SITEKEY,
+    timeout:  int = 120,
+) -> Optional[str]:
     """
-    Download and extract the NoPeCHA browser extension CRX to nopecha_ext/.
-    Called automatically on first run — workers need no manual setup.
-    Returns the path to the extracted extension dir, or None on failure.
-    """
-    import struct, io, zipfile as _zipfile
+    Solve an hCaptcha using the NoPeCHA REST API.
 
-    base     = _get_tool_base_dir()
-    ext_dir  = os.path.join(base, "nopecha_ext")
-    manifest = os.path.join(ext_dir, "manifest.json")
+    Returns the h-captcha-response token string on success, None on failure.
+    No browser extension is involved — pure HTTPS calls from Python.
 
-    if os.path.isfile(manifest):
-        return ext_dir   # already extracted on a previous run
-
-    print(Colorate.Horizontal(Colors.cyan_to_blue,
-        "  [NoPeCHA] Downloading extension (first-time auto-setup)..."))
-
-    # Multiple URL formats to try — Google sometimes blocks one format but not another.
-    # A proper Chrome User-Agent is required, otherwise Google returns an HTML error page.
-    _crx_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.6099.109 Safari/537.36"
-        ),
-        "Accept": "application/octet-stream,*/*",
-    }
-    _crx_urls = [
-        (
-            "https://clients2.google.com/service/update2/crx"
-            f"?response=redirect&os=win&arch=x64&prodversion=120.0.6099.109"
-            f"&acceptformat=crx2,crx3&x=id%3D{NOPECHA_EXT_ID}%26uc"
-        ),
-        (
-            "https://clients2.google.com/service/update2/crx"
-            f"?response=redirect&prodversion=120.0.6099.109"
-            f"&x=id%3D{NOPECHA_EXT_ID}%26uc"
-        ),
-        (
-            "https://clients2.google.com/service/update2/crx"
-            f"?response=redirect&prodversion=91.0.4442.4"
-            f"&acceptformat=crx2,crx3&x=id%3D{NOPECHA_EXT_ID}%26uc"
-        ),
-    ]
-
-    crx_data = None
-    for _url in _crx_urls:
-        try:
-            resp = requests.get(_url, headers=_crx_headers, timeout=30,
-                                allow_redirects=True, verify=False)
-            resp.raise_for_status()
-            if resp.content[:4] == b"Cr24":
-                crx_data = resp.content
-                log.debug(f"[NoPeCHA] CRX downloaded from: {_url[:80]}...")
-                break
-            else:
-                log.debug(f"[NoPeCHA] URL returned non-CRX data ({len(resp.content)}B), trying next...")
-        except Exception as e:
-            log.debug(f"[NoPeCHA] CRX URL failed ({e}), trying next...")
-
-    if not crx_data:
-        log.warning(
-            "[NoPeCHA] Could not download extension CRX from any URL.\n"
-            "          → Download it manually: chrome.google.com/webstore/detail/"
-            f"{NOPECHA_EXT_ID}\n"
-            "          → Extract the .crx to a folder named 'nopecha_ext' next to main.py"
-        )
-        return None
-
-    # Parse CRX header (supports CRX2 and CRX3) to find the ZIP payload
-    if crx_data[:4] != b"Cr24":
-        log.warning("[NoPeCHA] Unexpected CRX magic bytes — download may be corrupt")
-        return None
-
-    version = struct.unpack_from("<I", crx_data, 4)[0]
-    try:
-        if version == 3:
-            header_size = struct.unpack_from("<I", crx_data, 8)[0]
-            zip_start   = 12 + header_size
-        elif version == 2:
-            pk_len  = struct.unpack_from("<I", crx_data, 8)[0]
-            sig_len = struct.unpack_from("<I", crx_data, 12)[0]
-            zip_start = 16 + pk_len + sig_len
-        else:
-            log.warning(f"[NoPeCHA] Unknown CRX version {version}")
-            return None
-    except struct.error as e:
-        log.warning(f"[NoPeCHA] CRX header parse error: {e}")
-        return None
-
-    zip_payload = crx_data[zip_start:]
-    os.makedirs(ext_dir, exist_ok=True)
-    try:
-        with _zipfile.ZipFile(io.BytesIO(zip_payload)) as zf:
-            zf.extractall(ext_dir)
-    except Exception as e:
-        log.warning(f"[NoPeCHA] CRX extract failed: {e}")
-        shutil.rmtree(ext_dir, ignore_errors=True)
-        return None
-
-    if not os.path.isfile(manifest):
-        log.warning("[NoPeCHA] Extracted CRX has no manifest.json — corrupt download")
-        shutil.rmtree(ext_dir, ignore_errors=True)
-        return None
-
-    print(Colorate.Horizontal(Colors.green_to_cyan,
-        f"  [NoPeCHA] Extension ready → {ext_dir}"))
-    return ext_dir
-
-
-
-async def inject_nopecha_key_auto(browser, ext_id: str, api_key: str,
-                                  ext_dir: str = "") -> bool:
-    """
-    Fully automatic NoPeCHA API key injection — ZERO user interaction required.
-
-    Why not profile-copy:
-      Chrome's chrome.storage LevelDB files cannot be reliably copied while
-      Chrome is running (files may be uncommitted). Copying results in NoPeCHA
-      loading but reading no key → it detects captchas but silently fails to
-      solve them. This function injects the key fresh every time instead.
-
-    Flow:
-      1. Determine the correct popup HTML path from the extension manifest
-         (different NoPeCHA versions use different filenames).
-      2. Open that popup as a browser tab; fall back through common names if
-         ERR_FILE_NOT_FOUND.
-      3. Dismiss any promo banner.
-      4. Programmatically click the "Enter API key" button/link.
-      5. Fill key via native setter + fire events + press Enter → NoPeCHA
-         validates via its servers and saves to chrome.storage.local.
-      6. Verify key is now active.
-    """
-    safe_key = api_key.replace("\\", "\\\\").replace("'", "\\'")
-
-    # ── Determine the correct popup file from the manifest ──────────────────
-    # Different NoPeCHA releases use different filenames. We read the manifest
-    # first; fall back to a list of common names if that fails or 404s.
-    popup_candidates: list[str] = []
-    if ext_dir:
-        manifest_popup = _get_nopecha_popup_path(ext_dir)
-        popup_candidates.append(manifest_popup)
-    for fallback in ("popup.html", "index.html", "app.html", "main.html", "panel.html"):
-        if fallback not in popup_candidates:
-            popup_candidates.append(fallback)
-
-    ext_page = None
-    for popup_file in popup_candidates:
-        popup_url = f"chrome-extension://{ext_id}/{popup_file}"
-        try:
-            candidate = await browser.get(popup_url)
-            await asyncio.sleep(1.5)
-            # Check whether the page actually loaded (vs ERR_FILE_NOT_FOUND)
-            title = await candidate.evaluate("document.title || ''")
-            body  = await candidate.evaluate("document.body ? document.body.innerText.slice(0,80) : ''")
-            if "not found" in str(body).lower() or "file_not_found" in str(body).lower():
-                log.debug(f"[NoPeCHA] {popup_file} → not found, trying next...")
-                continue
-            ext_page = candidate
-            log.debug(f"[NoPeCHA] Popup loaded: {popup_file} (title={title!r})")
-            break
-        except Exception as e:
-            log.debug(f"[NoPeCHA] {popup_file} → error: {e}, trying next...")
-
-    if ext_page is None:
-        log.warning("[NoPeCHA] Could not open extension popup (all candidates failed)")
-        return False
-
-    await asyncio.sleep(0.5)
-
-    try:
-        # Dismiss the "Join our Discord" promo banner if present
-        await ext_page.evaluate(
-            "(() => {"
-            "  let all = Array.from(document.querySelectorAll('*'));"
-            "  let x = all.find(e =>"
-            "    ['×','✕','✖','x','X'].includes(e.textContent.trim()) &&"
-            "    e.getBoundingClientRect().width > 0 &&"
-            "    e.getBoundingClientRect().width < 40);"
-            "  if (x) x.click();"
-            "  return x ? 'dismissed' : 'none';"
-            "})()"
-        )
-        await asyncio.sleep(0.4)
-
-        # Auto-click "Enter API key" button so the input field appears
-        clicked = await ext_page.evaluate(
-            "(() => {"
-            "  let all = Array.from(document.querySelectorAll('button,a,span,p,div,li'));"
-            "  let btn = all.find(e => {"
-            "    if (!e.getBoundingClientRect().width) return false;"
-            "    let t = (e.textContent || '').trim().toLowerCase();"
-            "    return t.includes('enter api key') || t === 'api key' || t === 'key';"
-            "  });"
-            "  if (btn) { btn.click(); return 'clicked'; }"
-            "  return 'not-found';"
-            "})()"
-        )
-        log.debug(f"[NoPeCHA] 'Enter API key' click: {clicked}")
-        await asyncio.sleep(0.8)
-
-        # Wait up to 10 s for the input field to appear
-        found_input = False
-        for _ in range(20):
-            has = await ext_page.evaluate(
-                "(() => {"
-                "  let i = Array.from(document.querySelectorAll('input,textarea'))"
-                "    .find(e => e.getBoundingClientRect().width > 0 && e.type !== 'checkbox');"
-                "  return i ? 'yes' : 'no';"
-                "})()"
-            )
-            if has == "yes":
-                found_input = True
-                break
-            await asyncio.sleep(0.5)
-
-        if not found_input:
-            log.warning("[NoPeCHA] Input field not found after clicking — key inject skipped")
-            return False
-
-        log.info("[NoPeCHA] Input detected — filling API key automatically...")
-
-        # Fill key via native React/Vue setter + fire events + press Enter
-        await ext_page.evaluate(
-            f"(() => {{"
-            f"  let inp = Array.from(document.querySelectorAll('input,textarea'))"
-            f"    .find(e => e.getBoundingClientRect().width > 0 && e.type !== 'checkbox');"
-            f"  if (!inp) return;"
-            f"  let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
-            f"  if (setter) setter.call(inp, '{safe_key}'); else inp.value = '{safe_key}';"
-            f"  inp.dispatchEvent(new Event('input',  {{bubbles:true}}));"
-            f"  inp.dispatchEvent(new Event('change', {{bubbles:true}}));"
-            f"  inp.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,which:13,bubbles:true}}));"
-            f"  inp.dispatchEvent(new KeyboardEvent('keyup',  {{key:'Enter',keyCode:13,which:13,bubbles:true}}));"
-            f"}})()"
-        )
-        await asyncio.sleep(5)  # NoPeCHA validates key via its servers + flushes chrome.storage
-
-        # Confirm key is now active
-        still_asking = await ext_page.evaluate(
-            "(() => {"
-            "  let els = Array.from(document.querySelectorAll('*'));"
-            "  let e = els.find(e => e.getBoundingClientRect().width > 0"
-            "    && (e.textContent || '').trim().toLowerCase().includes('enter api key'));"
-            "  return e ? 'yes' : 'no';"
-            "})()"
-        )
-        if still_asking == "no":
-            log.success("[NoPeCHA] API key saved and active in worker browser ✓")
-            return True
-
-        log.warning("[NoPeCHA] Key may not have saved — check NoPeCHA plan/credits")
-        return True  # proceed anyway; extension will show whether it works
-
-    except Exception as e:
-        log.warning(f"[NoPeCHA] Key inject error: {e}")
-        return False
-
-
-# Keep old name as alias so any direct callers still work
-inject_nopecha_key = inject_nopecha_key_auto
-
-
-# ── NoPeCHA direct file injection (no browser tab, no popup UI) ──────────────
-
-_NOPECHA_INJECT_MARKER = "// __SKYHIGHEV_NOPECHA_INJECT_START__"
-_NOPECHA_INJECT_END    = "// __SKYHIGHEV_NOPECHA_INJECT_END__"
-
-
-def inject_nopecha_key_into_extension_files(ext_dir: str, api_key: str) -> bool:
-    """
-    Inject the NoPeCHA API key into the extension's background script.
-
-    ES-MODULE AWARENESS (key fix)
-    ──────────────────────────────
-    NopeCHA MV3 uses a Module Service Worker ("type": "module" in manifest.json).
-    ES modules FORBID code before import declarations — prepending an IIFE to such
-    a file causes a silent parse failure: the background never initialises, nothing
-    runs, and the key is never set.
-
-    Detection: we read the manifest background config for "type": "module".
-      • ES module  → inject AFTER the last import statement in the file.
-      • Classic script → prepend at the top (original behaviour, still works).
-
-    In both cases the injected block:
-      1. Reads the API key from chrome.runtime.getManifest() (synchronous, written
-         by inject_nopecha_key_into_manifest() before Chrome even opens the file).
-      2. Falls back to the hardcoded key embedded in the block itself.
-      3. Calls chrome.storage.local.set() for persistence across SW restarts.
-      4. Overrides chrome.storage.local.get() so every subsequent read (callback
-         or Promise) returns the injected key immediately.
-    """
-    import json as _json, glob as _glob
-
-    safe_key = api_key.replace("\\", "\\\\").replace('"', '\\"')
-
-    # ── Find the background script from manifest.json ─────────────────────────
-    manifest_path = os.path.join(ext_dir, "manifest.json")
-    bg_script_rel = None
-    is_module     = False
-    try:
-        with open(manifest_path, encoding="utf-8") as f:
-            manifest = _json.load(f)
-        bg = manifest.get("background", {})
-        bg_script_rel = bg.get("service_worker") or bg.get("scripts", [None])[0]
-        is_module     = (bg.get("type", "").lower() == "module")
-    except Exception as e:
-        log.debug(f"[NoPeCHA] manifest.json read error: {e}")
-
-    bg_script_path = None
-    if bg_script_rel:
-        candidate = os.path.join(ext_dir, bg_script_rel.lstrip("/\\"))
-        if os.path.isfile(candidate):
-            bg_script_path = candidate
-
-    if not bg_script_path:
-        for name in ("background.js", "background-script.js", "worker.js",
-                     "sw.js", "service-worker.js", "service_worker.js",
-                     "background.min.js", "bg.js"):
-            candidate = os.path.join(ext_dir, name)
-            if os.path.isfile(candidate):
-                bg_script_path = candidate
-                break
-
-    if not bg_script_path:
-        log.warning("[NoPeCHA] Could not locate background script — injection skipped")
-        return False
-
-    bg_filename = os.path.basename(bg_script_path)
-
-    # ── Discover every storage key name this extension version uses ───────────
-    key_names: set = set()
-    for js_path in _glob.glob(os.path.join(ext_dir, "**", "*.js"), recursive=True):
-        try:
-            with open(js_path, encoding="utf-8", errors="ignore") as f:
-                src_scan = f.read()
-            for m in re.finditer(
-                r'chrome\.storage\.(?:local|sync)\.(?:set|get)\s*\(\s*[{"\']([a-zA-Z_][a-zA-Z0-9_]{1,29})',
-                src_scan
-            ):
-                key_names.add(m.group(1))
-        except Exception:
-            pass
-    key_names.update(["key", "api_key", "apiKey", "nopechaKey", "nopecha_key"])
-
-    # Build combined storage object  e.g. {"api_key":K,"key":K,...}
-    combined = "{" + ",".join(f'"{k}":K' for k in sorted(key_names)) + "}"
-
-    # ── Build injection block ─────────────────────────────────────────────────
-    # For ES modules we use const/arrow-functions and call storage.get() as a
-    # Promise (not with a callback).  For classic scripts we use var/function and
-    # the callback form for maximum compatibility.
-    if is_module:
-        inject_block = (
-            f'\n{_NOPECHA_INJECT_MARKER}\n'
-            f';(()=>{{try{{\n'
-            f'  const _m=(typeof chrome!=="undefined"&&chrome.runtime&&chrome.runtime.getManifest)?chrome.runtime.getManifest():{{}};\n'
-            f'  const K=(_m.nopecha_key||_m.key||"{safe_key}")||"{safe_key}";\n'
-            f'  const _KS={combined};\n'
-            f'  chrome.storage.local.set(_KS).catch(()=>{{}});\n'
-            f'  chrome.storage.sync .set(_KS).catch(()=>{{}});\n'
-            f'  const _mkGet=orig=>(q,cb)=>{{\n'
-            f'    const p=orig(q).then(r=>{{\n'
-            f'      r=r||{{}};\n'
-            f'      const ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
-            f'      if(ks.length===0)Object.assign(r,_KS);\n'
-            f'      else ks.forEach(k=>{{if(_KS[k]!==undefined)r[k]=_KS[k];}});\n'
-            f'      return r;\n'
-            f'    }});\n'
-            f'    if(typeof cb==="function")p.then(cb);\n'
-            f'    return p;\n'
-            f'  }};\n'
-            f'  chrome.storage.local.get=_mkGet(chrome.storage.local.get.bind(chrome.storage.local));\n'
-            f'  chrome.storage.sync .get=_mkGet(chrome.storage.sync .get.bind(chrome.storage.sync ));\n'
-            f'}}catch(e){{}}}})()\n'
-            f'{_NOPECHA_INJECT_END}\n'
-        )
-    else:
-        inject_block = (
-            f'{_NOPECHA_INJECT_MARKER}\n'
-            f'(function(){{try{{\n'
-            f'  var _m=(typeof chrome!=="undefined"&&chrome.runtime&&chrome.runtime.getManifest)?chrome.runtime.getManifest():{{}};\n'
-            f'  var K=(_m.nopecha_key||_m.key||"{safe_key}")||"{safe_key}";\n'
-            f'  var _KS={combined};\n'
-            f'  try{{chrome.storage.local.set(_KS);}}catch(e){{}}\n'
-            f'  try{{chrome.storage.sync .set(_KS);}}catch(e){{}}\n'
-            f'  function _mkGet(orig){{\n'
-            f'    return function(q,cb){{\n'
-            f'      var p=new Promise(function(resolve){{\n'
-            f'        orig(q,function(r){{\n'
-            f'          r=r||{{}};\n'
-            f'          var ks=typeof q==="string"?[q]:Array.isArray(q)?q:(q&&typeof q==="object"?Object.keys(q):[]);\n'
-            f'          if(ks.length===0){{Object.assign(r,_KS);}}\n'
-            f'          else{{ks.forEach(function(k){{if(_KS[k]!==undefined)r[k]=_KS[k];}});}}\n'
-            f'          resolve(r);\n'
-            f'        }});\n'
-            f'      }});\n'
-            f'      if(typeof cb==="function")p.then(cb);\n'
-            f'      return p;\n'
-            f'    }};\n'
-            f'  }}\n'
-            f'  chrome.storage.local.get=_mkGet(chrome.storage.local.get.bind(chrome.storage.local));\n'
-            f'  chrome.storage.sync .get=_mkGet(chrome.storage.sync .get.bind(chrome.storage.sync ));\n'
-            f'}}catch(e){{}}}}());\n'
-            f'{_NOPECHA_INJECT_END}\n'
-        )
-
-    # ── Read file, strip old injection, insert at the right position ──────────
-    try:
-        with open(bg_script_path, encoding="utf-8", errors="ignore") as f:
-            original = f.read()
-
-        # Remove any previous injection block (idempotent)
-        if _NOPECHA_INJECT_MARKER in original:
-            si = original.find(_NOPECHA_INJECT_MARKER)
-            ei = original.find(_NOPECHA_INJECT_END, si)
-            if ei != -1:
-                original = (original[:si] +
-                            original[ei + len(_NOPECHA_INJECT_END):].lstrip("\n"))
-
-        if is_module:
-            # ── ES MODULE: inject AFTER the last import statement ─────────────
-            # Prepending to an ES module breaks parsing (imports must come first).
-            # We find the position just after the last top-level import and insert
-            # there — valid module-level code, no syntax error.
-            last_import_end = 0
-            # Regex: top-level import statements (handles side-effect, named,
-            # default, namespace, and dynamic-import-in-string-literal forms).
-            for m in re.finditer(
-                r'^[ \t]*import\s+(?:[^;\'"`]|\'[^\']*\'|"[^"]*")*;',
-                original, re.MULTILINE
-            ):
-                last_import_end = m.end()
-
-            if last_import_end:
-                new_content = (original[:last_import_end]
-                               + "\n" + inject_block
-                               + original[last_import_end:])
-                log.debug("[NoPeCHA] ES-module detected — injecting after import block")
-            else:
-                # No imports found; safe to prepend
-                new_content = inject_block + original
-        else:
-            # ── CLASSIC SCRIPT: prepend at top ────────────────────────────────
-            new_content = inject_block + original
-
-        with open(bg_script_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-
-        mode_tag = "ES-module" if is_module else "classic"
-        log.success(f"[NoPeCHA] Key injected into {bg_filename} ({mode_tag}) ✓")
-        return True
-
-    except Exception as e:
-        log.warning(f"[NoPeCHA] File injection failed ({bg_filename}): {e}")
-        return False
-
-
-def inject_nopecha_key_into_manifest(ext_dir: str, api_key: str) -> bool:
-    """
-    Write the NoPeCHA API key directly into the extension's manifest.json.
-
-    This is the approach used by other generators (e.g. Moon Gen):
-      • The key is written into manifest.json BEFORE Chrome loads the extension.
-      • The background script can then read it synchronously via
-        chrome.runtime.getManifest().nopecha_key  (or .key) — zero async race.
-      • No popup, no chrome.storage, no timing dependency.
-
-    We write the key under both "nopecha_key" and "key" field names so the
-    extension finds it regardless of which field name its version uses.
+    API reference: https://nopecha.com/api-reference/
     """
     import json as _json
+    import urllib.request as _ur
+    import urllib.error as _uerr
 
-    manifest_path = os.path.join(ext_dir, "manifest.json")
+    if not api_key:
+        log.warning("[NoPeCHA] API key is empty — cannot call REST API")
+        return None
+
+    # ── Step 1: Submit the task ───────────────────────────────────────────────
+    payload = _json.dumps({
+        "key":     api_key,
+        "type":    "hcaptcha",
+        "url":     page_url,
+        "sitekey": sitekey,
+    }).encode()
+
     try:
-        with open(manifest_path, encoding="utf-8") as f:
-            manifest = _json.load(f)
-
-        manifest["nopecha_key"] = api_key
-        manifest["key"]         = api_key
-
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            _json.dump(manifest, f, indent=2)
-
-        log.success(f"[NoPeCHA] Key injected into manifest.json ✓")
-        return True
-
-    except Exception as e:
-        log.warning(f"[NoPeCHA] manifest.json injection failed: {e}")
-        return False
-
-
-async def _nopecha_set_key_via_extension_context(browser, api_key: str, ext_dir: str) -> bool:
-    """
-    Set the NopeCHA API key directly into the extension's chrome.storage.local by
-    navigating to the extension's own popup page inside a tab.
-
-    WHY this is necessary
-    ─────────────────────
-    NopeCHA's background script is often declared as an ES-module service worker
-    (manifest "type": "module").  Prepending IIFE code to an ES-module file causes
-    a silent parse failure — the storage.set() call in our injected code never runs,
-    so the extension connects to the NopeCHA API without a key (showing "Unavailable").
-
-    The popup page (chrome-extension://{id}/popup.html) runs in the extension's own
-    security origin and has full chrome.* API access including chrome.storage.local.
-    By opening it in a hidden tab and calling storage.set() from there, the key is
-    written to the extension's persistent storage — the same storage the background
-    service worker reads when solving captchas.
-
-    This is the underlying mechanism that makes tools like Moon Gen reliable: the key
-    is in the extension's storage before any captcha is encountered, so NopeCHA always
-    has it when it calls the solver API.
-    """
-    try:
-        from nodriver import cdp as _cdp
-        import asyncio
-
-        safe_key = api_key.replace("\\", "\\\\").replace('"', '\\"')
-        ext_id   = None
-
-        # ── Step 1: Wait for the extension's service worker to appear in targets ──
-        # Chrome registers the SW target when the extension first loads.
-        for _attempt in range(25):
-            try:
-                targets = await browser.connection.send(_cdp.target.get_targets())
-                for t in (targets or []):
-                    url = getattr(t, "url", "") or ""
-                    if url.startswith("chrome-extension://"):
-                        candidate = url.split("//")[1].split("/")[0]
-                        # Extension IDs are exactly 32 lowercase a-p characters
-                        if len(candidate) == 32 and candidate.replace("a","").replace("b","").replace("c","").replace("d","").replace("e","").replace("f","").replace("g","").replace("h","").replace("i","").replace("j","").replace("k","").replace("l","").replace("m","").replace("n","").replace("o","").replace("p","") == "":
-                            ext_id = candidate
-                            break
-            except Exception:
-                pass
-            if ext_id:
-                break
-            await asyncio.sleep(0.3)
-
-        if not ext_id:
-            log.warning("[NoPeCHA] Extension ID not found in browser targets — file injection only")
-            return False
-
-        # ── Step 2: Open the popup URL as a tab (extension context = full chrome.* access) ──
-        popup_url = f"chrome-extension://{ext_id}/popup.html"
-        try:
-            tab = await browser.get(popup_url, new_tab=True)
-        except Exception:
-            tab = await browser.get(popup_url)
-
-        await asyncio.sleep(1.5)   # let popup.html fully initialize
-
-        # ── Step 3: Set key in extension storage from within extension context ──
-        storage_js = (
-            f'chrome.storage.local.set({{'
-            f'  key:"{safe_key}",'
-            f'  nopecha_key:"{safe_key}",'
-            f'  api_key:"{safe_key}",'
-            f'  apiKey:"{safe_key}"'
-            f'}});'
+        req = _ur.Request(
+            _NOPECHA_API,
+            data    = payload,
+            headers = {"Content-Type": "application/json",
+                       "User-Agent":   "CTRL.PNL/1.0"},
+            method  = "POST",
         )
-        await tab.evaluate(storage_js)
-        await asyncio.sleep(0.5)   # let storage write complete
+        with _ur.urlopen(req, timeout=30) as r:
+            resp = _json.loads(r.read())
+    except _uerr.HTTPError as e:
+        log.warning(f"[NoPeCHA] Submit HTTP error {e.code}: {e.reason}")
+        return None
+    except Exception as e:
+        log.warning(f"[NoPeCHA] Submit failed: {e}")
+        return None
 
-        # ── Step 4: Close the popup tab ──────────────────────────────────────────
-        try:
-            await tab.close()
-        except Exception:
-            pass
+    err  = resp.get("error", resp.get("status", -1))
+    data = resp.get("data",  "")
 
-        log.success(f"[NoPeCHA] Key written to extension storage via popup context ✓  (ext={ext_id[:8]}...)")
-        return True
+    if err == 1:
+        log.error("[NoPeCHA] ✗ Invalid API key — update it on the dashboard")
+        return None
+    if err == 3:
+        log.error("[NoPeCHA] ✗ No active NopeCHA plan — check your credits at nopecha.com")
+        return None
+    if err not in (0, 9) and err != -1:
+        log.warning(f"[NoPeCHA] Submit rejected: {_NOPECHA_ERROR_MSGS.get(err, f'error {err}')}")
+        return None
 
-    except Exception as exc:
-        log.warning(f"[NoPeCHA] Extension-context storage set failed: {exc}")
-        return False
+    # NopeCHA sometimes returns the token immediately (cached / fast solve)
+    token = str(data) if data else ""
+    if len(token) > 64:
+        log.success("[NoPeCHA] Token returned immediately ✓")
+        return token
 
+    task_id = token
+    if not task_id:
+        log.warning("[NoPeCHA] Submit returned no task ID")
+        return None
 
-async def wait_for_nopecha_solve(page, api_key: str = "", timeout: int = 300) -> bool:
-    """
-    Wait for the NoPeCHA browser extension to solve the hCaptcha.
+    log.info(f"[NoPeCHA] Task submitted (id={task_id[:14]}…) — polling for solution…")
 
-    NoPeCHA is an EXTENSION-based solver — it visually detects the captcha,
-    moves a blue cursor inside the challenge iframe, and submits the answer.
-    Our code must NOT interfere — no clicking, no DOM changes, just watch.
+    # ── Step 2: Poll until solved or timeout ─────────────────────────────────
+    poll_url = f"{_NOPECHA_API}?id={task_id}&key={api_key}"
+    deadline = asyncio.get_event_loop().time() + timeout
+    interval = 4.0     # NopeCHA typically solves hCaptcha in 5-30 s
 
-    Signals we trust (in order of reliability):
-      1. URL leaves /register  → Discord redirected after successful registration
-      2. Discord token appears in localStorage  → account created (fires before redirect)
-    The hCaptcha iframe briefly disappearing is NOT used as a signal — it flickers
-    during challenge transitions and causes false-positives.
-
-    Returns True when solved, False on timeout (NoPeCHA extension keeps running).
-    """
-    # ── Phase 1: 15 s fast-exit (no captcha case) ──────────────────────────
-    for _ in range(15):
-        await asyncio.sleep(1.0)
-        try:
-            url = str(await page.evaluate("window.location.href") or "")
-        except Exception:
-            return True
-        if url and "register" not in url:
-            log.info("[NoPeCHA] No captcha needed — page already moved on")
-            return True
-
-    # ── Phase 2: captcha blocking — NoPeCHA is on it ───────────────────────
-    log.info("[NoPeCHA] Captcha detected — extension is solving (blue cursor)...")
-
-    # ── Phase 3: wait passively, check two reliable signals ────────────────
-    elapsed   = 0.0
-    _LOG_STEP = 30
-    _next_log = _LOG_STEP
-    while elapsed < timeout:
-        await asyncio.sleep(1.0)
-        elapsed += 1.0
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(interval)
+        interval = min(interval * 1.15, 8.0)   # back off gently
 
         try:
-            url = str(await page.evaluate("window.location.href") or "")
-        except Exception:
-            log.success("[NoPeCHA] Page navigated — captcha solved ✓")
-            return True
+            with _ur.urlopen(
+                _ur.Request(poll_url,
+                            headers={"User-Agent": "CTRL.PNL/1.0"}),
+                timeout=15
+            ) as r:
+                resp = _json.loads(r.read())
+        except Exception as e:
+            log.debug(f"[NoPeCHA] Poll error: {e}")
+            continue
 
-        # Signal 1: URL left the register/login pages
-        if url and "register" not in url and "login" not in url:
-            log.success("[NoPeCHA] Captcha solved — page redirected ✓")
-            return True
+        err   = resp.get("error", resp.get("status", -1))
+        data  = resp.get("data",  "")
+        token = str(data) if data else ""
 
-        # Signal 2: Discord auth token in localStorage (most reliable — fires
-        # the moment the account is created, even before the URL changes)
-        try:
-            has_token = await page.evaluate(
-                "(()=>{ try{ return !!localStorage.getItem('token'); } catch(e){ return false; } })()"
-            )
-            if has_token:
-                log.success("[NoPeCHA] Captcha solved — Discord token in localStorage ✓")
-                return True
-        except Exception:
-            pass
-
-        if elapsed >= _next_log:
-            log.debug(f"[NoPeCHA] Extension solving... ({elapsed:.0f}s / {timeout}s)")
-            _next_log += _LOG_STEP
-
-    log.warning(f"[NoPeCHA] {timeout}s elapsed — extension may still be working in background")
-    return False
-
-
-async def wait_for_account_creation(page, timeout: int = 300) -> bool:
-    """
-    Poll until Discord account is created. Uses four independent signals so that
-    a slow/lagging page.url never causes the tool to freeze:
-      1. URL contains /channels/ or /@me  (standard redirect)
-      2. Discord auth token appears in localStorage  (most reliable)
-      3. Registration email input disappears AND page title changed  (nav complete)
-      4. Discord app container element appears in the DOM  (UI mounted)
-    Any one signal returning True is enough to proceed.
-    """
-    start = time.time()
-    last_url = ""
-    while (time.time() - start) < timeout:
-        await asyncio.sleep(0.4)
-        try:
-            # ── Signal 1: URL-based detection ─────────────────────────────
-            # ALWAYS read window.location.href via JS — page.url is a cached
-            # property that stays stale after navigation and must NOT be the
-            # primary source. Only fall back to page.url if the evaluate fails.
-            url = ""
-            try:
-                raw = await page.evaluate('window.location.href')
-                url = str(raw) if raw else ""
-            except Exception:
-                pass
-            if not url:
-                try:
-                    url = str(page.url) if page.url else ""
-                except Exception:
-                    pass
-            if url and url != last_url:
-                last_url = url
-                log.debug(f"[account-wait] URL → {url[:80]}")
-            if url and (
-                "discord.com/channels/" in url
-                or "channels/%40me" in url
-                or "discord.com/@me" in url
-            ):
-                log.info("[account-wait] Detected via URL redirect")
-                return True
-
-            # ── Signal 2: localStorage token present ──────────────────────
-            # Discord writes the auth token to localStorage as soon as the
-            # account is created — this fires even before the URL changes.
-            try:
-                has_token = await page.evaluate(
-                    '(()=>{ try{ return !!localStorage.getItem("token"); } catch(e){ return false; } })()'
-                )
-                if has_token:
-                    log.info("[account-wait] Detected via localStorage token")
-                    return True
-            except Exception:
-                pass
-
-            # ── Signal 3: Registration form gone + title changed ──────────
-            try:
-                form_gone = await page.evaluate(
-                    '(()=>{ try{'
-                    '  const emailInput = document.querySelector("input[name=\\"email\\"]");'
-                    '  const passInput  = document.querySelector("input[name=\\"password\\"]");'
-                    '  return !emailInput && !passInput;'
-                    '} catch(e){ return false; } })()'
-                )
-                if form_gone and url and "register" not in url:
-                    log.info("[account-wait] Detected via form disappearance")
-                    return True
-            except Exception:
-                pass
-
-            # ── Signal 4: Discord logged-in-only UI elements ─────────────
-            # Guard: ONLY check if we're no longer on the register page.
-            # The register page itself is a React SPA and has generic app-level
-            # containers — checking them without the URL guard causes a false positive.
-            # We look for elements that ONLY exist when the user is logged in:
-            #   - [aria-label="Servers"] = the guilds/server list nav
-            #   - [data-list-id="guildsnav"] = the server sidebar
-            #   - [class*="guilds-"] = server icon list
-            if url and "register" not in url and "login" not in url:
-                try:
-                    logged_in_ui = await page.evaluate(
-                        '(()=>{ try{'
-                        '  return !!(document.querySelector("[aria-label=\\"Servers\\"]") || '
-                        '            document.querySelector("[data-list-id=\\"guildsnav\\"]") || '
-                        '            document.querySelector("[class*=\\"guilds-\\"]") || '
-                        '            document.querySelector("[class*=\\"privateChannels-\\"]"));'
-                        '} catch(e){ return false; } })()'
-                    )
-                    if logged_in_ui:
-                        log.info("[account-wait] Detected via logged-in Discord UI")
-                        return True
-                except Exception:
-                    pass
-
-        except Exception:
-            pass
-
-    log.error("Timeout waiting for account creation")
-    return False
-
-async def extract_token_via_api(email: str, password: str) -> Optional[str]:
-    """Fetch Discord token by logging in via API — more reliable than localStorage."""
-    # Pass the aged Discord x-fingerprint fetched earlier this run (global config)
-    x_fp = config.get("_discord_xfp")
-    for attempt in range(5):
-        await asyncio.sleep(3)
-        token = await fetch_discord_token(email, password, x_fingerprint=x_fp)
-        if token:
-            log.success(f"Token fetched via API (attempt {attempt+1})")
+        if err == 9:            # not ready — keep waiting
+            log.debug("[NoPeCHA] Still solving…")
+            continue
+        if err != 0:
+            log.warning(f"[NoPeCHA] Poll error: {_NOPECHA_ERROR_MSGS.get(err, f'code {err}')}")
+            return None
+        if len(token) > 64:
+            log.success(f"[NoPeCHA] hCaptcha solved ✓  token={token[:22]}…")
             return token
-        log.debug(f"Token attempt {attempt+1} returned empty")
+
+    log.warning(f"[NoPeCHA] Timed out after {timeout}s — no solution received")
     return None
 
 
-# ============================================================================
-# WORKER
-# ============================================================================
-
-DISPLAY_NAMES = [
-    'Afham','Arhan','Ahmed','Ali','Hassan','Ibrahim','Karim','Malik','Omar','Rashid',
-    'Alex','Jordan','Taylor','Morgan','Casey','Riley','Sam','Blake','Drew','Avery',
-    'Henrik','Johan','Magnus','Nils','Pierre','Jean','Claude','Antoine','Benoit',
-    'Akira','Kenji','Koji','Satoshi','Takeshi','Wei','Lei','Ming','Jun','Feng',
-    'Arjun','Ankit','Aditya','Devesh','Harish','Raj','Vikram','Rohan','Sanjay',
-    'Ashton','Bradley','Calvin','Derek','Ethan','Fiona','Graham','Harper','Jackson',
-]
-
-_JS_CLEAR_DISCORD_SESSION = """
-(function() {
-    try { localStorage.clear(); } catch(e) {}
-    try { sessionStorage.clear(); } catch(e) {}
-    try {
-        document.cookie.split(';').forEach(function(c) {
-            var name = c.split('=')[0].trim();
-            var expire = 'expires=Thu, 01 Jan 1970 00:00:00 UTC;';
-            document.cookie = name + '=;' + expire + 'path=/;domain=.discord.com;';
-            document.cookie = name + '=;' + expire + 'path=/;domain=discord.com;';
-            document.cookie = name + '=;' + expire + 'path=/;';
-        });
-    } catch(e) {}
-    return 'ok';
-})();
-"""
-
-async def _clear_discord_session(browser, page=None) -> None:
+async def nopecha_inject_token(page, token: str) -> bool:
     """
-    Wipe Discord's cookies + localStorage so the next tab opens fresh
-    on the register page instead of redirecting to the home feed.
+    Inject a solved hCaptcha token into a browser page and trigger the
+    form submission callback.
 
-    Strategy (in order):
-      1. CDP Storage.clearDataForOrigin via browser.connection  (best)
-      2. CDP Network.clearBrowserCookies via browser.connection (fallback)
-      3. JS execution on the discord tab to wipe localStorage +
-         sessionStorage + non-httpOnly cookies              (JS fallback)
-
-    This does NOT call Discord's logout API — the token already
-    extracted remains valid on Discord's servers.
-
-    IMPORTANT: call this BEFORE closing the discord tab so that
-    browser.connection is still alive and the JS fallback can run.
+    This replicates what hCaptcha does internally when a user solves the
+    challenge: sets the textarea value and fires the registered callback
+    (which for Discord submits the registration form).
     """
-    cdp_ok = False
+    import json as _json
 
-    # ── 1 & 2: CDP path (requires live browser.connection) ────────────────
-    if browser is not None and getattr(browser, "connection", None) is not None:
-        try:
-            from nodriver import cdp as _cdp
-            await browser.connection.send(
-                _cdp.storage.clear_data_for_origin(
-                    origin="https://discord.com",
-                    storage_types="cookies,local_storage,indexedDB,service_workers,cache_storage",
-                )
-            )
-            log.debug("[Session] discord.com site data cleared via CDP ✓")
-            cdp_ok = True
-        except Exception as e:
-            log.debug(f"[Session] clearDataForOrigin failed ({e}), trying clearBrowserCookies...")
+    safe_tok = _json.dumps(token)   # properly escaped JS string literal
 
-        if not cdp_ok and getattr(browser, "connection", None) is not None:
-            try:
-                from nodriver import cdp as _cdp
-                await browser.connection.send(_cdp.network.clear_browser_cookies())
-                log.debug("[Session] All browser cookies cleared via CDP ✓")
-                cdp_ok = True
-            except Exception as e:
-                log.debug(f"[Session] clearBrowserCookies also failed ({e})")
-    else:
-        log.debug("[Session] browser.connection unavailable — skipping CDP clear")
+    try:
+        result = await page.evaluate(f"""
+        (function() {{
+            var token = {safe_tok};
+            var injected = 0;
 
-    # ── 3: JS fallback — wipes localStorage, sessionStorage, JS-accessible cookies ──
-    # Runs on the discord tab while it is still open.  httpOnly cookies
-    # are NOT cleared here (CDP handles those above), but localStorage
-    # and sessionStorage alone prevent the "already logged in" redirect.
-    if page is not None:
-        try:
-            await page.evaluate(_JS_CLEAR_DISCORD_SESSION)
-            log.debug("[Session] localStorage / sessionStorage / JS cookies cleared via JS ✓")
-        except Exception as e:
-            log.debug(f"[Session] JS clear failed ({e})")
+            // ── 1. Set every h-captcha-response textarea ──────────────────
+            document.querySelectorAll('textarea[name="h-captcha-response"]').forEach(function(el) {{
+                try {{
+                    var s = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                    if (s && s.set) s.set.call(el, token); else el.value = token;
+                }} catch(e) {{ el.value = token; }}
+                el.dispatchEvent(new Event('input',  {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                injected++;
+            }});
 
-    if not cdp_ok:
-        log.debug("[Session] CDP clear skipped/failed — JS fallback was the only cleanup")
+            // ── 2. Also set g-recaptcha-response (some hCaptcha builds read this) ──
+            document.querySelectorAll('textarea[name="g-recaptcha-response"]').forEach(function(el) {{
+                try {{ el.value = token; }} catch(e) {{}}
+            }});
+
+            // ── 3. Fire the data-callback registered on the widget container ──
+            // hCaptcha spec: <div class="h-captcha" data-sitekey="..." data-callback="fnName">
+            // When solved, hcaptcha.js calls window[fnName](token).
+            var container = document.querySelector('.h-captcha[data-callback], [data-sitekey][data-callback]');
+            if (container) {{
+                var cbName = container.getAttribute('data-callback');
+                if (cbName && typeof window[cbName] === 'function') {{
+                    try {{ window[cbName](token); injected++; }} catch(e) {{}}
+                }}
+            }}
+
+            // ── 4. Find hCaptcha widget-ID containers and invoke internal API ──
+            document.querySelectorAll('[data-hcaptcha-widget-id]').forEach(function(c) {{
+                var wid = c.getAttribute('data-hcaptcha-widget-id');
+                if (!wid) return;
+                try {{
+                    // hcaptcha.execute() triggers challenge; we want to mark it solved
+                    // hcaptcha stores widget callbacks in hcaptcha._hmt (internal, undocumented)
+                    var hmt = window.hcaptcha && window.hcaptcha._hmt;
+                    if (hmt && hmt[wid] && typeof hmt[wid].onSuccess === 'function') {{
+                        hmt[wid].onSuccess(token);
+                        injected++;
+                    }}
+                }} catch(e) {{}}
+            }});
+
+            // ── 5. Dispatch a synthetic hcaptcha verify event on the document ──
+            try {{
+                document.dispatchEvent(new CustomEvent('hcaptchaVerified', {{
+                    detail: {{ token: token }}, bubbles: true
+                }}));
+            }} catch(e) {{}}
+
+            return injected;
+        }})()
+        """)
+        log.info(f"[NoPeCHA] Token injected (triggered {result} callback(s))")
+        return True
+    except Exception as e:
+        log.warning(f"[NoPeCHA] Token injection error: {e}")
+        return False
 
 
-def _refresh_nopecha_key_from_server() -> str:
     """
     Fetch the latest NopeCHA API key from the dashboard right now.
     Returns the key string, or "" if unreachable / not set.
@@ -3314,33 +2663,26 @@ async def worker():
     Per-account-browser worker.
 
     A brand-new browser instance is started for EVERY Discord account:
-      · 100 % clean session guaranteed — no cookies, localStorage or
-        extension state leaks between accounts.
+      · 100 % clean session — no cookies, localStorage or state leaks.
       · NoPeCHA API key is fetched FRESH from the dashboard before every
         browser launch — changing the key on the website takes effect on
         the very next account without restarting the tool.
-      · Key is injected directly into the extension's background script so
-        it is active the instant the service worker starts.
+      · NO browser extension loaded — captcha solving uses NoPeCHA REST API
+        directly from Python.  This avoids Brave's tamper-detection which
+        disables modified unpacked extensions and removes them from the toolbar.
       · Browser is fully stopped after each account (browser.stop()).
 
     Captcha solving:
-      1. NoPeCHA extension  — automatic (key injected into manifest.json + background script)
-      2. Manual  — user solves in the browser window (if NoPeCHA times out)
+      1. NoPeCHA REST API  — calls api.nopecha.com, gets h-captcha-response
+         token, injects it into the page (no extension, no file patching).
+      2. Accessibility solver (OpenRouter) — if NopeCHA is not configured.
+      3. Manual  — user solves in the browser window (final fallback).
     """
     global SESSION_CREATED, SESSION_STOP
 
-    _nopecha_enabled     = bool(config.get("nopechaEnabled"))
-    _nopecha_api_key     = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
-    _nopecha_ext_dir     = None
-    _last_injected_key   = ""   # track what key is currently baked into the extension
-    adb_rot              = config.get("adb_rotator")
-
-    # ── Ensure extension is downloaded (one-time, background-script patch happens
-    #    inside the loop so the freshest key is always used) ────────────────────
-    if _nopecha_enabled:
-        _nopecha_ext_dir = ensure_nopecha_extension()
-        if not _nopecha_ext_dir:
-            log.warning("[NoPeCHA] Extension unavailable — continuing without auto-solve")
+    _nopecha_enabled = bool(config.get("nopechaEnabled"))
+    _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+    adb_rot          = config.get("adb_rotator")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PER-ACCOUNT LOOP — each iteration owns its own browser instance
@@ -3360,36 +2702,21 @@ async def worker():
                 adb_rot.rotate_ip()
 
             # ── Always fetch the latest NoPeCHA key from the dashboard ─────
-            # This means any key you save on the website is used immediately
-            # on the very next account — no tool restart needed.
+            # Any key saved on the website takes effect on the very next account
+            # without restarting the tool.
             if _nopecha_enabled:
                 fresh_key = _refresh_nopecha_key_from_server()
                 if fresh_key:
                     _nopecha_api_key = fresh_key
                     config["nopechaApiKey"] = fresh_key
                 elif not _nopecha_api_key:
-                    # fall back to whatever was in config at startup
                     _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
 
-            # ── Re-inject key into extension if it changed (or first run) ──
-            # Uses the Moon Gen approach: key goes into manifest.json first so
-            # chrome.runtime.getManifest() returns it synchronously — zero race.
-            # Also patches the background script for belt-and-suspenders coverage.
-            if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
-                if _nopecha_api_key != _last_injected_key:
-                    # PRIMARY: inject key into manifest.json (synchronous, reliable)
-                    inject_nopecha_key_into_manifest(_nopecha_ext_dir, _nopecha_api_key)
-                    # SECONDARY: also patch background script (belt-and-suspenders)
-                    if inject_nopecha_key_into_extension_files(_nopecha_ext_dir, _nopecha_api_key):
-                        _last_injected_key = _nopecha_api_key
-                    else:
-                        log.warning("[NoPeCHA] Background script patch failed (manifest.json still injected)")
-
             # ── Start a FRESH browser for this account ─────────────────────
+            # No extensions loaded — NopeCHA solving uses the REST API instead.
             # NOTE: do NOT pass --disable-blink-features=AutomationControlled.
             # Brave shows a yellow warning banner that shifts the layout and
             # causes click coordinates to land on the wrong row.
-            # nodriver removes the webdriver flag at the CDP level instead.
             brave_path = config.get("brave_executable")
             start_kw = {"headless": False, "browser_args": [
                 "--no-first-run", "--disable-default-apps",
@@ -3400,29 +2727,8 @@ async def worker():
                 start_kw["browser_executable_path"] = brave_path
                 log.info(f"Launching Brave: {brave_path}")
 
-            if _nopecha_enabled and _nopecha_api_key and _nopecha_ext_dir:
-                start_kw["browser_args"].append(f"--load-extension={_nopecha_ext_dir}")
-                # Required for Brave/Chrome to load unpacked extensions from disk.
-                # Without this flag newer Brave versions silently block the extension's
-                # content scripts from injecting into pages, so NopeCHA loads but never
-                # interacts with hCaptcha iframes.
-                start_kw["browser_args"].append(f"--disable-extensions-except={_nopecha_ext_dir}")
-                start_kw["browser_args"].append("--allow-extensions-from-unpacked-dirs")
-
             browser = await uc.start(**start_kw)
             log.debug("[Browser] Fresh instance started")
-
-            # ── NoPeCHA: set key in extension storage via popup context ─────
-            # File injection (manifest.json + background.js) alone may not work
-            # when the background is an ES-module service worker — our prepended
-            # IIFE would break the module parse silently.  Opening the extension's
-            # popup URL in a tab gives us full chrome.* access and lets us call
-            # chrome.storage.local.set() directly in the extension's context,
-            # writing the key to persistent storage before any captcha arrives.
-            if _nopecha_enabled and _nopecha_api_key:
-                await _nopecha_set_key_via_extension_context(
-                    browser, _nopecha_api_key, _nopecha_ext_dir or ""
-                )
 
             # ── Fingerprint (set up once per browser instance) ─────────────
             if config.get("fingerprintEnabled"):
@@ -3572,51 +2878,112 @@ async def worker():
                 captcha_gave_up.set()
 
             async def _captcha_loop():
-                # Always read live values — key may have been refreshed this iteration
+                """
+                Solve hCaptcha using NopeCHA REST API (no extension).
+
+                Flow:
+                  1. Wait 2 s for the page to settle after form submit.
+                  2. Check whether hCaptcha iframe is present.
+                  3. If NopeCHA is enabled → call REST API, get token, inject it.
+                  4. Fallback: accessibility solver (OpenRouter) if enabled.
+                  5. Final fallback: wait for the user to solve manually.
+                """
+                # Always read live config — key may have been refreshed this iteration
                 nopecha_enabled = bool(config.get("nopechaEnabled"))
                 nopecha_key     = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
                 solver_enabled  = bool(config.get("captchaSolverEnabled"))
 
-                # ── Quick check: is there even a captcha? ──────────────────
-                await asyncio.sleep(2)  # let the page settle after form submit
+                # ── Let the page settle after form submit ──────────────────
+                await asyncio.sleep(2)
+
+                # ── Check whether a captcha is actually present ─────────────
                 try:
                     has_captcha_now = await discord_tab.evaluate(
                         "(()=>{ try{ return !!document.querySelector('iframe[src*=\"hcaptcha.com\"]'); } catch(e){ return false; } })()"
                     )
                 except Exception:
-                    has_captcha_now = True  # assume yes if JS fails
+                    has_captcha_now = True  # assume yes if JS eval fails
 
                 if not has_captcha_now:
                     log.info("[Captcha] No captcha detected — proceeding")
                     return
 
-                log.info("[Captcha] hCaptcha detected — NoPeCHA solving...")
+                log.info("[Captcha] hCaptcha detected")
 
                 # ──────────────────────────────────────────────────────────
-                # STEP 1 — NoPeCHA extension (automatic)
+                # STEP 1 — NoPeCHA REST API  (no extension, no file patching)
                 # ──────────────────────────────────────────────────────────
                 if nopecha_enabled and nopecha_key:
                     captcha_timeout = int(config.get("captchaTimeoutSeconds", 120))
-                    log.info(f"[Captcha] Step 1/2 — NoPeCHA solving (timeout={captcha_timeout}s)...")
-                    nopecha_solved = await wait_for_nopecha_solve(
-                        discord_tab, api_key=nopecha_key, timeout=captcha_timeout
+                    log.info(f"[Captcha] Step 1 — NoPeCHA REST API (timeout={captcha_timeout}s)…")
+
+                    # Get the current page URL for the API call
+                    try:
+                        page_url = str(await discord_tab.evaluate("window.location.href") or "https://discord.com/register")
+                    except Exception:
+                        page_url = "https://discord.com/register"
+
+                    # Try to read sitekey from the page (falls back to known Discord sitekey)
+                    try:
+                        page_sitekey = str(await discord_tab.evaluate(
+                            "(()=>{"
+                            "  var el = document.querySelector('[data-sitekey]');"
+                            "  return el ? el.getAttribute('data-sitekey') : '';"
+                            "})()"
+                        ) or "")
+                    except Exception:
+                        page_sitekey = ""
+                    sitekey = page_sitekey or _DISCORD_HCAPTCHA_SITEKEY
+
+                    token = await nopecha_solve_hcaptcha(
+                        api_key  = nopecha_key,
+                        page_url = page_url,
+                        sitekey  = sitekey,
+                        timeout  = captcha_timeout,
                     )
-                    if nopecha_solved:
-                        log.success("[Captcha] NoPeCHA solved the captcha ✓")
-                        return
-                    log.warning("[Captcha] NoPeCHA did not solve within timeout — waiting for manual solve...")
+
+                    if token:
+                        log.info("[Captcha] Token received — injecting into page…")
+                        injected = await nopecha_inject_token(discord_tab, token)
+                        if injected:
+                            # Give Discord 5 s to process the token and redirect
+                            for _ in range(10):
+                                await asyncio.sleep(0.5)
+                                try:
+                                    url = str(await discord_tab.evaluate("window.location.href") or "")
+                                    if url and "register" not in url and "login" not in url:
+                                        log.success("[Captcha] NoPeCHA REST API solved captcha ✓")
+                                        return
+                                    # Also check localStorage for token (fires before redirect)
+                                    has_tok = await discord_tab.evaluate(
+                                        "(()=>{ try{ return !!localStorage.getItem('token'); } catch(e){ return false; } })()"
+                                    )
+                                    if has_tok:
+                                        log.success("[Captcha] NoPeCHA REST API solved captcha ✓ (token in localStorage)")
+                                        return
+                                except Exception:
+                                    pass
+                            log.warning("[Captcha] Token injected but no redirect yet — falling back")
+                        else:
+                            log.warning("[Captcha] Token injection failed — falling back")
+                    else:
+                        log.warning("[Captcha] NoPeCHA REST API returned no token — falling back")
+
+                # ──────────────────────────────────────────────────────────
+                # STEP 2 — Accessibility solver (OpenRouter vision model)
+                # ──────────────────────────────────────────────────────────
                 elif solver_enabled:
-                    log.info("[Captcha] Step 1/2 — Accessibility solver...")
+                    log.info("[Captcha] Step 2 — Accessibility solver…")
                     accessibility_solved = await solve_captcha_accessibility(discord_tab, config)
                     if accessibility_solved:
                         log.success("[Captcha] Accessibility solver solved the captcha ✓")
                         return
-                    log.warning("[Captcha] Accessibility solver could not solve — waiting for manual...")
+                    log.warning("[Captcha] Accessibility solver could not solve — waiting for manual…")
 
                 # ──────────────────────────────────────────────────────────
-                # STEP 2 — Manual fallback
+                # STEP 3 — Manual fallback
                 # ──────────────────────────────────────────────────────────
-                log.info("[Captcha] Step 2/2 — Waiting for manual solve (120s)...")
+                log.info("[Captcha] Waiting for manual solve (120s)…")
                 await _wait_manual_captcha()
 
             asyncio.ensure_future(_captcha_loop())
