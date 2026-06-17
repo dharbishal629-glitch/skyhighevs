@@ -1,5 +1,5 @@
 """
-NopeCHA Profile Setup v5 - Chrome Web Store Install Method
+NopeCHA Profile Setup v6 - Chrome Web Store Install Method
 - Opens Chrome Web Store page for NopeCHA
 - Clicks "Add to Chrome" automatically
 - Confirms the "Add Extension" dialog via keyboard
@@ -111,7 +111,7 @@ async def run_setup(nopecha_key: str, brave_input: str = ""):
         return False
 
     print("=" * 60)
-    print("  NOPECHA SETUP v5 - Web Store Installer")
+    print("  NOPECHA SETUP v6 - Web Store Installer")
     print("=" * 60)
 
     brave_path = resolve_browser_path(brave_input)
