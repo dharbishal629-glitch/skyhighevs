@@ -1740,7 +1740,7 @@ async def fill_date_of_birth(page) -> bool:
             except Exception:
                 pass
             await dd.click()
-            await asyncio.sleep(0.03)  # listbox mount
+            await asyncio.sleep(0.25)  # wait for listbox to fully mount and render
 
             # -------------------------------------------------------------------
             # click_marked: query the element JS tagged with data-dob-pick
@@ -1845,21 +1845,30 @@ async def fill_date_of_birth(page) -> bool:
                   for (const cont of scrollables) {
                     const total = cont.scrollHeight;
 
-                    // Smart-jump for year values: 1990 ≈ 72%, 2004 ≈ 83%
-                    // through the 1900-2026 list — hit those positions first.
+                    // Smart-jump for year values.
+                    // Discord shows years DESCENDING (newest/youngest at top, 1900 at bottom).
+                    // Age gate ≈13 yrs → top of list is ~2013. Year 2004 is near the TOP (~8%).
+                    // Old formula assumed ascending order and sent 2004 to 83% — completely wrong.
+                    // Fix: use descending fraction = (maxYear - target) / (maxYear - minYear)
+                    // Also try ascending in case the order ever flips.
                     const asNum = parseInt(want, 10);
                     const smartStops = [];
                     if (!isNaN(asNum) && asNum >= 1900 && asNum <= 2030) {
-                      const frac   = (asNum - 1900) / (2026 - 1900);
-                      const center = Math.round(total * frac);
-                      for (let d = -3; d <= 3; d++) {
-                        const p = center + Math.round(total * d / 30);
-                        if (p >= 0 && p <= total) smartStops.push(p);
+                      const maxYear = 2013;
+                      const minYear = 1900;
+                      const fracDesc = Math.max(0, Math.min(1, (maxYear - asNum) / (maxYear - minYear)));
+                      const fracAsc  = Math.max(0, Math.min(1, (asNum - minYear) / (maxYear - minYear)));
+                      for (const frac of [fracDesc, fracAsc]) {
+                        const center = Math.round(total * frac);
+                        for (let d = -4; d <= 4; d++) {
+                          const p = center + Math.round(total * d / 25);
+                          if (p >= 0 && p <= total) smartStops.push(p);
+                        }
                       }
                     }
 
                     const fullStops = [0];
-                    for (let i = 1; i <= 23; i++) fullStops.push(Math.round(total * i / 23));
+                    for (let i = 1; i <= 30; i++) fullStops.push(Math.round(total * i / 30));
 
                     for (const pos of [...smartStops, ...fullStops]) {
                       cont.scrollTop = pos;
@@ -3255,11 +3264,12 @@ def _refresh_nopecha_key_from_server() -> str:
     return ""
 
 
-def _refresh_worker_nopecha_key() -> str:
+def _refresh_worker_settings_per_account() -> str:
     """
-    Per-account: fetch the worker's own NoPeCHA key from their personal settings.
-    Returns the key string if worker edits are active and they have one, else "".
-    Called every account so the worker can change their key mid-session.
+    Per-account: fetch the worker's personal settings from the dashboard.
+    - Updates cooldown override in config (worker cooldown beats admin cooldown).
+    - Returns the worker's NoPeCHA key if they have one enabled, else "".
+    Called every account so changes take effect immediately — no restart needed.
     """
     if not api_client:
         return ""
@@ -3273,11 +3283,19 @@ def _refresh_worker_nopecha_key() -> str:
         if resp.ok:
             ws = resp.json()
             if ws.get("workerEditsEnabled"):
-                npc = ws.get("settings", {}).get("nopecha", {})
+                s = ws.get("settings", {})
+                # ── Cooldown: always apply worker override if > 0 ──────────
+                wcd = int(s.get("cooldown", 0))
+                config["_worker_cooldown_override"] = wcd  # 0 = use admin config
+                # ── NoPeCHA key ────────────────────────────────────────────
+                npc = s.get("nopecha", {})
                 if npc.get("enabled") and npc.get("key"):
                     return npc["key"].strip()
+            else:
+                # Worker edits off — clear any stale override so admin config wins
+                config["_worker_cooldown_override"] = 0
     except Exception as e:
-        log.debug(f"[NoPeCHA] Worker key refresh failed: {e}")
+        log.debug(f"[Worker settings] Per-account refresh failed: {e}")
     return ""
 
 
@@ -3335,7 +3353,7 @@ async def worker():
             # Falls back to admin key. Changing either on the website takes
             # effect on the very next account — no tool restart needed.
             if _nopecha_enabled:
-                worker_key_val = _refresh_worker_nopecha_key()
+                worker_key_val = _refresh_worker_settings_per_account()
                 if worker_key_val:
                     _nopecha_api_key = worker_key_val
                     config["nopechaApiKey"] = worker_key_val
