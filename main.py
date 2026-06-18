@@ -477,12 +477,17 @@ class ADBIPRotator:
         return ""
 
     def _set_airplane_mode(self, enable: bool):
-        """Toggle airplane mode via ADB — drops and re-assigns mobile IP cleanly."""
-        state = "1" if enable else "0"
-        bcast = "true" if enable else "false"
-        self._run("shell", "settings", "put", "global", "airplane_mode_on", state)
-        self._run("shell", "am", "broadcast", "-a", "android.intent.action.AIRPLANE_MODE",
-                  "--ez", "state", bcast)
+        """
+        Toggle airplane mode via ADB without root.
+        Uses `cmd connectivity airplane-mode` (Android 9+, no permissions needed).
+        The old `am broadcast android.intent.action.AIRPLANE_MODE` requires system
+        permissions and throws a Security Exception on unrooted devices — do NOT use it.
+        """
+        cmd_state = "enable" if enable else "disable"
+        # Primary: cmd connectivity (Android 9+, works without root)
+        self._run("shell", "cmd", "connectivity", "airplane-mode", cmd_state)
+        # Belt-and-suspenders: also write the settings key so status queries are accurate
+        self._run("shell", "settings", "put", "global", "airplane_mode_on", "1" if enable else "0")
 
     def _try_rotate(self, old_ip: str, max_wait: int = 45) -> str:
         self._set_airplane_mode(True)
