@@ -89,8 +89,8 @@ router.get("/worker/my-stats", requireWorkerKey, async (req: Request, res: Respo
 
 /**
  * GET /api/worker/my-settings
- * Worker fetches their own saved personal settings + whether edits are enabled.
- * main.py calls this after fetching admin config to decide which config to use.
+ * Worker fetches their own saved personal settings.
+ * main.py calls this on startup and per-account to apply worker edits.
  */
 router.get("/worker/my-settings", requireWorkerKey, async (req: Request, res: Response) => {
   try {
@@ -102,9 +102,6 @@ router.get("/worker/my-settings", requireWorkerKey, async (req: Request, res: Re
           enabled: Boolean(worker.workerProxyEnabled),
           url: worker.workerProxy || "",
         },
-        fingerprint: {
-          enabled: Boolean(worker.workerFingerprintEnabled),
-        },
         adb: {
           enabled: Boolean(worker.workerAdbEnabled),
         },
@@ -112,6 +109,7 @@ router.get("/worker/my-settings", requireWorkerKey, async (req: Request, res: Re
           enabled: Boolean(worker.workerNopechaEnabled),
           key: worker.workerNopechaKey || "",
         },
+        cooldown: worker.workerCooldown ?? 0,
       },
     });
   } catch (err: any) {
@@ -121,28 +119,27 @@ router.get("/worker/my-settings", requireWorkerKey, async (req: Request, res: Re
 
 /**
  * PUT /api/worker/my-settings
- * Worker saves their personal proxy / fingerprint / adb / nopecha config.
- * Body: { proxy?: { enabled, url }, fingerprint?: { enabled }, adb?: { enabled }, nopecha?: { enabled, key } }
+ * Worker saves their personal proxy / adb / nopecha / cooldown config.
  */
 router.put("/worker/my-settings", requireWorkerKey, async (req: Request, res: Response) => {
   try {
     const worker = (req as any).worker;
-    const { proxy, fingerprint, adb, nopecha } = req.body as {
-      proxy?:       { enabled?: boolean; url?: string };
-      fingerprint?: { enabled?: boolean };
-      adb?:         { enabled?: boolean };
-      nopecha?:     { enabled?: boolean; key?: string };
+    const { proxy, adb, nopecha, cooldown } = req.body as {
+      proxy?:   { enabled?: boolean; url?: string };
+      adb?:     { enabled?: boolean };
+      nopecha?: { enabled?: boolean; key?: string };
+      cooldown?: number;
     };
 
     await db
       .update(workersTable)
       .set({
-        workerProxyEnabled:       proxy?.enabled        !== undefined ? Boolean(proxy.enabled)        : undefined,
-        workerProxy:              proxy?.url             !== undefined ? (proxy.url || null)           : undefined,
-        workerFingerprintEnabled: fingerprint?.enabled  !== undefined ? Boolean(fingerprint.enabled)  : undefined,
-        workerAdbEnabled:         adb?.enabled           !== undefined ? Boolean(adb.enabled)          : undefined,
-        workerNopechaEnabled:     nopecha?.enabled       !== undefined ? Boolean(nopecha.enabled)      : undefined,
-        workerNopechaKey:         nopecha?.key           !== undefined ? (nopecha.key || null)         : undefined,
+        workerProxyEnabled:   proxy?.enabled   !== undefined ? Boolean(proxy.enabled)   : undefined,
+        workerProxy:          proxy?.url        !== undefined ? (proxy.url || null)       : undefined,
+        workerAdbEnabled:     adb?.enabled      !== undefined ? Boolean(adb.enabled)     : undefined,
+        workerNopechaEnabled: nopecha?.enabled  !== undefined ? Boolean(nopecha.enabled) : undefined,
+        workerNopechaKey:     nopecha?.key      !== undefined ? (nopecha.key || null)    : undefined,
+        workerCooldown:       cooldown          !== undefined ? Math.max(0, Number(cooldown)) : undefined,
         updatedAt: new Date(),
       })
       .where(eq(workersTable.id, worker.id));
