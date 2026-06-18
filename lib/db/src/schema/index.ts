@@ -12,13 +12,13 @@ export const workersTable = pgTable("workers", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
   // Worker Edits — per-worker custom config
-  workerEditsEnabled: boolean("worker_edits_enabled").notNull().default(false),
-  workerProxy: text("worker_proxy"),
-  workerProxyEnabled: boolean("worker_proxy_enabled").notNull().default(false),
-  workerFingerprintEnabled: boolean("worker_fingerprint_enabled").notNull().default(false),
-  workerAdbEnabled: boolean("worker_adb_enabled").notNull().default(false),
-  workerNopechaKey: text("worker_nopecha_key"),
+  workerEditsEnabled:   boolean("worker_edits_enabled").notNull().default(false),
+  workerProxy:          text("worker_proxy"),
+  workerProxyEnabled:   boolean("worker_proxy_enabled").notNull().default(false),
+  workerAdbEnabled:     boolean("worker_adb_enabled").notNull().default(false),
+  workerNopechaKey:     text("worker_nopecha_key"),
   workerNopechaEnabled: boolean("worker_nopecha_enabled").notNull().default(false),
+  workerCooldown:       integer("worker_cooldown").notNull().default(0),
 });
 
 export const tokensTable = pgTable("tokens", {
