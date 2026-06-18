@@ -476,53 +476,38 @@ class ADBIPRotator:
                 continue
         return ""
 
-    def _set_wifi(self, enable: bool):
-        state = "enable" if enable else "disable"
-        self._run("shell", "svc", "wifi", state)
-        log.info(f"[ADB] Wi-Fi → {state.upper()}")
-        time.sleep(1)
-
-    def _set_mobile_data(self, enable: bool):
-        state = "enable" if enable else "disable"
-        self._run("shell", "svc", "data", state)
-        log.info(f"[ADB] Mobile data → {state.upper()}")
+    def _set_airplane_mode(self, enable: bool):
+        """Toggle airplane mode via ADB — drops and re-assigns mobile IP cleanly."""
+        state = "1" if enable else "0"
+        bcast = "true" if enable else "false"
+        self._run("shell", "settings", "put", "global", "airplane_mode_on", state)
+        self._run("shell", "am", "broadcast", "-a", "android.intent.action.AIRPLANE_MODE",
+                  "--ez", "state", bcast)
 
     def _try_rotate(self, old_ip: str, max_wait: int = 45) -> str:
-        log.info("[ADB] Step 1/4 — Disabling Wi-Fi (force mobile data only)...")
-        self._set_wifi(False)
-        log.info("[ADB] Step 2/4 — Disabling mobile data...")
-        self._set_mobile_data(False)
-        log.info("[ADB] Waiting 4s for carrier to drop connection...")
-        time.sleep(4)
-        log.info("[ADB] Step 3/4 — Re-enabling mobile data...")
-        self._set_mobile_data(True)
-        log.info("[ADB] Waiting 3s for carrier to assign new IP...")
-        time.sleep(3)
-        log.info(f"[ADB] Step 4/4 — Polling for IP change (up to {max_wait}s)...")
+        self._set_airplane_mode(True)
+        time.sleep(6)           # wait for carrier to release IP
+        self._set_airplane_mode(False)
+        time.sleep(5)           # wait for network to reconnect
         start = time.time()
         while (time.time() - start) < max_wait:
             new_ip = self.get_current_ip()
             if new_ip and new_ip != old_ip:
                 return new_ip
-            if new_ip:
-                log.debug(f"[ADB] IP still {new_ip}, carrier may need more time...")
-            time.sleep(4)
+            time.sleep(3)
         final_ip = self.get_current_ip()
         return final_ip if (final_ip and final_ip != old_ip) else ""
 
     def rotate_ip(self, max_retries: int = 3, max_wait: int = 45) -> bool:
         old_ip = self.get_current_ip()
-        log.info(f"[ADB] Starting IP rotation. Current IP: {old_ip or '(unknown)'}")
         for attempt in range(1, max_retries + 1):
-            log.info(f"[ADB] Rotation attempt {attempt}/{max_retries}")
             new_ip = self._try_rotate(old_ip, max_wait=max_wait)
             if new_ip:
-                log.success(f"[ADB] IP rotated: {old_ip} → {new_ip}")
+                log.success(f"[ADB] IP rotated → {new_ip}")
                 return True
             if attempt < max_retries:
-                log.warning(f"[ADB] IP unchanged on attempt {attempt}. Waiting 5s before retry...")
                 time.sleep(5)
-        log.warning(f"[ADB] IP did not change after {max_retries} attempt(s).")
+        log.warning("[ADB] IP unchanged after rotation")
         return False
 
 # ============================================================================
@@ -1675,7 +1660,6 @@ async def fill_date_of_birth(page) -> bool:
     year  = str(random.randint(1990, 2004))
     targets = [month, day, year]
     labels  = ["Month", "Day", "Year"]
-    log.info(f"Filling DOB: {month} {day}, {year}")
 
     # Tiny wait for the DOB row to render
     await asyncio.sleep(0.05)
@@ -1920,10 +1904,6 @@ async def fill_date_of_birth(page) -> bool:
             log.warning(f"DOB {label} error: {e}")
             all_ok = False
 
-    if all_ok:
-        log.success(f"DOB set: {month} {day}, {year}")
-    else:
-        log.warning("DOB: one or more dropdowns failed — registration may be rejected")
     return all_ok
 
 # Older signature used elsewhere; keep a no-op JS leftover removed
@@ -1955,95 +1935,155 @@ async def _send_keys_robust(page, selector: str, value: str, timeout: int = 1000
     return False
 
 
-async def fill_registration_form(page, email: str, display_name: str, username: str, password: str) -> bool:
-    """Fill Discord registration form using native send_keys so React tracks the input."""
-    try:
-
-        # Email
+async def _fill_input_js(page, selector: str, value: str, timeout_ms: int = 5000) -> bool:
+    """
+    Fill an input field instantly via React-compatible native setter.
+    Uses Object.getOwnPropertyDescriptor to bypass React's read-only .value
+    and triggers synthetic input/change/blur events so React state updates.
+    Near-instant vs character-by-character send_keys.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+    js = f"""(function() {{
+        var el = document.querySelector({json.dumps(selector)});
+        if (!el) return false;
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+        if (setter && setter.set) setter.set.call(el, {json.dumps(value)});
+        el.dispatchEvent(new Event('input',  {{bubbles:true}}));
+        el.dispatchEvent(new Event('change', {{bubbles:true}}));
+        el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
+        return true;
+    }})()"""
+    while asyncio.get_event_loop().time() < deadline:
         try:
-            ok = await _send_keys_robust(page, 'input[name="email"]', email, timeout=12000)
-            if not ok:
-                log.error("Email field: all retry attempts failed"); return False
-        except Exception as e:
-            log.error(f"Email field error: {e}"); return False
-
-        # Display Name (global_name)
-        try:
-            await _send_keys_robust(page, 'input[name="global_name"]', display_name, timeout=3000)
-        except Exception as e:
-            log.debug(f"Display name field not found (may not exist): {e}")
-
-        # Username
-        try:
-            ok = await _send_keys_robust(page, 'input[name="username"]', username, timeout=4000)
-            if not ok:
-                log.error("Username field: all retry attempts failed"); return False
-        except Exception as e:
-            log.error(f"Username field error: {e}"); return False
-
-        # Password
-        try:
-            ok = await _send_keys_robust(page, 'input[aria-label="Password"]', password, timeout=4000)
-            if not ok:
-                raise Exception("all retries failed")
+            if await page.evaluate(js):
+                return True
         except Exception:
-            try:
-                ok = await _send_keys_robust(page, 'input[name="password"]', password, timeout=3000)
-                if not ok:
-                    log.error("Password field: all retry attempts failed"); return False
-            except Exception as e:
-                log.error(f"Password field error: {e}"); return False
+            pass
+        await asyncio.sleep(0.08)
+    return False
 
-        # Date of birth dropdowns
+
+def _generate_username_variant(base: str) -> str:
+    """Mutate a taken username: insert digits mid-string, append suffix, or fully regenerate."""
+    strategy = random.randint(0, 3)
+    if strategy == 0:
+        result = base + str(random.randint(1, 9999))
+    elif strategy == 1:
+        mid = len(base) // 2
+        result = base[:mid] + str(random.randint(10, 99)) + base[mid:]
+    elif strategy == 2:
+        result = base + random.choice(['x', 'v', 'z', '_']) + str(random.randint(1, 999))
+    else:
+        result = generate_username()
+    return result[:32]  # Discord: max 32 chars
+
+
+async def _click_submit_button(page) -> bool:
+    """Click the form submit button using multiple fallback strategies."""
+    try:
+        buttons = await page.query_selector_all('button')
+        for btn in buttons:
+            txt = await btn.text_content()
+            if txt and any(k in txt for k in ('Continue', 'Create', 'Submit', 'Register')):
+                await btn.click()
+                return True
+    except Exception:
+        pass
+    try:
+        sub = await page.query_selector('[type="submit"]')
+        if sub:
+            await sub.click()
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(await page.evaluate("""() => {
+            for (const btn of document.querySelectorAll('button,[type="submit"]')) {
+                const t = btn.textContent || '';
+                if (t.includes('Continue') || t.includes('Create') || t.includes('Submit')) {
+                    btn.click(); return true;
+                }
+            }
+            return false;
+        }"""))
+    except Exception:
+        pass
+    return False
+
+
+async def _get_username_error(page) -> str:
+    """Return visible username-related error text from the page, or empty string."""
+    try:
+        return await page.evaluate("""() => {
+            const texts = [];
+            for (const sel of ['[class*="errorMessage"]','[class*="error-message"]',
+                                '[class*="errorText"]','[class*="inputError"]',
+                                '[class*="Error"]','[class*="error"]']) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if (t) texts.push(t);
+                }
+            }
+            return texts.join(' ');
+        }""") or ""
+    except Exception:
+        return ""
+
+
+async def fill_registration_form(page, email: str, display_name: str, username: str, password: str) -> bool:
+    """
+    Fill Discord registration form via instant JS native-setter injection.
+    React state updates immediately — no character-by-character simulation.
+    Automatically retries with username variants if the username is taken.
+    """
+    try:
+        # ── Email ──────────────────────────────────────────────────────────────
+        if not await _fill_input_js(page, 'input[name="email"]', email, timeout_ms=12000):
+            log.error("Email field not found"); return False
+
+        # ── Display Name (optional field) ─────────────────────────────────────
+        await _fill_input_js(page, 'input[name="global_name"]', display_name, timeout_ms=2000)
+
+        # ── Password ─────────────────────────────────────────────────────────
+        filled_pw = await _fill_input_js(page, 'input[aria-label="Password"]', password, timeout_ms=4000)
+        if not filled_pw:
+            filled_pw = await _fill_input_js(page, 'input[name="password"]', password, timeout_ms=3000)
+        if not filled_pw:
+            log.error("Password field not found"); return False
+
+        # ── Date of birth dropdowns ────────────────────────────────────────────
         await fill_date_of_birth(page)
 
-        # Checkboxes (Terms of Service etc.)
+        # ── Checkboxes ────────────────────────────────────────────────────────
         try:
             await page.evaluate(JS_UTILS)
             await page.evaluate('window.utils.clickAllCheckboxes()')
         except Exception:
             pass
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.03)
 
-        # Submit — try button text match first, then type=submit
-        clicked = False
-        try:
-            buttons = await page.query_selector_all('button')
-            for btn in buttons:
-                txt = await btn.text_content()
-                if txt and any(k in txt for k in ('Continue', 'Create', 'Submit', 'Register')):
-                    await btn.click()
-                    clicked = True
-                    break
-        except Exception:
-            pass
-        if not clicked:
-            try:
-                sub = await page.query_selector('[type="submit"]')
-                if sub:
-                    await sub.click()
-                    clicked = True
-            except Exception:
-                pass
-        if not clicked:
-            try:
-                clicked = await page.evaluate('''() => {
-                    for (const btn of document.querySelectorAll('button')) {
-                        const t = btn.textContent || '';
-                        if (t.includes('Continue') || t.includes('Create') || t.includes('Submit')) {
-                            btn.click(); return true;
-                        }
-                    }
-                    return false;
-                }''')
-            except Exception:
-                pass
+        # ── Username + submit with retry on "taken" error ─────────────────────
+        current_username = username
+        for attempt in range(6):
+            if not await _fill_input_js(page, 'input[name="username"]', current_username, timeout_ms=4000):
+                log.error("Username field not found"); return False
+            await asyncio.sleep(0.05)
 
-        if clicked:
-            log.success("Registration form submitted!")
+            if not await _click_submit_button(page):
+                log.error("Submit button not found"); return False
+
+            # Give Discord ~1.5s to show a username error (if any)
+            await asyncio.sleep(1.5)
+            err_text = await _get_username_error(page)
+            if err_text and any(k in err_text for k in ("taken", "unavailable", "invalid", "already", "username")):
+                current_username = _generate_username_variant(current_username)
+                continue  # retry with new username
+
+            # No username error — form accepted
             return True
-        log.error("Could not find submit button")
-        return False
+
+        log.warning("Username retry limit reached")
+        return True  # submitted anyway, let the outer loop handle it
 
     except Exception as e:
         log.error(f"Form fill error: {e}")
@@ -3031,23 +3071,19 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
                 or "channels/%40me" in url
                 or "discord.com/@me" in url
             ):
-                log.info("[account-wait] Detected via URL redirect")
                 return True
 
             # ── Signal 2: localStorage token present ──────────────────────
-            # Discord writes the auth token to localStorage as soon as the
-            # account is created — this fires even before the URL changes.
             try:
                 has_token = await page.evaluate(
                     '(()=>{ try{ return !!localStorage.getItem("token"); } catch(e){ return false; } })()'
                 )
                 if has_token:
-                    log.info("[account-wait] Detected via localStorage token")
                     return True
             except Exception:
                 pass
 
-            # ── Signal 3: Registration form gone + title changed ──────────
+            # ── Signal 3: Registration form gone ─────────────────────────
             try:
                 form_gone = await page.evaluate(
                     '(()=>{ try{'
@@ -3057,19 +3093,11 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
                     '} catch(e){ return false; } })()'
                 )
                 if form_gone and url and "register" not in url:
-                    log.info("[account-wait] Detected via form disappearance")
                     return True
             except Exception:
                 pass
 
             # ── Signal 4: Discord logged-in-only UI elements ─────────────
-            # Guard: ONLY check if we're no longer on the register page.
-            # The register page itself is a React SPA and has generic app-level
-            # containers — checking them without the URL guard causes a false positive.
-            # We look for elements that ONLY exist when the user is logged in:
-            #   - [aria-label="Servers"] = the guilds/server list nav
-            #   - [data-list-id="guildsnav"] = the server sidebar
-            #   - [class*="guilds-"] = server icon list
             if url and "register" not in url and "login" not in url:
                 try:
                     logged_in_ui = await page.evaluate(
@@ -3081,7 +3109,6 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
                         '} catch(e){ return false; } })()'
                     )
                     if logged_in_ui:
-                        log.info("[account-wait] Detected via logged-in Discord UI")
                         return True
                 except Exception:
                     pass
@@ -3198,9 +3225,8 @@ async def _clear_discord_session(browser, page=None) -> None:
 
 def _refresh_nopecha_key_from_server() -> str:
     """
-    Fetch the latest NopeCHA API key from the dashboard right now.
+    Fetch the latest NoPeCHA API key from the admin dashboard config.
     Returns the key string, or "" if unreachable / not set.
-    The tool config endpoint is open to any valid worker key — no admin needed.
     """
     if not api_client:
         return ""
@@ -3214,14 +3240,39 @@ def _refresh_nopecha_key_from_server() -> str:
         if resp.ok:
             cfg = resp.json().get("config", {})
             key = (cfg.get("nopechaApiKey") or cfg.get("nopechaKey") or "").strip()
-            # Also sync other captcha settings so they are always current
             for field in ("nopechaEnabled", "captchaSolverEnabled", "openRouterApiKey",
                           "openRouterModel", "captchaMaxAttempts", "captchaTimeoutSeconds"):
                 if field in cfg:
                     config[field] = cfg[field]
             return key
     except Exception as e:
-        log.debug(f"[NoPeCHA] Key refresh failed: {e}")
+        log.debug(f"[NoPeCHA] Admin key refresh failed: {e}")
+    return ""
+
+
+def _refresh_worker_nopecha_key() -> str:
+    """
+    Per-account: fetch the worker's own NoPeCHA key from their personal settings.
+    Returns the key string if worker edits are active and they have one, else "".
+    Called every account so the worker can change their key mid-session.
+    """
+    if not api_client:
+        return ""
+    try:
+        resp = requests.get(
+            f"{api_client.base_url}/api/worker/my-settings",
+            headers=api_client._headers(),
+            timeout=8,
+            verify=False,
+        )
+        if resp.ok:
+            ws = resp.json()
+            if ws.get("workerEditsEnabled"):
+                npc = ws.get("settings", {}).get("nopecha", {})
+                if npc.get("enabled") and npc.get("key"):
+                    return npc["key"].strip()
+    except Exception as e:
+        log.debug(f"[NoPeCHA] Worker key refresh failed: {e}")
     return ""
 
 
@@ -3274,17 +3325,22 @@ async def worker():
             if adb_rot:
                 adb_rot.rotate_ip()
 
-            # ── Always fetch the latest NoPeCHA key from the dashboard ─────
-            # This means any key you save on the website is used immediately
-            # on the very next account — no tool restart needed.
+            # ── Always fetch the latest NoPeCHA key before each account ──────
+            # Worker key takes priority (if worker edits enabled + they have one).
+            # Falls back to admin key. Changing either on the website takes
+            # effect on the very next account — no tool restart needed.
             if _nopecha_enabled:
-                fresh_key = _refresh_nopecha_key_from_server()
-                if fresh_key:
-                    _nopecha_api_key = fresh_key
-                    config["nopechaApiKey"] = fresh_key
-                elif not _nopecha_api_key:
-                    # fall back to whatever was in config at startup
-                    _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
+                worker_key_val = _refresh_worker_nopecha_key()
+                if worker_key_val:
+                    _nopecha_api_key = worker_key_val
+                    config["nopechaApiKey"] = worker_key_val
+                else:
+                    fresh_key = _refresh_nopecha_key_from_server()
+                    if fresh_key:
+                        _nopecha_api_key = fresh_key
+                        config["nopechaApiKey"] = fresh_key
+                    elif not _nopecha_api_key:
+                        _nopecha_api_key = config.get("nopechaApiKey", config.get("nopechaKey", "")).strip()
 
             # ── Re-inject key into extension if it changed (or first run) ──
             # Uses the Moon Gen approach: key goes into manifest.json first so
@@ -3479,7 +3535,6 @@ async def worker():
                     has_captcha_now = True  # assume yes if JS fails
 
                 if not has_captcha_now:
-                    log.info("[Captcha] No captcha detected — proceeding")
                     return
 
                 # ──────────────────────────────────────────────────────────
@@ -3660,14 +3715,12 @@ async def worker():
             if browser is not None:
                 try:
                     await browser.stop()
-                    log.debug("[Browser] Stopped — fresh instance for next account")
                 except Exception:
                     pass
 
-            # ── Cooldown ───────────────────────────────────────────────────
-            cooldown = int(config.get("cooldownSeconds", 0))
+            # ── Cooldown ── worker override takes priority over admin config ─
+            cooldown = int(config.get("_worker_cooldown_override", 0)) or int(config.get("cooldownSeconds", 0))
             if cooldown > 0:
-                log.info(f"Cooldown: waiting {cooldown}s before next account...")
                 for remaining in range(cooldown, 0, -1):
                     print(f"\r  {Fore.CYAN}Next account in {remaining}s...{Fore.RESET}   ", end="", flush=True)
                     await asyncio.sleep(1)
@@ -3776,14 +3829,15 @@ async def main():
                 if _prx.get("enabled") and _prx.get("url"):
                     config["proxyEnabled"] = True
                     config["proxyUrl"]     = _prx["url"]
-                if _s.get("fingerprint", {}).get("enabled"):
-                    config["fingerprintEnabled"] = True
                 if _s.get("adb", {}).get("enabled"):
                     config["adbEnabled"] = True
                 _npc = _s.get("nopecha", {})
                 if _npc.get("enabled") and _npc.get("key"):
                     config["nopechaEnabled"] = True
                     config["nopechaApiKey"]  = _npc["key"]
+                _wcd = int(_s.get("cooldown", 0))
+                if _wcd > 0:
+                    config["_worker_cooldown_override"] = _wcd
                 log.success("Worker Edits active.")
     except Exception as e:
         log.debug(f"Worker settings fetch skipped: {e}")
