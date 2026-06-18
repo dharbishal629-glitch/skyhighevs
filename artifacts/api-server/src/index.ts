@@ -79,10 +79,10 @@ async function initDb() {
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_edits_enabled    BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_proxy             TEXT;
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_proxy_enabled     BOOLEAN NOT NULL DEFAULT FALSE;
-      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_fingerprint_enabled BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_adb_enabled       BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_nopecha_key       TEXT;
       ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_nopecha_enabled   BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE workers ADD COLUMN IF NOT EXISTS worker_cooldown          INTEGER NOT NULL DEFAULT 0;
     `);
     logger.info("Database tables verified/created");
   } catch (err) {
