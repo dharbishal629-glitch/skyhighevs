@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { useLocation } from "wouter";
-import { Download, LogOut, RefreshCw, CheckCircle2, XCircle, Lock, TrendingUp, Activity, Check, Save, Settings } from "lucide-react";
+import { LogOut, RefreshCw, CheckCircle2, Lock, TrendingUp, Activity, Check, Save, Settings } from "lucide-react";
 import { format } from "date-fns";
 import { CONFIG } from "../lib/config";
 
@@ -290,23 +290,6 @@ export default function WorkerPortal() {
           )}
         </div>
 
-        {/* Download launcher */}
-        <div className="rounded-xl p-4" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)" }}>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h3 className="text-sm font-semibold text-white mb-0.5">Launcher</h3>
-              <p className="text-xs" style={{ color: "rgba(148,163,184,0.6)" }}>Runs the tool in-memory.</p>
-            </div>
-            <button onClick={downloadLauncher} disabled={dlStatus === "loading"}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all flex-shrink-0"
-              style={{ background: dlStatus === "done" ? "rgba(16,185,129,0.2)" : "linear-gradient(135deg, #7c3aed, #2563eb)", color: dlStatus === "done" ? "#10b981" : "white", border: dlStatus === "done" ? "1px solid rgba(16,185,129,0.4)" : "none", cursor: dlStatus === "loading" ? "wait" : "pointer" }}>
-              {dlStatus === "done" ? <><Check className="w-4 h-4" />Done!</> : dlStatus === "loading" ? <><RefreshCw className="w-4 h-4 animate-spin" />…</> : <><Download className="w-4 h-4" />Download launcher.py</>}
-            </button>
-          </div>
-          <div className="mt-3 px-3 py-2 rounded-lg text-xs font-mono" style={{ background: "rgba(0,0,0,0.3)", color: "rgba(148,163,184,0.7)" }}>
-            python launcher.py
-          </div>
-        </div>
       </div>
     </div>
   );
