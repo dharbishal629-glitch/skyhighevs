@@ -280,6 +280,21 @@ JS_UTILS = '''
 console = Console()
 LOCK = threading.Lock()
 SCRIPT_DIR = Path(__file__).parent
+
+# ── Zeus-X email recycling pool ──────────────────────────────────────────────
+# Paid Zeus-X emails that couldn't be used (registration failed / no token)
+# are held here and re-used on the next cycle to avoid wasting paid credits.
+_zeus_email_pool: list = []
+_zeus_email_pool_lock = threading.Lock()
+
+def _recycle_zeus_email(email_obj: dict) -> None:
+    """Return a purchased Zeus-X email to the recycle pool for re-use."""
+    if not email_obj or not email_obj.get("email"):
+        return
+    with _zeus_email_pool_lock:
+        _zeus_email_pool.append(email_obj)
+        log.info(f"[Zeus pool] Recycled {email_obj.get('email')} — pool size: {len(_zeus_email_pool)}")
+
 MS_CLIENT_ID = "d8fbe69d-15be-43fa-b204-5c5bc5a73ad7"
 
 SESSION_TARGET = 0
@@ -828,10 +843,18 @@ class ZeusXAPI:
             log.error("Missing Zeus-X API key. Set ZEUS_API_KEY at the top of main.py.")
             return {"success": False, "error": "Missing API key"}
 
-        # Map generic mail_type names to zeus-x.ru accountcode values
-        account_code = "HOTMAIL"  # Default — covers both Outlook and Hotmail
+        # Map zeusMailType config value → zeus-x.ru accountcode
+        # Graph API and IMAP variants buy the same account type; the distinction
+        # is only in how the inbox is read for email verification later.
+        _ZEUS_CODE_MAP = {
+            "hotmail_trusted_graph": "HOTMAIL_TRUSTED",
+            "hotmail_trusted_imap":  "HOTMAIL_TRUSTED",
+            "outlook_trusted_graph": "OUTLOOK_TRUSTED",
+            "outlook_trusted_imap":  "OUTLOOK_TRUSTED",
+        }
+        account_code = _ZEUS_CODE_MAP.get(mail_type, "HOTMAIL_TRUSTED")
 
-        log.info(f"Purchasing {account_code} from Zeus-X...")
+        log.info(f"Purchasing {account_code} (mail_type={mail_type}) from Zeus-X...")
         try:
             resp = self.session.get(
                 f"{self.BASE_URL}/purchase",
@@ -1458,6 +1481,79 @@ def fetch_verification_url_graph(email_data: dict, timeout: int = 120) -> Option
         time.sleep(3)
     log.warning("Verification email not found in Outlook inbox after timeout")
     return None
+
+def fetch_verification_url_imap_outlook(email: str, password: str, timeout: int = 120) -> Optional[str]:
+    """
+    Poll an Outlook / Hotmail inbox via IMAP SSL to extract the Discord
+    verification link.  Used when zeusMailType ends with '_imap'.
+
+    Returns the verification URL string, or None if not found within `timeout`.
+    """
+    import imaplib
+    import email as _email_lib
+
+    IMAP_HOST = "outlook.office365.com"
+    IMAP_PORT = 993
+    _DISCORD_SENDER = "noreply@discord.com"
+    _URL_PATTERNS   = [
+        r'https://click\.discord\.com/ls/click\?[^\s"<>]+',
+        r'https://discord\.com/verify\?[^\s"<>]+',
+    ]
+
+    deadline = time.time() + timeout
+    poll_interval = 5
+    attempt = 0
+
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as mail:
+                mail.login(email, password)
+                mail.select("INBOX")
+
+                _, msg_ids = mail.search(None, f'FROM "{_DISCORD_SENDER}"')
+                ids = msg_ids[0].split()
+                for mid in reversed(ids):
+                    _, data = mail.fetch(mid, "(RFC822)")
+                    if not data or not data[0]:
+                        continue
+                    raw = data[0][1] if isinstance(data[0], tuple) else b""
+                    msg = _email_lib.message_from_bytes(raw)
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            ct = part.get_content_type()
+                            if ct in ("text/html", "text/plain"):
+                                try:
+                                    body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                    if ct == "text/html":
+                                        break
+                                except Exception:
+                                    pass
+                    else:
+                        try:
+                            body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        except Exception:
+                            pass
+
+                    for pat in _URL_PATTERNS:
+                        m = re.search(pat, body)
+                        if m:
+                            url = m.group(0).replace("&amp;", "&").rstrip('">')
+                            log.success(f"[IMAP] Verification URL found on attempt {attempt}")
+                            return url
+
+        except imaplib.IMAP4.error as e:
+            log.warning(f"[IMAP] Auth/protocol error: {e} — check credentials")
+            return None
+        except Exception as e:
+            log.debug(f"[IMAP] Attempt {attempt} error: {e}")
+
+        time.sleep(poll_interval)
+
+    log.warning(f"[IMAP] No Discord verification email found within {timeout}s")
+    return None
+
 
 def fetch_verification_url_draxono(email: str, api_key: str = None, domain_secret: str = None, timeout: int = 120) -> Optional[str]:
     """
@@ -3282,18 +3378,14 @@ def _refresh_worker_settings_per_account() -> str:
         )
         if resp.ok:
             ws = resp.json()
-            if ws.get("workerEditsEnabled"):
-                s = ws.get("settings", {})
-                # ── Cooldown: always apply worker override if > 0 ──────────
-                wcd = int(s.get("cooldown", 0))
-                config["_worker_cooldown_override"] = wcd  # 0 = use admin config
-                # ── NoPeCHA key ────────────────────────────────────────────
-                npc = s.get("nopecha", {})
-                if npc.get("enabled") and npc.get("key"):
-                    return npc["key"].strip()
-            else:
-                # Worker edits off — clear any stale override so admin config wins
-                config["_worker_cooldown_override"] = 0
+            s = ws.get("settings", {})
+            # Apply each setting based on its own individual enabled flag —
+            # no global workerEditsEnabled gate required.
+            wcd = int(s.get("cooldown", 0))
+            config["_worker_cooldown_override"] = wcd  # 0 = fall back to admin config
+            npc = s.get("nopecha", {})
+            if npc.get("enabled") and npc.get("key"):
+                return npc["key"].strip()
     except Exception as e:
         log.debug(f"[Worker settings] Per-account refresh failed: {e}")
     return ""
@@ -3436,12 +3528,19 @@ async def worker():
             if email_provider == "zeusx":
                 zx_key = config.get("zeusxApiKey") or ZEUS_API_KEY
                 if zx_key:
-                    result = ZeusXAPI(zx_key).buy_email()
-                    if result.get("success"):
-                        email_obj = result
-                        log.success(f"Zeus-X email: {result['email']}")
-                    else:
-                        log.warning(f"Zeus-X failed: {result.get('error')} — trying CyberTemp fallback...")
+                    # ── Check recycle pool first (avoids wasting paid credits) ──
+                    with _zeus_email_pool_lock:
+                        if _zeus_email_pool:
+                            email_obj = _zeus_email_pool.pop(0)
+                            log.info(f"[Zeus pool] Reusing {email_obj.get('email')} (pool remaining: {len(_zeus_email_pool)})")
+                    if not email_obj:
+                        zx_mail_type = config.get("zeusMailType", "hotmail_trusted_graph")
+                        result = ZeusXAPI(zx_key).buy_email(mail_type=zx_mail_type)
+                        if result.get("success"):
+                            email_obj = result
+                            log.success(f"Zeus-X email: {result['email']}")
+                        else:
+                            log.warning(f"Zeus-X failed: {result.get('error')} — trying CyberTemp fallback...")
                 else:
                     log.warning("Zeus-X selected but no API key — falling back to CyberTemp.")
 
@@ -3601,6 +3700,8 @@ async def worker():
                        and account_task.result() is True)
             if not created:
                 log.error("Account creation failed — captcha not solved or timed out")
+                if email_provider == "zeusx":
+                    _recycle_zeus_email(email_obj)
                 continue
 
             # ── 5. Extract token ───────────────────────────────────────────
@@ -3616,6 +3717,8 @@ async def worker():
 
             if not token:
                 log.warning(f"No token captured for {account_email} — captcha or rate-limit")
+                if email_provider == "zeusx":
+                    _recycle_zeus_email(email_obj)
                 continue
 
             m = re.search(r'([A-Za-z0-9_-]{20,})\.([A-Za-z0-9_-]{6})\.([A-Za-z0-9_-]{27,})', token)
@@ -3638,16 +3741,23 @@ async def worker():
                         "uuid":  email_obj.get("uuid", ""),
                     })
                 elif email_provider == "zeusx":
-                    log.info("Opening Outlook.com to fetch verification email for Zeus-X account...")
-                    try:
-                        verify_url = fetch_verification_url_graph({
-                            "token": email_obj.get("token", ""),
-                            "uuid":  email_obj.get("uuid", ""),
-                        })
-                    except Exception:
-                        pass
-                    if not verify_url:
-                        log.warning("Zeus-X: No Graph token available — manual inbox check required")
+                    zx_mail_type = config.get("zeusMailType", "hotmail_trusted_graph")
+                    if "imap" in zx_mail_type:
+                        log.info("Zeus-X [IMAP]: Polling Outlook inbox for Discord verification email...")
+                        verify_url = fetch_verification_url_imap_outlook(account_email, account_password, timeout=120)
+                        if not verify_url:
+                            log.warning("Zeus-X [IMAP]: No verification email found within timeout")
+                    else:
+                        log.info("Zeus-X [Graph API]: Fetching verification link via Microsoft Graph...")
+                        try:
+                            verify_url = fetch_verification_url_graph({
+                                "token": email_obj.get("token", ""),
+                                "uuid":  email_obj.get("uuid", ""),
+                            })
+                        except Exception:
+                            pass
+                        if not verify_url:
+                            log.warning("Zeus-X: No Graph token available — manual inbox check required")
                 elif email_provider == "cybertemp":
                     ct_key       = config.get("cybertempApiKey") or None
                     ct_inbox_tok = email_obj.get("inbox_token") or None
@@ -3844,29 +3954,32 @@ async def main():
         )
         if _ws_resp.ok:
             _ws = _ws_resp.json()
-            if _ws.get("workerEditsEnabled"):
-                _s = _ws.get("settings", {})
-                # Each setting only overrides admin config when the worker has it
-                # explicitly enabled — never force-disables what admin configured.
-                _prx = _s.get("proxy", {})
-                if _prx.get("enabled") and _prx.get("url"):
-                    config["proxyEnabled"] = True
-                    config["proxyUrl"]     = _prx["url"]
-                if _s.get("adb", {}).get("enabled"):
-                    config["adbEnabled"] = True
-                _npc = _s.get("nopecha", {})
-                if _npc.get("enabled") and _npc.get("key"):
-                    config["nopechaEnabled"] = True
-                    config["nopechaApiKey"]  = _npc["key"]
-                _wcd = int(_s.get("cooldown", 0))
-                if _wcd > 0:
-                    config["_worker_cooldown_override"] = _wcd
-                log.success("Worker Edits active.")
+            # Apply each worker personal setting based on its individual enabled
+            # flag — no global workerEditsEnabled gate needed. Each setting is
+            # self-contained: workers control their own proxy/nopecha/cooldown.
+            _s = _ws.get("settings", {})
+            _prx = _s.get("proxy", {})
+            if _prx.get("enabled") and _prx.get("url"):
+                config["proxyEnabled"] = True
+                config["proxyUrl"]     = _prx["url"]
+            _npc = _s.get("nopecha", {})
+            if _npc.get("enabled") and _npc.get("key"):
+                config["nopechaEnabled"] = True
+                config["nopechaApiKey"]  = _npc["key"]
+            if _s.get("adb", {}).get("enabled"):
+                config["adbEnabled"] = True
+            _wcd = int(_s.get("cooldown", 0))
+            if _wcd > 0:
+                config["_worker_cooldown_override"] = _wcd
+            if any([_prx.get("enabled"), _npc.get("enabled"),
+                    _s.get("adb", {}).get("enabled"), _wcd > 0]):
+                log.success("Worker personal settings applied.")
     except Exception as e:
         log.debug(f"Worker settings fetch skipped: {e}")
 
     # ── Fill in any missing defaults ──────────────────────────────
     config.setdefault("emailProvider",          "cybertemp")
+    config.setdefault("zeusMailType",           "hotmail_trusted_graph")
     config.setdefault("zeusxApiKey",            ZEUS_API_KEY)
     config.setdefault("hotmail007ClientKey",    "")
     config.setdefault("cybertempApiKey",        "")
