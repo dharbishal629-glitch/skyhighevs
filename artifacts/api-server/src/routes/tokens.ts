@@ -13,7 +13,7 @@ function getTodayDate(): string {
 }
 
 router.post("/tokens/save", requireApiKeyOrWorkerKey, async (req: Request, res: Response) => {
-  const { token, email, accountPass, workerKey, status } = req.body;
+  const { token, email, accountPass, emailPass, workerKey, status } = req.body;
 
   if (!token) {
     logBus.warn(`[!] /tokens/save rejected: missing token field (workerKey=${workerKey || "<none>"})`);
@@ -58,6 +58,7 @@ router.post("/tokens/save", requireApiKeyOrWorkerKey, async (req: Request, res: 
       token,
       email: email || null,
       accountPass: accountPass || null,
+      emailPass: emailPass || null,
       status: tokenStatus,
       workerId: worker ? worker.id : null,
       workerKey: workerKey || null,
@@ -147,6 +148,7 @@ router.get("/tokens/fetch", requireApiKey, requireAdmin, async (req: Request, re
     token: tokensTable.token,
     email: tokensTable.email,
     accountPass: tokensTable.accountPass,
+    emailPass: tokensTable.emailPass,
     status: tokensTable.status,
     workerId: tokensTable.workerId,
     workerKey: tokensTable.workerKey,
