@@ -37,16 +37,16 @@ from PIL import Image, ImageDraw, ImageFont
 #  FILL IN ALL VALUES BELOW BEFORE RUNNING THE BOT
 # ══════════════════════════════════════════════════════════════════
 
-BOT_TOKEN         = "MTUwNzYzMjUxNzAxOTIwOTc3MQ.GGfU21.bHeVOr0gSH_vwy-pUpqqOUQd_4uxRGJPHxZi10"
+BOT_TOKEN         = "MTUwNzYzMjUxNzAxOTIwOTc3MQ.GCzLFn.eKnyZfv6FfshTIqkvTy4guwExuDWDk2TAhE0Qc"
 API_BASE_URL      = "https://skyhighev.onrender.com"
 WORKER_API_KEY    = "WAK-EA328FEDEDC3AB55DE03B84B90E1F03B7C20BA5E77AF7C5A"
 ADMIN_ACCESS_CODE = "SKY-129"   # ← set to your Admin Access Code (used as x-admin-key header)
 TOTP_SECRET       = "YYUACPGKAASUNKZTEAWMGCDSLSAA"
-ADMIN_IDS         = { 1496870243581165621, 1496870243581165621 }
-WORKER_ROLE_ID = 0  # ← set to your worker role ID (e.g. 1234567890123456789)
+ADMIN_IDS         = { 1513278456484598046 }
+WORKER_ROLE_ID = 1518594165808562237  # ← set to your worker role ID (e.g. 1234567890123456789)
 # Channel where payout request notifications are sent (set to your admin/payout channel ID)
-PAYOUT_NOTIFY_CHANNEL_ID = 1503009242582351903   # ← replace 0 with your channel ID
-TICKET_CATEGORY_ID       = 1503009374212329633                     # ← set to your ticket category channel ID (0 = no category)
+PAYOUT_NOTIFY_CHANNEL_ID = 1518598206169288785   # ← replace 0 with your channel ID
+TICKET_CATEGORY_ID       = 1518598288612266004                     # ← set to your ticket category channel ID (0 = no category)
 LEADERBOARD_CHANNEL_ID   = 0   # ← set to channel ID for midnight UTC daily leaderboard auto-post (0 = disabled)
 
 # ═══════════════════════════════════════════""═══════════════════════
@@ -413,10 +413,18 @@ async def create_key(interaction: discord.Interaction, user: discord.Member, dur
     if WORKER_ROLE_ID and interaction.guild:
         try:
             role = interaction.guild.get_role(WORKER_ROLE_ID)
+            if role is None:
+                # get_role uses cache — fall back to fetching all roles
+                await interaction.guild.fetch_roles()
+                role = interaction.guild.get_role(WORKER_ROLE_ID)
             if role:
                 await user.add_roles(role, reason="Worker key issued via /create-key")
-        except Exception:
-            pass
+            else:
+                logger.warning(f"[Role] WORKER_ROLE_ID {WORKER_ROLE_ID} not found in guild — role not assigned")
+        except discord.Forbidden:
+            logger.error(f"[Role] Bot lacks 'Manage Roles' permission — could not assign worker role to {user}")
+        except Exception as e:
+            logger.error(f"[Role] Failed to assign worker role to {user}: {e}")
 
     await interaction.followup.send(view=_cv2(C_SUCCESS,
         _td("## Worker Key Issued"),
