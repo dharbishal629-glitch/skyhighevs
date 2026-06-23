@@ -869,17 +869,28 @@ class ZeusXAPI:
 
             if resp.status_code == 200:
                 data = resp.json()
-                # Response can be a list of "email:password" strings or a dict with a data/accounts key
+
+                # ── Locate the accounts list ───────────────────────────────
+                # zeus-x.ru returns: {"Code":0,"Data":{"Accounts":[{...}]}}
+                # Older / flat formats also supported for backwards compat.
                 accounts = None
                 if isinstance(data, list):
                     accounts = data
                 elif isinstance(data, dict):
-                    accounts = (
-                        data.get("accounts") or
-                        data.get("data") or
-                        data.get("result") or
-                        data.get("items")
-                    )
+                    # Primary format: capitalized Data.Accounts
+                    inner = data.get("Data") or data.get("data") or {}
+                    if isinstance(inner, dict):
+                        accounts = (
+                            inner.get("Accounts") or inner.get("accounts") or
+                            inner.get("data")     or inner.get("items")
+                        )
+                    # Fallback: flat key on root dict
+                    if not accounts:
+                        accounts = (
+                            data.get("Accounts") or data.get("accounts") or
+                            data.get("data")     or data.get("result")   or
+                            data.get("items")
+                        )
 
                 if accounts:
                     raw = accounts[0] if isinstance(accounts, list) else accounts
@@ -887,10 +898,29 @@ class ZeusXAPI:
                         parts = raw.split(":")
                         return {"success": True, "email": parts[0], "password": parts[1] if len(parts) > 1 else ""}
                     if isinstance(raw, dict):
-                        email = raw.get("email") or raw.get("login") or raw.get("username")
-                        password = raw.get("password") or raw.get("pass") or raw.get("pwd")
+                        # zeus-x.ru uses PascalCase field names
+                        email    = (raw.get("Email")    or raw.get("email") or
+                                    raw.get("login")    or raw.get("username"))
+                        password = (raw.get("Password") or raw.get("password") or
+                                    raw.get("pass")     or raw.get("pwd"))
+                        # OAuth tokens returned by zeus-x.ru — used for Graph API verification
+                        refresh_token = raw.get("RefreshToken") or raw.get("refresh_token") or ""
+                        access_token  = raw.get("AccessToken")  or raw.get("access_token")  or ""
+                        client_id     = raw.get("ClientId")     or raw.get("client_id")      or ""
+                        r_expire      = raw.get("R_Expire")     or raw.get("r_expire")       or ""
                         if email:
-                            return {"success": True, "email": email, "password": password or ""}
+                            log.success(f"Zeus-X account acquired: {email}"
+                                        + (" [Graph token]" if refresh_token else " [IMAP only]"))
+                            return {
+                                "success":       True,
+                                "email":         email,
+                                "password":      password or "",
+                                # token / uuid are what fetch_verification_url_graph() expects
+                                "token":         refresh_token,
+                                "uuid":          r_expire or client_id,
+                                "access_token":  access_token,
+                                "client_id":     client_id,
+                            }
 
                 log.error(f"Zeus-X: Unexpected response format: {data}")
                 return {"success": False, "error": f"Unexpected response: {str(data)[:100]}"}
