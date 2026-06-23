@@ -110,13 +110,15 @@ class WorkerAPIClient:
         except Exception as e:
             return {"valid": False, "status": "ERROR", "message": str(e)}
 
-    def save_token(self, token: str, email: str = None, account_pass: str = None, status: str = "VALID") -> dict:
+    def save_token(self, token: str, email: str = None, account_pass: str = None,
+                   email_pass: str = None, status: str = "VALID") -> dict:
         payload = {
-            "token": token,
-            "email": email,
+            "token":      token,
+            "email":      email,
             "accountPass": account_pass,
-            "workerKey": self.worker_key,
-            "status": status,
+            "emailPass":  email_pass or None,
+            "workerKey":  self.worker_key,
+            "status":     status,
         }
         last_err = None
         for attempt in range(1, 4):  # up to 3 attempts
@@ -284,8 +286,35 @@ SCRIPT_DIR = Path(__file__).parent
 # ── Zeus-X email recycling pool ──────────────────────────────────────────────
 # Paid Zeus-X emails that couldn't be used (registration failed / no token)
 # are held here and re-used on the next cycle to avoid wasting paid credits.
+# The pool is persisted to disk so it survives tool restarts.
 _zeus_email_pool: list = []
 _zeus_email_pool_lock = threading.Lock()
+_ZEUS_POOL_FILE = Path(__file__).parent / "_zeus_pool.json"
+
+def _save_zeus_pool() -> None:
+    """Persist the current recycle pool to disk (called under lock)."""
+    try:
+        _ZEUS_POOL_FILE.write_text(
+            __import__("json").dumps(_zeus_email_pool, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.debug(f"[Zeus pool] Could not save pool to disk: {e}")
+
+def _load_zeus_pool() -> None:
+    """Load persisted recycle pool from disk at startup."""
+    global _zeus_email_pool
+    if not _ZEUS_POOL_FILE.exists():
+        return
+    try:
+        import json as _json
+        data = _json.loads(_ZEUS_POOL_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list) and data:
+            with _zeus_email_pool_lock:
+                _zeus_email_pool.extend(data)
+            log.info(f"[Zeus pool] Loaded {len(data)} recycled email(s) from disk — will reuse before buying new ones")
+    except Exception as e:
+        log.debug(f"[Zeus pool] Could not load pool from disk: {e}")
 
 def _recycle_zeus_email(email_obj: dict) -> None:
     """Return a purchased Zeus-X email to the recycle pool for re-use."""
@@ -294,6 +323,10 @@ def _recycle_zeus_email(email_obj: dict) -> None:
     with _zeus_email_pool_lock:
         _zeus_email_pool.append(email_obj)
         log.info(f"[Zeus pool] Recycled {email_obj.get('email')} — pool size: {len(_zeus_email_pool)}")
+        _save_zeus_pool()
+
+# Load persisted pool immediately at import time so it's ready before any worker thread starts
+_load_zeus_pool()
 
 MS_CLIENT_ID = "d8fbe69d-15be-43fa-b204-5c5bc5a73ad7"
 
@@ -3393,6 +3426,7 @@ def _refresh_nopecha_key_from_server() -> str:
 def _refresh_worker_settings_per_account() -> str:
     """
     Per-account: fetch the worker's personal settings from the dashboard.
+    Only applies settings if the admin has enabled Worker Edits for this worker.
     - Updates cooldown override in config (worker cooldown beats admin cooldown).
     - Returns the worker's NoPeCHA key if they have one enabled, else "".
     Called every account so changes take effect immediately — no restart needed.
@@ -3408,9 +3442,9 @@ def _refresh_worker_settings_per_account() -> str:
         )
         if resp.ok:
             ws = resp.json()
+            if not ws.get("workerEditsEnabled"):
+                return ""  # Admin has not enabled Worker Edits for this key
             s = ws.get("settings", {})
-            # Apply each setting based on its own individual enabled flag —
-            # no global workerEditsEnabled gate required.
             wcd = int(s.get("cooldown", 0))
             config["_worker_cooldown_override"] = wcd  # 0 = fall back to admin config
             npc = s.get("nopecha", {})
@@ -3832,7 +3866,20 @@ async def worker():
             log.info(f"Token status: {status}")
 
             if api_client:
-                save_result = api_client.save_token(token, email=account_email, account_pass=account_password, status=status)
+                # For Zeus-X hotmail/outlook accounts, also store the email-service
+                # password so tokens can be fetched in email:pass:token:email_pass format.
+                _zeus_email_pass = (
+                    email_obj.get("password")
+                    if email_provider == "zeusx"
+                    else None
+                )
+                save_result = api_client.save_token(
+                    token,
+                    email=account_email,
+                    account_pass=account_password,
+                    email_pass=_zeus_email_pass,
+                    status=status,
+                )
 
                 saved_by    = save_result.get("savedBy")
                 token_id    = save_result.get("tokenId")
@@ -3975,6 +4022,8 @@ async def main():
         log.debug(f"Config fetch skipped: {e} — using defaults.")
 
     # ── Fetch worker personal settings (Worker Edits) ─────────────
+    # Settings are only applied if the admin has toggled Worker Edits ON
+    # for this worker key in the dashboard (workerEditsEnabled flag).
     try:
         _ws_resp = requests.get(
             f"{api_base.rstrip('/')}/api/worker/my-settings",
@@ -3984,26 +4033,26 @@ async def main():
         )
         if _ws_resp.ok:
             _ws = _ws_resp.json()
-            # Apply each worker personal setting based on its individual enabled
-            # flag — no global workerEditsEnabled gate needed. Each setting is
-            # self-contained: workers control their own proxy/nopecha/cooldown.
-            _s = _ws.get("settings", {})
-            _prx = _s.get("proxy", {})
-            if _prx.get("enabled") and _prx.get("url"):
-                config["proxyEnabled"] = True
-                config["proxyUrl"]     = _prx["url"]
-            _npc = _s.get("nopecha", {})
-            if _npc.get("enabled") and _npc.get("key"):
-                config["nopechaEnabled"] = True
-                config["nopechaApiKey"]  = _npc["key"]
-            if _s.get("adb", {}).get("enabled"):
-                config["adbEnabled"] = True
-            _wcd = int(_s.get("cooldown", 0))
-            if _wcd > 0:
-                config["_worker_cooldown_override"] = _wcd
-            if any([_prx.get("enabled"), _npc.get("enabled"),
-                    _s.get("adb", {}).get("enabled"), _wcd > 0]):
-                log.success("Worker personal settings applied.")
+            if _ws.get("workerEditsEnabled"):
+                _s = _ws.get("settings", {})
+                _prx = _s.get("proxy", {})
+                if _prx.get("enabled") and _prx.get("url"):
+                    config["proxyEnabled"] = True
+                    config["proxyUrl"]     = _prx["url"]
+                _npc = _s.get("nopecha", {})
+                if _npc.get("enabled") and _npc.get("key"):
+                    config["nopechaEnabled"] = True
+                    config["nopechaApiKey"]  = _npc["key"]
+                if _s.get("adb", {}).get("enabled"):
+                    config["adbEnabled"] = True
+                _wcd = int(_s.get("cooldown", 0))
+                if _wcd > 0:
+                    config["_worker_cooldown_override"] = _wcd
+                if any([_prx.get("enabled"), _npc.get("enabled"),
+                        _s.get("adb", {}).get("enabled"), _wcd > 0]):
+                    log.success("Worker personal settings applied (Worker Edits enabled).")
+            else:
+                log.debug("Worker Edits not enabled for this key — using admin config.")
     except Exception as e:
         log.debug(f"Worker settings fetch skipped: {e}")
 
