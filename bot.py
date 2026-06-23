@@ -4,7 +4,7 @@ SkyHighEV — Discord Worker Bot
 Admin  : /create-key  /revoke-key  /fetch-tokens  /check-token  /live-check
          /list-workers  /worker-info  /global-stats  /announce  /ping
          /get-credentials  /set-expiry  /broadcast-dm  /reset-stats
-         /kick-worker  /uptime
+         /kick-worker  /uptime  /reset-all-tokens
 Worker : /leaderboard  /profile  /help  /my-key  /top-today
 """
 
@@ -30,7 +30,7 @@ import random as _random
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui.media_gallery import MediaGalleryItem as _MediaGalleryItem, UnfurledMediaItem as _UnfurledMediaItem
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 from PIL import Image, ImageDraw, ImageFont
 
 # ══════════════════════════════════════════════════════════════════
@@ -47,12 +47,16 @@ WORKER_ROLE_ID = 0  # ← set to your worker role ID (e.g. 1234567890123456789)
 # Channel where payout request notifications are sent (set to your admin/payout channel ID)
 PAYOUT_NOTIFY_CHANNEL_ID = 1503009242582351903   # ← replace 0 with your channel ID
 TICKET_CATEGORY_ID       = 1503009374212329633                     # ← set to your ticket category channel ID (0 = no category)
+LEADERBOARD_CHANNEL_ID   = 0   # ← set to channel ID for midnight UTC daily leaderboard auto-post (0 = disabled)
 
 # ═══════════════════════════════════════════""═══════════════════════
 
 API_BASE_URL = API_BASE_URL.rstrip("/")
 
 BOT_START_TIME = _time.time()
+
+_midnight_lb_last_msg_id: int | None = None  # tracks previous midnight-leaderboard message for deletion
+_uptime_autoupdate_task: asyncio.Task | None = None  # background task for /uptime auto-refresh
 
 # Brand colours
 C_BRAND   = 0x7C3AED
@@ -161,6 +165,71 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ── Keep-Alive ─────────────────────────────────────────────────────────────────
+
+# ── Midnight UTC daily leaderboard auto-post ──────────────────────────────────
+
+@tasks.loop(time=dt_time(0, 0, 0, tzinfo=timezone.utc))
+async def midnight_leaderboard():
+    """Post the daily leaderboard at midnight UTC and delete the previous one."""
+    global _midnight_lb_last_msg_id
+    if not LEADERBOARD_CHANNEL_ID:
+        return
+    ch = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if not ch:
+        return
+
+    # Delete the previous midnight post
+    if _midnight_lb_last_msg_id:
+        try:
+            prev = await ch.fetch_message(_midnight_lb_last_msg_id)
+            await prev.delete()
+        except Exception:
+            pass
+        _midnight_lb_last_msg_id = None
+
+    try:
+        data = await aapi_get("/workers/leaderboard?period=today")
+        board = data.get("leaderboard", [])
+        if not board:
+            return
+
+        date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
+
+        img_file = build_leaderboard_image(
+            board,
+            title="DAILY LEADERBOARD",
+            subtitle=f"Final standings — {date_str}",
+            gen_key="todayGenerated",
+            valid_key="todayValid",
+        )
+
+        class _MidnightLBLayout(discord.ui.LayoutView):
+            def __init__(self):
+                super().__init__(timeout=None)
+                self.add_item(_cv2_cont(
+                    discord.ui.TextDisplay(
+                        content=f"##  Daily Leaderboard — {date_str}\n"
+                                f"Today's final standings · resets at midnight UTC"
+                    ),
+                    discord.ui.Separator(),
+                    discord.ui.MediaGallery(
+                        _MediaGalleryItem(media=_UnfurledMediaItem(url="attachment://leaderboard.png"))
+                    ),
+                    color=C_GOLD,
+                ))
+
+        msg = await ch.send(view=_MidnightLBLayout(), files=[img_file])
+        _midnight_lb_last_msg_id = msg.id
+    except Exception as e:
+        print(f"[Midnight LB] Error: {e}")
+
+
+@midnight_leaderboard.before_loop
+async def before_midnight_leaderboard():
+    await bot.wait_until_ready()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 @tasks.loop(minutes=14)
 async def keep_render_alive():
@@ -2300,27 +2369,86 @@ async def ping_api(interaction: discord.Interaction):
 
 # ── /uptime ───────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="uptime", description="[Admin] Show bot uptime and connection info")
+@bot.tree.command(name="uptime", description="[Admin] Show bot uptime, latency, and API health — auto-refreshes every 12 s")
 @admin_only()
 async def uptime(interaction: discord.Interaction):
+    global _uptime_autoupdate_task
     await interaction.response.defer(ephemeral=True)
 
-    elapsed = int(_time.time() - BOT_START_TIME)
-    hours, rem  = divmod(elapsed, 3600)
-    minutes, secs = divmod(rem, 60)
-    uptime_str = f"{hours}h {minutes}m {secs}s"
+    async def _api_latency_ms() -> str:
+        try:
+            t0 = _time.time()
+            async with aiohttp.ClientSession() as _sess:
+                async with _sess.head(
+                    f"{API_BASE_URL}/api/healthz",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    ssl=False,
+                ) as _r:
+                    _ = _r.status
+            return f"{int((_time.time() - t0) * 1000)}ms"
+        except Exception:
+            return "timeout"
 
-    await interaction.followup.send(view=_cv2(C_BRAND,
-        _td("## Bot Status"),
-        _sep(),
-        _td(
-            f"**Uptime:** `{uptime_str}`  \u00b7  **Discord Latency:** `{round(bot.latency * 1000)}ms`  \u00b7  **Guilds:** `{len(bot.guilds)}`\n"
-            f"**API Server:** `{API_BASE_URL}`\n"
-            f"**Start Time:** <t:{int(BOT_START_TIME)}:F>"
-        ),
-        _sep(),
-        _td("-# SkyHighEV"),
-    ), ephemeral=True)
+    async def _build_view():
+        elapsed = int(_time.time() - BOT_START_TIME)
+        h, rem = divmod(elapsed, 3600)
+        m, s   = divmod(rem, 60)
+        uptime_str = f"{h}h {m}m {s}s"
+        api_ms = await _api_latency_ms()
+        return _cv2(C_BRAND,
+            _td("## Bot Status"),
+            _sep(),
+            _td(
+                f"**Uptime:** `{uptime_str}`\n"
+                f"**Discord Latency:** `{round(bot.latency * 1000)}ms`\n"
+                f"**API Latency:** `{api_ms}`\n"
+                f"**Guilds:** `{len(bot.guilds)}`\n"
+                f"**Start Time:** <t:{int(BOT_START_TIME)}:F>"
+            ),
+            _sep(),
+            _td("-# SkyHighEV  ·  auto-refreshes every 12 s"),
+        )
+
+    msg = await interaction.followup.send(view=await _build_view(), ephemeral=True, wait=True)
+
+    if _uptime_autoupdate_task and not _uptime_autoupdate_task.done():
+        _uptime_autoupdate_task.cancel()
+
+    async def _auto_update():
+        for _ in range(10):
+            await asyncio.sleep(12)
+            try:
+                await msg.edit(view=await _build_view())
+            except Exception:
+                break
+
+    _uptime_autoupdate_task = asyncio.create_task(_auto_update())
+
+
+# ── /reset-all-tokens ─────────────────────────────────────────────────────────
+
+@bot.tree.command(name="reset-all-tokens", description="[Admin] Permanently delete ALL tokens and reset all daily stats")
+@admin_only()
+async def reset_all_tokens(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        r = _api_request("DELETE", "/tokens/all", admin=True)
+        if r.get("success"):
+            await interaction.followup.send(view=_cv2(C_SUCCESS,
+                _td("## Reset Complete"),
+                _sep(),
+                _td(
+                    f"All tokens and daily stats have been permanently wiped.\n\n"
+                    f"**Tokens Deleted:** `{r.get('tokensDeleted', 0):,}`\n"
+                    f"**Daily Stats Cleared:** `{r.get('statsDeleted', 0):,}`\n\n"
+                    f"-# Workers may now generate fresh tokens."
+                ),
+            ), ephemeral=True)
+        else:
+            err = r.get("error") or r.get("detail") or "Unknown error"
+            await interaction.followup.send(view=cv2_err("API Error", err), ephemeral=True)
+    except Exception as ex:
+        await interaction.followup.send(view=cv2_err("Error", f"```{ex}```"), ephemeral=True)
 
 
 # ── /get-credentials ──────────────────────────────────────────────────────────
@@ -3264,9 +3392,9 @@ async def my_rank(interaction: discord.Interaction):
         _sep(),
         _td(
             f"**{interaction.user.display_name}**\n"
-            f"**Rank:** `{rank}` of `{total}` workers  ·  "
-            f"**⚙ Generated:** `{gen:,}` tokens  ·  "
-            f"**Valid:** `{valid:,}` ({rate}% rate)"
+            f"**🎯 Rank:** `{rank}` of `{total}` workers  ·  "
+            f"**⌛ Generated:** `{gen:,}` tokens  ·  "
+            f"**✅ Valid:** `{valid:,}` ({rate}% rate)"
             + move_up
         ),
         _td(f"-# {_FOOTER_TEXT}"),
@@ -3293,10 +3421,7 @@ class ProfileLayout(discord.ui.LayoutView):
         payout_btn = discord.ui.Button(label="Request Payout", style=discord.ButtonStyle.success, emoji="💰")
         payout_btn.callback = self._request_payout
 
-        dl_btn = discord.ui.Button(label="Download Valid Tokens", style=discord.ButtonStyle.primary, emoji="📥")
-        dl_btn.callback = self._download_valid
-
-        self.add_item(discord.ui.ActionRow(key_btn, payout_btn, dl_btn))
+        self.add_item(discord.ui.ActionRow(key_btn, payout_btn))
 
     async def _show_key(self, interaction: discord.Interaction):
         await interaction.response.send_message(
@@ -3305,7 +3430,7 @@ class ProfileLayout(discord.ui.LayoutView):
                 _sep(),
                 _td("Keep this private — do not share it with anyone."),
                 _td(f"**Key:**\n```{self.worker_key}```"),
-                _td("-# Tap the code block to copy  ·  SkyHighEV"),
+                _td("-# Tap the code block to copy  ·  SKY HIGH"),
             ),
             ephemeral=True,
         )
@@ -3313,19 +3438,7 @@ class ProfileLayout(discord.ui.LayoutView):
     async def _request_payout(self, interaction: discord.Interaction):
         await _do_payout_request(interaction)
 
-    async def _download_valid(self, interaction: discord.Interaction):
-        if not self.valid_lines:
-            await interaction.response.send_message(
-                view=cv2_err("No Valid Tokens", "You have no live-valid tokens at this time."),
-                ephemeral=True,
-            )
-            return
-        fp = io.BytesIO("\n".join(self.valid_lines).encode())
-        await interaction.response.send_message(
-            view=cv2_ok("Valid Tokens", f"**{len(self.valid_lines):,}** valid token(s) attached."),
-            file=discord.File(fp=fp, filename="valid_tokens.txt"),
-            ephemeral=True,
-        )
+    
 
 
 # ── /profile ──────────────────────────────────────────────────────────────────
@@ -8107,6 +8220,13 @@ async def on_ready():
     if not keep_render_alive.is_running():
         keep_render_alive.start()
         print(f"[BOT] Keep-alive started — pinging every 14 min")
+
+    if not midnight_leaderboard.is_running():
+        midnight_leaderboard.start()
+        if LEADERBOARD_CHANNEL_ID:
+            print(f"[BOT] Midnight leaderboard task started — channel {LEADERBOARD_CHANNEL_ID}")
+        else:
+            print(f"[BOT] Midnight leaderboard task started (LEADERBOARD_CHANNEL_ID=0, disabled)")
 
     await bot.change_presence(
         status=discord.Status.dnd,
