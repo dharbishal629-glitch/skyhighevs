@@ -265,7 +265,7 @@ router.delete("/tokens/user/:discordId", requireApiKey, requireAdmin, async (req
   const discordId = req.params.discordId as string;
 
   const workers = await db
-    .select({ id: workersTable.id })
+    .select({ id: workersTable.id, workerKey: workersTable.workerKey })
     .from(workersTable)
     .where(eq(workersTable.discordId, discordId))
     .limit(1);
@@ -275,14 +275,35 @@ router.delete("/tokens/user/:discordId", requireApiKey, requireAdmin, async (req
     return;
   }
 
-  const workerId = workers[0].id;
+  const { id: workerId, workerKey } = workers[0];
 
   const deleted = await db
     .delete(tokensTable)
-    .where(eq(tokensTable.workerId, workerId))
+    .where(
+      or(
+        eq(tokensTable.workerId, workerId),
+        and(
+          eq(tokensTable.workerKey, workerKey),
+          isNull(tokensTable.workerId)
+        )
+      )
+    )
     .returning({ id: tokensTable.id });
 
   res.json({ success: true, deleted: deleted.length });
+});
+
+router.delete("/tokens/all", requireApiKey, requireAdmin, async (_req: Request, res: Response) => {
+  const deletedTokens = await db.delete(tokensTable).returning({ id: tokensTable.id });
+  const deletedStats  = await db.delete(dailyStatsTable).returning({ id: dailyStatsTable.id });
+
+  logBus.warn(`[ADMIN] /tokens/all — wiped ${deletedTokens.length} token(s) and ${deletedStats.length} daily-stat row(s)`);
+
+  res.json({
+    success:       true,
+    tokensDeleted: deletedTokens.length,
+    statsDeleted:  deletedStats.length,
+  });
 });
 
 router.post("/tokens/check", requireApiKey, requireAdmin, async (req: Request, res: Response) => {
