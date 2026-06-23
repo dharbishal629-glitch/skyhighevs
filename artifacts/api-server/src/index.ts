@@ -51,6 +51,7 @@ async function initDb() {
       );
 
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS account_pass TEXT;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS email_pass   TEXT;
 
       CREATE TABLE IF NOT EXISTS daily_stats (
         id               SERIAL PRIMARY KEY,
