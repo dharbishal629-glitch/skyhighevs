@@ -26,6 +26,7 @@ export const tokensTable = pgTable("tokens", {
   token: text("token").notNull().unique(),
   email: text("email"),
   accountPass: text("account_pass"),
+  emailPass: text("email_pass"),
   status: text("status").notNull().default("VALID"),
   workerId: integer("worker_id").references(() => workersTable.id),
   workerKey: text("worker_key"),
