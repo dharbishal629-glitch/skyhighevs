@@ -10,6 +10,7 @@ import {
 
 interface ToolConfig {
   emailProvider: string;
+  zeusMailType: string;
   zeusxApiKey: string;
   hotmail007ClientKey: string;
   cybertempApiKey: string;
@@ -36,6 +37,7 @@ interface ToolConfig {
 
 const DEFAULT: ToolConfig = {
   emailProvider: "cybertemp",
+  zeusMailType: "hotmail_trusted_graph",
   zeusxApiKey: "",
   hotmail007ClientKey: "",
   cybertempApiKey: "",
@@ -238,6 +240,37 @@ export default function ToolConfig() {
           <div className="space-y-3 pt-2">
             {form.emailProvider === "zeusx" && (
               <SecretField label="Zeus-X API Key" hint="From your zeus-x.ru account" value={form.zeusxApiKey} onChange={set("zeusxApiKey")} placeholder="your-zeus-x-api-key" />
+            )}
+            {form.emailProvider === "zeusx" && (
+              <div className="flex flex-col gap-2">
+                <label className="text-[10px] font-mono font-semibold tracking-widest text-slate-500 uppercase">Mail Type</label>
+                <p className="text-[11px] text-slate-600 -mt-1">
+                  Graph API verifies via OAuth token (faster). IMAP/POP3 polls the inbox directly (more compatible).
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  {([
+                    { value: "hotmail_trusted_graph", label: "Hotmail Trusted",  sub: "Graph API" },
+                    { value: "hotmail_trusted_imap",  label: "Hotmail Trusted",  sub: "IMAP/POP3" },
+                    { value: "outlook_trusted_graph", label: "Outlook Trusted",  sub: "Graph API" },
+                    { value: "outlook_trusted_imap",  label: "Outlook Trusted",  sub: "IMAP/POP3" },
+                  ] as const).map(opt => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => set("zeusMailType")(opt.value)}
+                      className={cn(
+                        "flex flex-col items-start px-3 py-2 rounded-lg border text-left transition-all",
+                        form.zeusMailType === opt.value
+                          ? "border-violet-500/60 bg-violet-500/10 text-violet-300"
+                          : "border-white/10 bg-white/5 text-slate-400 hover:border-white/20"
+                      )}
+                    >
+                      <span className="text-xs font-semibold">{opt.label}</span>
+                      <span className="text-[11px] opacity-70">{opt.sub}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
             {form.emailProvider === "hotmail007" && (
               <SecretField label="Hotmail007 Client Key" hint="From hotmail007.com" value={form.hotmail007ClientKey} onChange={set("hotmail007ClientKey")} placeholder="your-client-key" />
