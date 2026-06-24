@@ -110,6 +110,57 @@ class WorkerAPIClient:
         except Exception as e:
             return {"valid": False, "status": "ERROR", "message": str(e)}
 
+    def push_unused_mail(self, email_obj: dict) -> bool:
+        """Push a failed Zeus-X email to the server-side unused-mails pool."""
+        if not email_obj or not email_obj.get("email"):
+            return False
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/unused-mails",
+                json={
+                    "email":        email_obj.get("email"),
+                    "password":     email_obj.get("password"),
+                    "refreshToken": email_obj.get("token"),
+                    "accessToken":  email_obj.get("access_token"),
+                    "clientId":     email_obj.get("client_id"),
+                    "uuid":         email_obj.get("uuid"),
+                    "mailType":     email_obj.get("mail_type") or config.get("zeusMailType", ""),
+                },
+                headers=self._headers(),
+                timeout=10,
+                verify=False,
+            )
+            return resp.ok
+        except Exception as e:
+            log.debug(f"[UnusedMail] push failed: {e}")
+            return False
+
+    def pop_unused_mail(self) -> Optional[dict]:
+        """Pop one unused Zeus-X email from the server-side pool. Returns None if empty."""
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/unused-mails/pop",
+                headers=self._headers(),
+                timeout=10,
+                verify=False,
+            )
+            if resp.ok:
+                data = resp.json()
+                if data.get("email"):
+                    log.info(f"[UnusedMail] Reusing {data['email']} from server pool")
+                    return {
+                        "success":      True,
+                        "email":        data["email"],
+                        "password":     data.get("password") or "",
+                        "token":        data.get("refreshToken") or "",
+                        "access_token": data.get("accessToken") or "",
+                        "client_id":    data.get("clientId") or "",
+                        "uuid":         data.get("uuid") or "",
+                    }
+        except Exception as e:
+            log.debug(f"[UnusedMail] pop failed: {e}")
+        return None
+
     def save_token(self, token: str, email: str = None, account_pass: str = None,
                    email_pass: str = None, status: str = "VALID") -> dict:
         payload = {
@@ -317,16 +368,20 @@ def _load_zeus_pool() -> None:
         log.debug(f"[Zeus pool] Could not load pool from disk: {e}")
 
 def _recycle_zeus_email(email_obj: dict) -> None:
-    """Return a purchased Zeus-X email to the recycle pool for re-use."""
+    """Return a purchased Zeus-X email to the server-side unused-mails pool for re-use.
+    Falls back to in-memory pool if api_client is not yet initialised (pre-auth phase)."""
     if not email_obj or not email_obj.get("email"):
         return
+    if api_client:
+        ok = api_client.push_unused_mail(email_obj)
+        if ok:
+            log.info(f"[UnusedMail] Pushed {email_obj.get('email')} to server pool")
+            return
+        log.debug("[UnusedMail] Server push failed — keeping in memory for this session")
+    # Pre-auth fallback: keep in-process memory only
     with _zeus_email_pool_lock:
         _zeus_email_pool.append(email_obj)
-        log.info(f"[Zeus pool] Recycled {email_obj.get('email')} — pool size: {len(_zeus_email_pool)}")
-        _save_zeus_pool()
-
-# Load persisted pool immediately at import time so it's ready before any worker thread starts
-_load_zeus_pool()
+        log.info(f"[Zeus pool] (memory) Recycled {email_obj.get('email')} — pool size: {len(_zeus_email_pool)}")
 
 MS_CLIENT_ID = "d8fbe69d-15be-43fa-b204-5c5bc5a73ad7"
 
@@ -3592,11 +3647,16 @@ async def worker():
             if email_provider == "zeusx":
                 zx_key = config.get("zeusxApiKey") or ZEUS_API_KEY
                 if zx_key:
-                    # ── Check recycle pool first (avoids wasting paid credits) ──
-                    with _zeus_email_pool_lock:
-                        if _zeus_email_pool:
-                            email_obj = _zeus_email_pool.pop(0)
-                            log.info(f"[Zeus pool] Reusing {email_obj.get('email')} (pool remaining: {len(_zeus_email_pool)})")
+                    # ── 1. Try server-side unused-mails pool first ─────────────
+                    if api_client:
+                        email_obj = api_client.pop_unused_mail()
+                    # ── 2. Fallback: in-memory pool (populated before api_client exists) ──
+                    if not email_obj:
+                        with _zeus_email_pool_lock:
+                            if _zeus_email_pool:
+                                email_obj = _zeus_email_pool.pop(0)
+                                log.info(f"[Zeus pool] (memory) Reusing {email_obj.get('email')}")
+                    # ── 3. Nothing in pool — buy a fresh one ──────────────────
                     if not email_obj:
                         zx_mail_type = config.get("zeusMailType", "hotmail_trusted_graph")
                         result = ZeusXAPI(zx_key).buy_email(mail_type=zx_mail_type)
@@ -3770,14 +3830,22 @@ async def worker():
 
             # ── 5. Extract token ───────────────────────────────────────────
             log.info("Extracting Discord token...")
-            token = await extract_token_via_api(account_email, account_password)
+            # JS localStorage FIRST — this is the genuine browser-session token that
+            # Discord generated during the real registration flow. It carries the
+            # correct fingerprint and has not triggered a "new device login" check.
+            # API login (tls_client) uses Chrome-131 headers that differ from the
+            # actual browser, which Discord flags as suspicious → immediate revocation.
+            token = None
+            try:
+                await discord_tab.evaluate(JS_UTILS)
+                token = await discord_tab.evaluate('window.utils.waitForDiscordToken(8000)')
+            except Exception:
+                pass
 
+            # Fallback: Discord API login — only when localStorage gave nothing
             if not token:
-                try:
-                    await discord_tab.evaluate(JS_UTILS)
-                    token = await discord_tab.evaluate('window.utils.waitForDiscordToken(8000)')
-                except Exception:
-                    pass
+                log.debug("localStorage token unavailable — trying API login fallback...")
+                token = await extract_token_via_api(account_email, account_password)
 
             if not token:
                 log.warning(f"No token captured for {account_email} — captcha or rate-limit")

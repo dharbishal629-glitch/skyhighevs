@@ -14,6 +14,7 @@ import envSettingsRouter from "./envSettings";
 import adminAuthRouter from "./adminAuth";
 import workerEnvRouter from "./workerEnv";
 import fingerprintsRouter from "./fingerprints";
+import unusedMailsRouter from "./unusedMails";
 
 const router: IRouter = Router();
 
@@ -32,5 +33,6 @@ router.use(workerPortalRouter);
 router.use(envSettingsRouter);
 router.use(workerEnvRouter);
 router.use(fingerprintsRouter);
+router.use(unusedMailsRouter);
 
 export default router;

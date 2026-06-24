@@ -53,6 +53,18 @@ async function initDb() {
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS account_pass TEXT;
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS email_pass   TEXT;
 
+      CREATE TABLE IF NOT EXISTS unused_mails (
+        id            SERIAL PRIMARY KEY,
+        email         TEXT NOT NULL,
+        password      TEXT,
+        refresh_token TEXT,
+        access_token  TEXT,
+        client_id     TEXT,
+        uuid          TEXT,
+        mail_type     TEXT,
+        created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS daily_stats (
         id               SERIAL PRIMARY KEY,
         worker_id        INTEGER NOT NULL REFERENCES workers(id),

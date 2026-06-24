@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageFont
 #  FILL IN ALL VALUES BELOW BEFORE RUNNING THE BOT
 # ══════════════════════════════════════════════════════════════════
 
-BOT_TOKEN         = "MTUwNzYzMjUxNzAxOTIwOTc3MQ.GCzLFn.eKnyZfv6FfshTIqkvTy4guwExuDWDk2TAhE0Qc"
+BOT_TOKEN         = "MTUwNzYzMjUxNzAxOTIwOTc3MQ.Gm0x1V.4dE7jqRmvZvkFNMk-K3GllqlLuiSlS6Nkvd_o0"
 API_BASE_URL      = "https://skyhighev.onrender.com"
 WORKER_API_KEY    = "WAK-EA328FEDEDC3AB55DE03B84B90E1F03B7C20BA5E77AF7C5A"
 ADMIN_ACCESS_CODE = "SKY-129"   # ← set to your Admin Access Code (used as x-admin-key header)
@@ -793,7 +793,8 @@ async def fetch_tokens(
         tok = t.get("token") or ""
         if not tok:
             continue
-        label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}"
+        _ep = t.get("emailPass") or ""
+        label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}" + (f":{_ep}" if _ep else "")
         token_entries.append((label, tok))
 
     total_entries = len(token_entries)
@@ -1161,7 +1162,8 @@ async def live_check_all(
         tok = t.get("token") or ""
         if not tok:
             continue
-        label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}"
+        _ep = t.get("emailPass") or ""
+        label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}" + (f":{_ep}" if _ep else "")
         token_entries.append((label, tok))
 
     total = len(token_entries)
@@ -2170,7 +2172,8 @@ async def worker_info(interaction: discord.Interaction, user: discord.Member):
     for t in all_tokens:
         tok = t.get("token") or ""
         if tok:
-            label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}"
+            _ep = t.get("emailPass") or ""
+        label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}" + (f":{_ep}" if _ep else "")
             entries.append((label, tok))
 
     wi_total   = len(entries)
@@ -3489,7 +3492,8 @@ async def profile(interaction: discord.Interaction):
     for t in all_tokens:
         tok = t.get("token") or ""
         if tok:
-            label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}"
+            _ep = t.get("emailPass") or ""
+        label = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{tok}" + (f":{_ep}" if _ep else "")
             entries.append((label, tok))
 
     pf_total    = len(entries)
@@ -3912,7 +3916,9 @@ async def _do_payout_request(interaction: discord.Interaction):
     ), ephemeral=True)
 
     def fmt_line(t):
-        return f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{t.get('token') or ''}"
+        _ep = t.get("emailPass") or ""
+        base = f"{t.get('email') or ''}:{t.get('accountPass') or ''}:{t.get('token') or ''}"
+        return f"{base}:{_ep}" if _ep else base
 
     entries = [(fmt_line(t), t.get("token") or "") for t in all_tokens]
     valid_list, locked_list, invalid_list, error_list = await _discord_live_check(entries)
