@@ -3551,8 +3551,11 @@ async def worker():
             SESSION_STOP = True
             break
 
-        browser     = None
-        discord_tab = None
+        browser                = None
+        discord_tab            = None
+        email_obj              = None          # for finally-block reference
+        email_provider         = "cybertemp"   # default; overridden inside try
+        discord_account_created = False         # True only after Discord confirms creation
 
         try:
             # ── ADB IP rotation ────────────────────────────────────────────
@@ -3824,40 +3827,35 @@ async def worker():
                        and account_task.result() is True)
             if not created:
                 log.error("Account creation failed — captcha not solved or timed out")
-                if email_provider == "zeusx":
-                    _recycle_zeus_email(email_obj)
+                # email_provider/email_obj already set above; recycle happens in finally
                 continue
+
+            # ── Account confirmed created — do NOT recycle this email ──────────
+            discord_account_created = True
 
             # ── 5. Extract token ───────────────────────────────────────────
             log.info("Extracting Discord token...")
-            # Python-side polling of localStorage — nodriver's evaluate() does NOT
-            # await JavaScript Promises, so a JS Promise that polls for 8 s resolves
-            # to null immediately. We poll with simple synchronous JS calls from Python.
-            # The NoPeCHA captcha handler already confirmed the token exists in
-            # localStorage before signalling success, so it should be readable on
-            # the very first tick or within a few hundred milliseconds at most.
-            token = None
-            for _poll in range(60):  # 12 seconds max (60 × 200 ms)
-                try:
-                    raw = await discord_tab.evaluate(
-                        '(()=>{ try { return localStorage.getItem("token"); } catch(e){ return null; } })()'
-                    )
-                    if raw and len(str(raw)) > 20:
-                        token = str(raw).strip('"')
-                        if _poll > 0:
-                            log.debug(f"localStorage token captured (poll #{_poll + 1})")
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.2)
+            # PRIMARY: tls_client API login — proven to produce tokens that Discord
+            # accepts at the time of creation. We log in via Chrome-131 fingerprint
+            # which triggers Discord's login flow and returns a fresh token.
+            token = await extract_token_via_api(account_email, account_password)
 
-            # Fallback: Discord API login — only when localStorage gave nothing.
-            # NOTE: this creates a new session with a tls_client Chrome-131 fingerprint
-            # which Discord can flag as a suspicious new-device login. Use it only as
-            # a last resort.
+            # FALLBACK: Python-side localStorage polling — nodriver's evaluate()
+            # does NOT await JS Promises, so we poll synchronously from Python.
             if not token:
-                log.debug("localStorage token unavailable — trying API login fallback...")
-                token = await extract_token_via_api(account_email, account_password)
+                log.debug("API login gave no token — trying localStorage fallback...")
+                for _poll in range(30):  # 6 seconds max (30 × 200 ms)
+                    try:
+                        raw = await discord_tab.evaluate(
+                            '(()=>{ try { return localStorage.getItem("token"); } catch(e){ return null; } })()'
+                        )
+                        if raw and len(str(raw)) > 20:
+                            token = str(raw).strip('"')
+                            log.debug(f"localStorage token captured (poll #{_poll + 1})")
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.2)
 
             if not token:
                 log.warning(f"No token captured for {account_email} — captcha or rate-limit")
@@ -4001,6 +3999,16 @@ async def worker():
             await asyncio.sleep(2)
 
         finally:
+            # ── Recycle Zeus-X / Hotmail email if Discord never got the form ─
+            # This fires for EVERY exit path that didn't set discord_account_created:
+            # exceptions, browser killed by user, rate limits, captcha timeouts,
+            # network errors, launcher crashes, etc.
+            # We ONLY skip recycling when discord_account_created=True because once
+            # Discord has the account, using that email again for registration fails.
+            if email_provider == "zeusx" and email_obj and not discord_account_created:
+                log.info(f"[UnusedMail] Auto-recycling {email_obj.get('email')} — cycle ended before account was created")
+                _recycle_zeus_email(email_obj)
+
             # ── Stop the browser completely — next account gets a fresh instance.
             # This guarantees a 100 % clean session: no cookies, localStorage,
             # extension state, or service-worker caches survive to the next run.
