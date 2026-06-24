@@ -3830,27 +3830,41 @@ async def worker():
 
             # ── 5. Extract token ───────────────────────────────────────────
             log.info("Extracting Discord token...")
-            # JS localStorage FIRST — this is the genuine browser-session token that
-            # Discord generated during the real registration flow. It carries the
-            # correct fingerprint and has not triggered a "new device login" check.
-            # API login (tls_client) uses Chrome-131 headers that differ from the
-            # actual browser, which Discord flags as suspicious → immediate revocation.
+            # Python-side polling of localStorage — nodriver's evaluate() does NOT
+            # await JavaScript Promises, so a JS Promise that polls for 8 s resolves
+            # to null immediately. We poll with simple synchronous JS calls from Python.
+            # The NoPeCHA captcha handler already confirmed the token exists in
+            # localStorage before signalling success, so it should be readable on
+            # the very first tick or within a few hundred milliseconds at most.
             token = None
-            try:
-                await discord_tab.evaluate(JS_UTILS)
-                token = await discord_tab.evaluate('window.utils.waitForDiscordToken(8000)')
-            except Exception:
-                pass
+            for _poll in range(60):  # 12 seconds max (60 × 200 ms)
+                try:
+                    raw = await discord_tab.evaluate(
+                        '(()=>{ try { return localStorage.getItem("token"); } catch(e){ return null; } })()'
+                    )
+                    if raw and len(str(raw)) > 20:
+                        token = str(raw).strip('"')
+                        if _poll > 0:
+                            log.debug(f"localStorage token captured (poll #{_poll + 1})")
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
 
-            # Fallback: Discord API login — only when localStorage gave nothing
+            # Fallback: Discord API login — only when localStorage gave nothing.
+            # NOTE: this creates a new session with a tls_client Chrome-131 fingerprint
+            # which Discord can flag as a suspicious new-device login. Use it only as
+            # a last resort.
             if not token:
                 log.debug("localStorage token unavailable — trying API login fallback...")
                 token = await extract_token_via_api(account_email, account_password)
 
             if not token:
                 log.warning(f"No token captured for {account_email} — captcha or rate-limit")
-                if email_provider == "zeusx":
-                    _recycle_zeus_email(email_obj)
+                # Do NOT recycle here: the Discord account was already created with this
+                # email address. Recycling it would push it back to the pool and the
+                # next registration attempt with the same email would fail because the
+                # account already exists on Discord's side.
                 continue
 
             m = re.search(r'([A-Za-z0-9_-]{20,})\.([A-Za-z0-9_-]{6})\.([A-Za-z0-9_-]{27,})', token)
