@@ -392,6 +392,57 @@ SESSION_STOP = False
 # Runtime config — populated from API server after worker key validation
 config: Dict = {}
 
+# ── In-flight email tracker ──────────────────────────────────────────────────
+# These are set the moment an email is obtained and cleared when the cycle
+# finishes successfully (account created). The atexit + SIGINT handler uses
+# them to push the email back to the unused-mails pool if the tool is closed
+# mid-cycle (Ctrl+C, window close, etc).
+_inflight_email_obj:      Optional[dict] = None
+_inflight_email_provider: str            = "cybertemp"
+_LOCK_INFLIGHT = threading.Lock()
+
+def _set_inflight(email_obj: Optional[dict], provider: str) -> None:
+    global _inflight_email_obj, _inflight_email_provider
+    with _LOCK_INFLIGHT:
+        _inflight_email_obj      = email_obj
+        _inflight_email_provider = provider
+
+def _clear_inflight() -> None:
+    _set_inflight(None, "cybertemp")
+
+def _recycle_inflight_on_exit() -> None:
+    """Called by atexit and SIGINT handler — recycles any in-progress Zeus-X email."""
+    with _LOCK_INFLIGHT:
+        obj      = _inflight_email_obj
+        provider = _inflight_email_provider
+    if obj and provider == "zeusx" and obj.get("email"):
+        try:
+            if api_client:
+                ok = api_client.push_unused_mail(obj)
+                if ok:
+                    print(f"\n[EXIT] Recycled {obj.get('email')} → unused-mails pool")
+                    return
+            # Fallback: memory pool (best effort — process may be exiting)
+            with _zeus_email_pool_lock:
+                _zeus_email_pool.append(obj)
+            print(f"\n[EXIT] Recycled {obj.get('email')} → memory pool (API unavailable)")
+        except Exception:
+            pass
+
+import atexit as _atexit
+_atexit.register(_recycle_inflight_on_exit)
+
+def _sigint_handler(signum, frame):
+    """Graceful Ctrl+C — recycle in-flight email then exit."""
+    print("\n[SIGINT] Tool closing — recycling in-flight email if any...")
+    _recycle_inflight_on_exit()
+    raise SystemExit(0)
+
+try:
+    signal.signal(signal.SIGINT, _sigint_handler)
+except Exception:
+    pass  # signal can only be set in main thread; skip if called from thread
+
 
 # ============================================================================
 # LOGGER
@@ -1097,9 +1148,71 @@ def find_brave_executable() -> Optional[str]:
 # ============================================================================
 
 def generate_username() -> str:
-    adjectives = ['Cool', 'Epic', 'Super', 'Mega', 'Ultra', 'Pro', 'Elite', 'Master', 'Dark', 'Neon']
-    nouns      = ['Gamer', 'Player', 'User', 'Hero', 'Legend', 'Champion', 'Warrior', 'Shadow', 'Ghost']
-    return f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(100, 9999)}"
+    """Generate a humanized Discord username. Picks randomly from several styles
+    so the pool is large and names look natural/real."""
+    style = random.randint(0, 5)
+
+    first_names = [
+        'Alex','Blake','Casey','Dakota','Emery','Finley','Harper','Jamie','Jordan',
+        'Kendall','Logan','Morgan','Nolan','Parker','Quinn','Riley','Sage','Taylor',
+        'Tyler','Avery','Cameron','Drew','Ellis','Frankie','Gray','Hayden','Indigo',
+        'Jesse','Kira','Lane','Marley','Nova','Oakley','Peyton','Reed','Skyler',
+        'Sloane','Tatum','Vaughn','Winter','Zara','Ace','Beau','Cole','Dean','Eli',
+        'Felix','Gabe','Hale','Ivan','Jace','Knox','Levi','Max','Nash','Omar',
+        'Pace','Rhys','Seth','Theo','Uri','Vance','Wade','Xane','Yael','Zeke',
+    ]
+    last_names = [
+        'Stone','Brooks','Hayes','Rivers','Cross','Lane','Burns','Flynn','Price',
+        'Gray','West','Cole','Hunt','Nash','Holt','Fox','Drake','Reid','Pierce',
+        'Webb','Ross','Grant','Blake','Frost','Craig','Kent','Ward','Bell','Dean',
+        'Miles','Knox','Sharp','Marsh','Vance','Day','Page','Lake','Wolf','Ray',
+    ]
+    adjectives = [
+        'Cool','Epic','Super','Mega','Ultra','Pro','Elite','Master','Dark','Neon',
+        'Swift','Bold','Crisp','Vast','Raw','Lone','Wild','Free','True','Pure',
+        'Icy','Misty','Sharp','Fierce','Quick','Silent','Slick','Grim','Soft','Rich',
+    ]
+    nouns = [
+        'Gamer','Player','Hero','Legend','Champion','Warrior','Shadow','Ghost',
+        'Rider','Hunter','Ranger','Falcon','Wolf','Storm','Blade','Blaze','Surge',
+        'Drift','Flux','Nexus','Spark','Cipher','Axiom','Rogue','Vortex','Pulse',
+        'Ember','Frost','Quake','Tide','Echo','Apex','Flare','Crest','Peak',
+    ]
+    separators = ['', '_', '.']
+
+    if style == 0:
+        # FirstnameLastname123
+        sep = random.choice(separators)
+        result = f"{random.choice(first_names)}{sep}{random.choice(last_names)}{random.randint(1, 999)}"
+    elif style == 1:
+        # firstname_lastname  (no number sometimes)
+        sep = random.choice(['_', '.'])
+        result = f"{random.choice(first_names).lower()}{sep}{random.choice(last_names).lower()}"
+        if random.random() < 0.6:
+            result += str(random.randint(1, 99))
+    elif style == 2:
+        # AdjectiveNoun + number
+        sep = random.choice(separators)
+        result = f"{random.choice(adjectives)}{sep}{random.choice(nouns)}{random.randint(10, 9999)}"
+    elif style == 3:
+        # firstname + noun  e.g. alexwolf99
+        sep = random.choice(separators)
+        result = f"{random.choice(first_names).lower()}{sep}{random.choice(nouns).lower()}{random.randint(1, 999)}"
+    elif style == 4:
+        # xFirstname or FirstnameX (gamer tag style)
+        fn = random.choice(first_names)
+        tag = random.choice(['x','v','z','gg','ez','og','real','its','im','the'])
+        result = random.choice([
+            f"{tag}{fn}{random.randint(1, 99)}",
+            f"{fn}{tag}{random.randint(1, 99)}",
+            f"{tag}_{fn.lower()}",
+        ])
+    else:
+        # lastname + year/number
+        sep = random.choice(separators)
+        result = f"{random.choice(last_names)}{sep}{random.randint(1, 9999)}"
+
+    return result[:32]
 
 def generate_password(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
@@ -2192,18 +2305,26 @@ async def _fill_input_js(page, selector: str, value: str, timeout_ms: int = 5000
 
 
 def _generate_username_variant(base: str) -> str:
-    """Mutate a taken username: insert digits mid-string, append suffix, or fully regenerate."""
-    strategy = random.randint(0, 3)
+    """Mutate a taken/invalid username: several strategies + full regeneration fallback."""
+    log.info(f"[Username] '{base}' unavailable/invalid — generating variant...")
+    strategy = random.randint(0, 5)
     if strategy == 0:
-        result = base + str(random.randint(1, 9999))
+        result = base.rstrip('0123456789') + str(random.randint(1, 99999))
     elif strategy == 1:
-        mid = len(base) // 2
-        result = base[:mid] + str(random.randint(10, 99)) + base[mid:]
+        mid = max(1, len(base) // 2)
+        result = base[:mid] + str(random.randint(10, 999)) + base[mid:].rstrip('0123456789')
     elif strategy == 2:
-        result = base + random.choice(['x', 'v', 'z', '_']) + str(random.randint(1, 999))
+        suffix = random.choice(['x', 'v', 'z', 'gg', 'ez', 'ok', 'yo'])
+        result = base.rstrip('0123456789_') + '_' + suffix + str(random.randint(1, 99))
+    elif strategy == 3:
+        result = base.rstrip('0123456789_') + '.' + str(random.randint(1, 9999))
+    elif strategy == 4:
+        result = generate_username()
     else:
         result = generate_username()
-    return result[:32]  # Discord: max 32 chars
+    result = result[:32]
+    log.info(f"[Username] Retrying with: '{result}'")
+    return result
 
 
 async def _click_submit_button(page) -> bool:
@@ -2258,6 +2379,35 @@ async def _get_username_error(page) -> str:
         return ""
 
 
+async def _get_page_errors(page) -> str:
+    """Return ALL visible error/warning text from the page (broader than username-only)."""
+    try:
+        return await page.evaluate("""() => {
+            const texts = [];
+            const selectors = [
+                '[class*="errorMessage"]','[class*="error-message"]',
+                '[class*="errorText"]','[class*="inputError"]',
+                '[class*="Error"]','[class*="error"]',
+                '[class*="warning"]','[class*="alert"]',
+                'p[class*="text"]','span[class*="text"]',
+            ];
+            for (const sel of selectors) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if (t) texts.push(t);
+                }
+            }
+            // also grab any visible text that explicitly mentions rate limiting
+            const body = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+            if (body.includes('rate limit') || body.includes('being rate limited')) {
+                texts.push('rate limited');
+            }
+            return texts.join(' ');
+        }""") or ""
+    except Exception:
+        return ""
+
+
 async def fill_registration_form(page, email: str, display_name: str, username: str, password: str) -> bool:
     """
     Fill Discord registration form via instant JS native-setter injection.
@@ -2290,9 +2440,9 @@ async def fill_registration_form(page, email: str, display_name: str, username: 
             pass
         await asyncio.sleep(0.03)
 
-        # ── Username + submit with retry on "taken" error ─────────────────────
+        # ── Username + submit with retry on "taken/invalid" error ────────────
         current_username = username
-        for attempt in range(6):
+        for attempt in range(8):
             if not await _fill_input_js(page, 'input[name="username"]', current_username, timeout_ms=4000):
                 log.error("Username field not found"); return False
             await asyncio.sleep(0.05)
@@ -2300,17 +2450,86 @@ async def fill_registration_form(page, email: str, display_name: str, username: 
             if not await _click_submit_button(page):
                 log.error("Submit button not found"); return False
 
-            # Give Discord ~1.5s to show a username error (if any)
-            await asyncio.sleep(1.5)
-            err_text = await _get_username_error(page)
-            if err_text and any(k in err_text for k in ("taken", "unavailable", "invalid", "already", "username")):
+            # ── Actively poll the page for up to 8 s after clicking submit ──
+            # Rather than a one-shot check we poll every 0.5 s so we catch
+            # the rate-limit message however fast/slow Discord renders it.
+            # Exit conditions:
+            #   • Rate-limit text found  → return False (recycle email)
+            #   • Page navigated away   → return True  (account being created)
+            #   • Captcha iframe appeared → return True (captcha loop takes over)
+            #   • Username error found  → break out and retry username
+            #   • 8 s timeout           → return True  (let wait_for_account_creation handle it)
+            _rate_limited   = False
+            _username_error = ""
+            _nav_away       = False
+            for _poll_i in range(16):           # 16 × 0.5 s = 8 s max
+                await asyncio.sleep(0.5)
+                try:
+                    # Check URL — navigated away = form accepted
+                    _cur_url = ""
+                    try:
+                        _raw_url = await page.evaluate('window.location.href')
+                        _cur_url = str(_raw_url) if _raw_url else ""
+                    except Exception:
+                        pass
+                    if _cur_url and "discord.com/register" not in _cur_url:
+                        _nav_away = True
+                        break
+
+                    # Check for captcha — if it appeared, stop polling and let
+                    # the captcha loop handle everything.
+                    try:
+                        _has_captcha = await page.evaluate(
+                            "(()=>{ try{ return !!document.querySelector('iframe[src*=\"hcaptcha.com\"]'); } catch(e){ return false; } })()"
+                        )
+                        if _has_captcha:
+                            _nav_away = True   # treat as "accepted, proceed"
+                            break
+                    except Exception:
+                        pass
+
+                    # Check for rate-limit text using innerText (catches ALL
+                    # visible text regardless of CSS class names)
+                    try:
+                        _body_text = await page.evaluate(
+                            "(()=>{ try{ return (document.body.innerText||'').toLowerCase(); } catch(e){ return ''; } })()"
+                        ) or ""
+                        if any(k in _body_text for k in ("rate limit", "being rate limited", "too many request")):
+                            _rate_limited = True
+                            break
+                    except Exception:
+                        pass
+
+                    # Check for username-specific error (only on last poll cycle
+                    # to avoid reacting before the error text has rendered)
+                    if _poll_i >= 2:
+                        try:
+                            _err_tmp = await _get_username_error(page)
+                            if _err_tmp and any(k in _err_tmp for k in (
+                                "taken", "unavailable", "invalid", "already",
+                                "username", "letters", "numbers", "characters",
+                            )):
+                                _username_error = _err_tmp
+                                break
+                        except Exception:
+                            pass
+
+                except Exception:
+                    pass   # browser may be closing; outer loop handles it
+
+            if _rate_limited:
+                log.warning("[RateLimit] Discord rate-limited this registration — recycling email")
+                return False  # triggers finally-block recycle
+
+            if _username_error:
+                log.warning(f"[Username] Error on attempt {attempt+1}: {_username_error[:80].strip()}")
                 current_username = _generate_username_variant(current_username)
                 continue  # retry with new username
 
-            # No username error — form accepted
+            # Navigated away OR timeout — form accepted; hand off to account-wait
             return True
 
-        log.warning("Username retry limit reached")
+        log.warning("Username retry limit reached — submitting as-is")
         return True  # submitted anyway, let the outer loop handle it
 
     except Exception as e:
@@ -3270,11 +3489,16 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
       3. Registration email input disappears AND page title changed  (nav complete)
       4. Discord app container element appears in the DOM  (UI mounted)
     Any one signal returning True is enough to proceed.
+    Also detects: rate-limit errors on the page (returns False instantly),
+    and browser close (consecutive JS failures → returns False instantly).
     """
     start = time.time()
     last_url = ""
+    _consec_errors = 0   # consecutive total-failure poll cycles
+    _MAX_CONSEC    = 6   # ~2.4 s of all-fail = browser is gone
     while (time.time() - start) < timeout:
         await asyncio.sleep(0.4)
+        _poll_ok = False  # did at least one JS call succeed this cycle?
         try:
             # ── Signal 1: URL-based detection ─────────────────────────────
             # ALWAYS read window.location.href via JS — page.url is a cached
@@ -3284,6 +3508,7 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
             try:
                 raw = await page.evaluate('window.location.href')
                 url = str(raw) if raw else ""
+                _poll_ok = True
             except Exception:
                 pass
             if not url:
@@ -3301,11 +3526,40 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
             ):
                 return True
 
+            # ── Rate-limit / error signal: abort immediately ──────────────
+            # Checked early so we don't waste 10 minutes waiting on a
+            # rate-limited registration page. Returns False → finally block
+            # recycles the email.
+            try:
+                page_err_text = await page.evaluate("""() => {
+                    try {
+                        const b = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+                        const errs = [];
+                        for (const sel of ['[class*="error"]','[class*="Error"]','[class*="warning"]']) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                const t = (el.textContent || '').trim().toLowerCase();
+                                if (t) errs.push(t);
+                            }
+                        }
+                        if (b.includes('rate limit') || b.includes('being rate limited')) errs.push('rate limited');
+                        return errs.join(' ');
+                    } catch(e) { return ''; }
+                }""") or ""
+                _poll_ok = True
+                if page_err_text and any(k in page_err_text for k in (
+                    "rate limit", "rate limited", "being rate limited", "too many requests"
+                )):
+                    log.warning("[RateLimit] Rate-limit detected while waiting for account creation — recycling email")
+                    return False
+            except Exception:
+                pass
+
             # ── Signal 2: localStorage token present ──────────────────────
             try:
                 has_token = await page.evaluate(
                     '(()=>{ try{ return !!localStorage.getItem("token"); } catch(e){ return false; } })()'
                 )
+                _poll_ok = True
                 if has_token:
                     return True
             except Exception:
@@ -3320,6 +3574,7 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
                     '  return !emailInput && !passInput;'
                     '} catch(e){ return false; } })()'
                 )
+                _poll_ok = True
                 if form_gone and url and "register" not in url:
                     return True
             except Exception:
@@ -3336,6 +3591,7 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
                         '            document.querySelector("[class*=\\"privateChannels-\\"]"));'
                         '} catch(e){ return false; } })()'
                     )
+                    _poll_ok = True
                     if logged_in_ui:
                         return True
                 except Exception:
@@ -3343,6 +3599,18 @@ async def wait_for_account_creation(page, timeout: int = 300) -> bool:
 
         except Exception:
             pass
+
+        # ── Browser-close detection ───────────────────────────────────────
+        # If every JS call fails for several consecutive cycles the browser
+        # has been closed by the user. Bail out immediately so the finally
+        # block can recycle the email without waiting for the full timeout.
+        if _poll_ok:
+            _consec_errors = 0
+        else:
+            _consec_errors += 1
+            if _consec_errors >= _MAX_CONSEC:
+                log.warning(f"[BrowserClose] Browser appears closed ({_consec_errors} consecutive failures) — recycling email immediately")
+                return False
 
     log.error("Timeout waiting for account creation")
     return False
@@ -3714,6 +3982,10 @@ async def worker():
             account_username = generate_username()
             display_name     = random.choice(DISPLAY_NAMES)
 
+            # Track this email globally so atexit/SIGINT can recycle it if
+            # the tool is closed before the cycle completes.
+            _set_inflight(email_obj if email_provider == "zeusx" else None, email_provider)
+
             # ── 2. Open Discord register tab ───────────────────────────────
             discord_tab = await browser.get("https://discord.com/register", new_tab=True)
 
@@ -3832,6 +4104,7 @@ async def worker():
 
             # ── Account confirmed created — do NOT recycle this email ──────────
             discord_account_created = True
+            _clear_inflight()   # email used — don't recycle on exit
 
             # ── 5. Extract token ───────────────────────────────────────────
             log.info("Extracting Discord token...")
@@ -4008,6 +4281,8 @@ async def worker():
             if email_provider == "zeusx" and email_obj and not discord_account_created:
                 log.info(f"[UnusedMail] Auto-recycling {email_obj.get('email')} — cycle ended before account was created")
                 _recycle_zeus_email(email_obj)
+            # Always clear the inflight tracker for the next cycle
+            _clear_inflight()
 
             # ── Stop the browser completely — next account gets a fresh instance.
             # This guarantees a 100 % clean session: no cookies, localStorage,
