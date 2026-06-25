@@ -163,7 +163,7 @@ class WorkerAPIClient:
 
     def post_account_log(self, email: str, account_pass: str, token: str,
                          email_pass: str = None, is_hotmail: bool = False,
-                         verified: bool = False) -> None:
+                         verified: bool = False, status: str = "VALID") -> None:
         """Fire-and-forget: notify the bot log channel that an account was created."""
         try:
             requests.post(
@@ -175,6 +175,7 @@ class WorkerAPIClient:
                     "emailPass":   email_pass or None,
                     "isHotmail":   is_hotmail,
                     "verified":    verified,
+                    "status":      status,
                     "workerId":    self.worker_key,
                 },
                 headers=self._headers(),
@@ -4286,6 +4287,7 @@ async def worker():
                         email_pass=_zeus_email_pass,
                         is_hotmail=_is_hotmail,
                         verified=verified,
+                        status=status,
                     )
             else:
                 log.warning("No API client — token was NOT saved (api_client not initialised)")
