@@ -1,6 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
 import { requireApiKey } from "../middlewares/auth";
+import { getEnvSetting } from "./envSettings";
 
 const router: IRouter = Router();
 
@@ -14,56 +15,95 @@ async function ensureTable() {
       email_pass   TEXT,
       is_hotmail   BOOLEAN NOT NULL DEFAULT false,
       verified     BOOLEAN NOT NULL DEFAULT false,
+      status       TEXT NOT NULL DEFAULT 'VALID',
       worker_id    TEXT,
-      sent         BOOLEAN NOT NULL DEFAULT false,
       created_at   TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 }
 
+function statusEmoji(s: string) {
+  if (s === "VALID")   return "✅ VALID";
+  if (s === "LOCKED")  return "🔒 LOCKED";
+  return "❌ " + (s || "UNKNOWN");
+}
+
+function embedColor(s: string) {
+  if (s === "VALID")  return 0x10B981; // green
+  if (s === "LOCKED") return 0xF59E0B; // yellow
+  return 0xEF4444;                      // red
+}
+
+async function sendWebhook(webhookUrl: string, payload: object) {
+  const r = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`Webhook returned ${r.status}: ${text.slice(0, 200)}`);
+  }
+}
+
 router.post("/logs/account-created", requireApiKey, async (req: Request, res: Response) => {
   try {
     await ensureTable();
-    const { email, accountPass, token, emailPass, isHotmail, verified, workerId } = req.body;
+    const {
+      email, accountPass, token, emailPass,
+      isHotmail, verified, status = "VALID", workerId,
+    } = req.body;
+
     if (!email || !token) {
       res.status(400).json({ error: "email and token are required" });
       return;
     }
-    const result = await pool.query(
-      `INSERT INTO account_logs (email, account_pass, token, email_pass, is_hotmail, verified, worker_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [email, accountPass || null, token, emailPass || null, isHotmail || false, verified || false, workerId || null]
-    );
-    res.json({ id: result.rows[0].id });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || "Failed to save log" });
-  }
-});
 
-router.get("/logs/account-created/pending", requireApiKey, async (_req: Request, res: Response) => {
-  try {
-    await ensureTable();
-    const result = await pool.query(
-      `SELECT id, email, account_pass, token, email_pass, is_hotmail, verified, worker_id, created_at
-       FROM account_logs WHERE sent = false ORDER BY created_at ASC LIMIT 20`
+    await pool.query(
+      `INSERT INTO account_logs
+         (email, account_pass, token, email_pass, is_hotmail, verified, status, worker_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [email, accountPass ?? null, token, emailPass ?? null,
+       isHotmail ?? false, verified ?? false, status, workerId ?? null]
     );
-    res.json({ logs: result.rows });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || "Failed to fetch pending logs" });
-  }
-});
 
-router.patch("/logs/account-created/:id/sent", requireApiKey, async (req: Request, res: Response) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    if (isNaN(id)) {
-      res.status(400).json({ error: "Invalid id" });
-      return;
+    const webhookUrl = await getEnvSetting("LOG_WEBHOOK_URL");
+    if (webhookUrl) {
+      const ep        = emailPass  ? `\`${emailPass}\`` : "—";
+      const hmVal     = isHotmail  ? "✅ Yes" : "❌ No";
+      const verVal    = verified   ? "✅ Yes" : "❌ No";
+      const copyStr   = [email, accountPass, token, ...(emailPass ? [emailPass] : [])].join(":");
+
+      const embed = {
+        title: "Account Created",
+        color: embedColor(status),
+        fields: [
+          { name: "Email",    value: `\`${email}\``,       inline: true  },
+          { name: "Password", value: `\`${accountPass ?? "—"}\``, inline: true },
+          { name: "\u200b",   value: "\u200b",              inline: true  },
+          { name: "Status",   value: statusEmoji(status),  inline: true  },
+          { name: "Email Verified",           value: verVal, inline: true },
+          { name: "\u200b",   value: "\u200b",              inline: true  },
+          { name: "Hotmail / Outlook",          value: hmVal, inline: true },
+          { name: "Hotmail / Outlook Password", value: ep,    inline: true },
+          { name: "\u200b",   value: "\u200b",              inline: true  },
+          { name: "📋 Copy", value: `\`\`\`\n${copyStr}\n\`\`\``, inline: false },
+        ],
+        footer: { text: "SKYHIGH GEN LOGS" },
+        timestamp: new Date().toISOString(),
+      };
+
+      try {
+        await sendWebhook(webhookUrl, { embeds: [embed] });
+      } catch (whErr: any) {
+        console.error("[AccLog] Webhook error:", whErr.message);
+      }
     }
-    await pool.query(`UPDATE account_logs SET sent = true WHERE id = $1`, [id]);
+
     res.json({ ok: true });
   } catch (err: any) {
-    res.status(500).json({ error: err?.message || "Failed to mark log as sent" });
+    console.error("[AccLog] Error:", err);
+    res.status(500).json({ error: err?.message || "Failed to save log" });
   }
 });
 
