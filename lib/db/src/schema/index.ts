@@ -50,6 +50,18 @@ export const toolConfigTable = pgTable("tool_config", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+export const unusedMailsTable = pgTable("unused_mails", {
+  id:           serial("id").primaryKey(),
+  email:        text("email").notNull(),
+  password:     text("password"),
+  refreshToken: text("refresh_token"),
+  accessToken:  text("access_token"),
+  clientId:     text("client_id"),
+  uuid:         text("uuid"),
+  mailType:     text("mail_type"),
+  createdAt:    timestamp("created_at").defaultNow().notNull(),
+});
+
 export const fingerprintsTable = pgTable("fingerprints", {
   id:        serial("id").primaryKey(),
   data:      text("data").notNull(),
