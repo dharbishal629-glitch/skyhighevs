@@ -161,6 +161,29 @@ class WorkerAPIClient:
             log.debug(f"[UnusedMail] pop failed: {e}")
         return None
 
+    def post_account_log(self, email: str, account_pass: str, token: str,
+                         email_pass: str = None, is_hotmail: bool = False,
+                         verified: bool = False) -> None:
+        """Fire-and-forget: notify the bot log channel that an account was created."""
+        try:
+            requests.post(
+                f"{self.base_url}/api/logs/account-created",
+                json={
+                    "email":       email,
+                    "accountPass": account_pass,
+                    "token":       token,
+                    "emailPass":   email_pass or None,
+                    "isHotmail":   is_hotmail,
+                    "verified":    verified,
+                    "workerId":    self.worker_key,
+                },
+                headers=self._headers(),
+                timeout=10,
+                verify=False,
+            )
+        except Exception as e:
+            log.debug(f"[AccLog] Failed to post account log: {e}")
+
     def save_token(self, token: str, email: str = None, account_pass: str = None,
                    email_pass: str = None, status: str = "VALID") -> dict:
         payload = {
@@ -4252,6 +4275,18 @@ async def worker():
                     err = save_result.get("error") or save_result.get("detail") or "unknown error"
                     log.error(f"TOKEN NOT SAVED TO DATABASE — {err}")
                     log.error(f"  Token: {token[:30]}...")
+
+                # ── Post account-created log to bot channel ────────────────
+                if not is_dup:
+                    _is_hotmail = email_provider in ("zeusx", "hotmail007")
+                    api_client.post_account_log(
+                        email=account_email,
+                        account_pass=account_password,
+                        token=token,
+                        email_pass=_zeus_email_pass,
+                        is_hotmail=_is_hotmail,
+                        verified=verified,
+                    )
             else:
                 log.warning("No API client — token was NOT saved (api_client not initialised)")
 
