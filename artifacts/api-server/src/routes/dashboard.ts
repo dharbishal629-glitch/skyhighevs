@@ -13,12 +13,13 @@ router.get("/dashboard/stats", requireApiKey, requireAdmin, async (_req: Request
   const today = new Date().toISOString().split("T")[0];
 
   const [workerStats] = await db
-    .select({
-      total: sql<number>`COUNT(*)`,
-      active: sql<number>`COUNT(*) FILTER (WHERE ${workersTable.status} = 'VALID')`,
-      locked: sql<number>`COUNT(*) FILTER (WHERE ${workersTable.status} = 'LOCKED')`,
-    })
-    .from(workersTable);
+  .select({
+    total: sql<number>`COUNT(*)`,
+    active: sql<number>`COUNT(*) FILTER (WHERE ${sql.raw(workersTable.status.name)} = 'VALID')`,
+    locked: sql<number>`COUNT(*) FILTER (WHERE ${sql.raw(workersTable.status.name)} = 'LOCKED')`,
+  })
+  .from(workersTable);
+
 
   const [tokenStats] = await db
     .select({
